@@ -1,0 +1,240 @@
+"""
+Single-process TP=N profiling: Load sharded weights on 1 GPU, profile compute.
+
+This patches vLLM's parallel state so linear layers see tp_size=N while
+running in a single process. Weights are sharded but no actual NCCL is used.
+
+Usage:
+    python test.py --model meta-llama/Llama-3.1-8B --tp 2 --trace_dir ./traces
+"""
+import os
+import sys
+import socket
+import argparse
+
+
+def find_free_port() -> int:
+    """Find a free port by binding to port 0 and letting the OS assign one."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]
+
+
+# Add project root to path for dooly imports
+# run-tracer.py -> run/ -> dooly/ -> dooly (repo root)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+# Parse arguments BEFORE any heavy imports
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="Model name or path")
+parser.add_argument("--tp", "--tensor_parallel_size", type=int, default=1, dest="tensor_parallel_size", help="Fake tensor parallel size (weights sharded but run on 1 GPU)")
+parser.add_argument("--dtype", type=str, default="bfloat16", help="Model dtype")
+parser.add_argument("--prompts", type=str, default="Hello, how are you? I am fine, and ", help="Prompt to run")
+parser.add_argument("--max-tokens", type=int, default=1, help="Max tokens to generate")
+parser.add_argument("--trace_dir", type=str, default="./vllm_traces_tp", help="Directory to save trace")
+parser.add_argument("--gpu", type=int, default=0, help="GPU device index to use")
+parser.add_argument("--attention-backend", type=str, default="FLASHINFER", help="Attention backend (FLASHINFER, FLASH_ATTN, XFORMERS)")
+parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
+args = parser.parse_args()
+
+import torch
+import torch.profiler
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
+print(f"[Tracer] Set VLLM_ATTENTION_BACKEND={args.attention_backend}")
+
+FAKE_TP = args.tensor_parallel_size
+os.environ["VLLM_FAKE_TP"] = str(FAKE_TP)
+
+# Install taint hooks BEFORE any vLLM imports
+# This patches AutoConfig.from_pretrained to return TaintedConfig objects
+# and installs hooks on tensor factory functions for taint propagation
+from dooly.taintracer.hooks import install_hooks
+from dooly.taintracer.config import patch_autoconfig, patch_input_buffers
+from dooly.taintracer.registry import TAINT_REGISTRY
+from dooly.taintracer import disable_taint_tracking, enable_taint_tracking
+
+# Disable taint tracking initially - we'll enable it only during the actual generate() call
+# This prevents semantic confusion during warm-up/compilation where values are reused incorrectly
+disable_taint_tracking()
+print("[Tracer] Taint tracking DISABLED during initialization/warm-up")
+
+patch_autoconfig()
+# patch_common_attention_metadata()
+patch_input_buffers()
+install_hooks(
+    int_patch_modules=[
+        "vllm.model_executor.layers.rotary_embedding",
+    ]
+)
+
+# Patch DummyModelLoader to force CUDA move
+# (dummy models are loaded into CPU for some reason when tainting is enabled)
+try:
+    from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+    original_dummy_load_weights = DummyModelLoader.load_weights
+
+    def patched_dummy_load_weights(self, model, model_config):
+        original_dummy_load_weights(self, model, model_config)
+        if torch.cuda.is_available():
+            model.to("cuda")
+
+    DummyModelLoader.load_weights = patched_dummy_load_weights
+except ImportError:
+    print("[DebugPatch] Could not import DummyModelLoader")
+
+# Debug patch: Track num_tokens in _dummy_run
+try:
+    import vllm.v1.worker.gpu_model_runner as gmr_module
+    from dooly.taintracer.types import TaintedInt
+
+    _orig_dummy_run = None
+    _orig_get_slot_mappings = None
+
+    def patch_for_debugging():
+        global _orig_dummy_run, _orig_get_slot_mappings
+        if hasattr(gmr_module, 'GPUModelRunner'):
+            GPUModelRunner = gmr_module.GPUModelRunner
+
+            if _orig_dummy_run is None:
+                _orig_dummy_run = GPUModelRunner._dummy_run
+                def debug_dummy_run(self, num_tokens, *args, **kwargs):
+                    print(f"\n[DEBUG _dummy_run] Called with num_tokens={num_tokens}, type={type(num_tokens)}, is_tainted={isinstance(num_tokens, TaintedInt)}", flush=True)
+                    if isinstance(num_tokens, TaintedInt):
+                        print(f"[DEBUG _dummy_run] num_tokens has taint: {num_tokens.taint}", flush=True)
+                    return _orig_dummy_run(self, num_tokens, *args, **kwargs)
+                GPUModelRunner._dummy_run = debug_dummy_run
+
+            if _orig_get_slot_mappings is None:
+                _orig_get_slot_mappings = GPUModelRunner._get_slot_mappings
+                def debug_get_slot_mappings(self, num_tokens_padded, *args, **kwargs):
+                    print(f"[DEBUG _get_slot_mappings] num_tokens_padded={num_tokens_padded}, type={type(num_tokens_padded)}, is_tainted={isinstance(num_tokens_padded, TaintedInt)}", flush=True)
+                    if isinstance(num_tokens_padded, TaintedInt):
+                        print(f"[DEBUG _get_slot_mappings] num_tokens_padded has taint: {num_tokens_padded.taint}", flush=True)
+                    return _orig_get_slot_mappings(self, num_tokens_padded, *args, **kwargs)
+                GPUModelRunner._get_slot_mappings = debug_get_slot_mappings
+
+            print("[DebugPatch] Installed debug wrappers for _dummy_run and _get_slot_mappings", flush=True)
+
+    # Will patch after GPUModelRunner is defined
+except Exception as e:
+    print(f"[DebugPatch] Could not setup debug patches - {e}", flush=True)
+
+# Apply fake TP patches using shared utility, then import vLLM
+from dooly.profiler.utils.fake_tp import apply_fake_tp_patches
+if FAKE_TP > 1:
+    apply_fake_tp_patches(FAKE_TP)
+
+from vllm import LLM, SamplingParams
+from transformers import AutoConfig
+
+# Debug: verify multiprocessing mode
+import vllm.envs as envs
+print(f"[DEBUG] VLLM_ENABLE_V1_MULTIPROCESSING = {envs.VLLM_ENABLE_V1_MULTIPROCESSING}", flush=True)
+
+def get_max_model_len(model_name: str, default: int = 4096) -> int:
+    """Auto-detect max_model_len from model config."""
+    try:
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        # Try common attribute names for max position embeddings
+        for attr in ["max_position_embeddings", "n_positions", "max_seq_len"]:
+            if hasattr(config, attr):
+                val = getattr(config, attr)
+                if val is not None:
+                    print(f"[Tracer] Auto-detected max_model_len={val} from {attr}")
+                    return int(val)
+        print(f"[Tracer] Could not find max position embeddings, using default={default}")
+        return default
+    except Exception as e:
+        print(f"[Tracer] Error loading config: {e}, using default={default}")
+        return default
+
+if __name__ == "__main__":
+    print(f"[Tracer] Tracing {args.model} with fake TP={FAKE_TP}")
+
+    # Auto-detect max_model_len from model config, capped at 32768 to avoid OOM
+    max_model_len = min(get_max_model_len(args.model), 32768)
+
+    try:
+        # Apply debug patches before LLM init
+        try:
+            patch_for_debugging()
+        except:
+            pass
+
+        llm = LLM(
+            model=args.model,
+            tokenizer=args.tokenizer if args.tokenizer else args.model,
+            dtype=args.dtype,
+            tensor_parallel_size=1,  # Tell vLLM executor we're single process
+            load_format="dummy",
+            enforce_eager=True,
+            gpu_memory_utilization=0.9,
+            attention_backend=args.attention_backend,
+            max_model_len=max_model_len,
+            trust_remote_code=True,
+            max_num_batched_tokens=269,
+            max_num_seqs=263
+        )
+
+        # Check weight shapes to verify sharding
+        print(f"\n=== Checking weight shapes (should be divided by TP={FAKE_TP}) ===")
+        model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+        for name, param in model.named_parameters():
+            if "layers.0" in name and ("q_proj" in name or "down_proj" in name):
+                print(f"{name}: {param.shape}")
+
+        sampling_params = SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
+
+        # Enable taint tracking now - warm-up/compilation is done
+        enable_taint_tracking()
+        print("\n[Tracer] Taint tracking ENABLED for actual generation")
+
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            # with_stack=True,
+            record_shapes=True,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.trace_dir)
+        ) as prof:
+            llm.generate([args.prompts, args.prompts, args.prompts,args.prompts, args.prompts], sampling_params=sampling_params)
+
+        print(f"[Tracer] Done tracing {args.model}, output saved to {args.trace_dir}")
+
+        # Print registry contents
+        print("\n" + "="*80)
+        print("TAINT_REGISTRY CONTENTS")
+        print("="*80)
+        print(f"Total entries: {len(TAINT_REGISTRY)}")
+
+        if len(TAINT_REGISTRY) > 0:
+            # Separate pure and MIX entries
+            pure_entries = {k: v for k, v in TAINT_REGISTRY.items() if not isinstance(v, dict)}
+            mix_entries = {k: v for k, v in TAINT_REGISTRY.items() if isinstance(v, dict)}
+
+            if pure_entries:
+                print(f"\nPure Taints ({len(pure_entries)} entries):")
+                # Sort by value (taint name) then by key
+                for key in sorted(pure_entries.keys()):
+                    value = pure_entries[key]
+                    print(f"  {key:6d} → {value}")
+
+            if mix_entries:
+                print(f"\nMIX Taints ({len(mix_entries)} entries):")
+                # Sort by key
+                for key in sorted(mix_entries.keys()):
+                    value = mix_entries[key]
+                    components_str = ', '.join(f"{qty}×{taint}" for taint, qty in value['components'].items())
+                    print(f"  {key:6d} → MIX [{components_str}]")
+        else:
+            print("  (Registry is empty)")
+
+        print("="*80 + "\n")
+            
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()

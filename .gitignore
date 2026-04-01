@@ -1,0 +1,15 @@
+/.claude/
+/__pycache__/
+/vllm_traces_tp/
+/local/
+/dooly/__pycache__/
+/dooly/run/__pycache__/
+/dooly/profiler/__pycache__/
+/dooly/taintracer/__pycache__/
+*.pyc
+test_*
+/database/
+# Large trace files
+*.trace.json
+*.pt.trace.json
+hierarchy_output.json
