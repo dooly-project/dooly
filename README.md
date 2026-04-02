@@ -1,2 +1,2 @@
 # simulator
-simulator implementation for end to end evaluation of dolly
+simulator implementation for end to end evaluation of Dooly
