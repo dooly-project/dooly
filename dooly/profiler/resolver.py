@@ -74,6 +74,10 @@ class ModuleResolver:
 
             print(f"\n[RESOLVER] Trying: {module.operation_name} (module={module.is_module})")
 
+            if module.module_name == "None":
+                print(f"[RESOLVER]   Skipping module with name 'None'")
+                continue
+            
             # Try importing the op/module as-is
             callable_obj = self.try_import(module)
 
@@ -443,6 +447,7 @@ class ModuleResolver:
                 backend=original.backend,
                 dtype=original.dtype,
                 hierarchy=hierarchy,
+                count=original.count,  # inherit count from original module
             )
         else:
             # cpu_op parent: use the same import path, just different op name
@@ -460,6 +465,7 @@ class ModuleResolver:
                 backend=original.backend,
                 dtype=original.dtype,
                 hierarchy=hierarchy,
+                count=original.count,
             )
 
     def _absorb_siblings(

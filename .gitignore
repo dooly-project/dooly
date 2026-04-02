@@ -8,7 +8,7 @@
 /dooly/taintracer/__pycache__/
 *.pyc
 test_*
-/database/
+# /database/
 # Large trace files
 *.trace.json
 *.pt.trace.json

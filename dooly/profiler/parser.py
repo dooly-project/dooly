@@ -165,7 +165,7 @@ class OperationHierarchy:
         """Get the root module name (for compatibility with existing code)."""
         if self.root_module:
             return self.root_module.name
-        return "Global/Unassigned"
+        return "None"
 
     @property
     def operation_name(self) -> str:
@@ -182,7 +182,7 @@ class OperationHierarchy:
         """Get the nearest module name."""
         if self.nearest_module:
             return self.nearest_module.name
-        return "Global/Unassigned"
+        return "None"
 
     @property
     def is_module(self) -> bool:

@@ -29,9 +29,10 @@ class ModuleInfo:
     call_chain: List[str] = field(default_factory=list)
     backend: str = ""
     dtype: str = ""
+    count: int = 0 # count of occurance (before deduplication)
     hierarchy: Optional[OperationHierarchy] = field(default=None, repr=False)
     absorbed_ops: List[str] = field(default_factory=list)  # ops merged into this module by resolver
-
+    
     # Convenience properties for accessing hierarchy info
     @property
     def anchor(self) -> Optional[Event]:
@@ -262,6 +263,7 @@ class ModuleComparator:
                 print(f"[COMPARATOR] Loaded {len(existing_hashes)} existing signatures from database")
 
         pruned: Dict[str, List[Tuple[ModuleInfo, Callable, str]]] = {name: [] for name in model_names}
+        all_ops: Dict[str, List[Tuple[ModuleInfo, Callable, str, str]]] = {name: [] for name in model_names}
         seen_this_session: Set[str] = set()
 
         for model_name, mod_call_tuple in zip(model_names, model_module_infos):
@@ -272,17 +274,20 @@ class ModuleComparator:
 
                 print(f"Model Name: {model_name}, Module Name: {module.module_name}, Hash: {sig_hash[:16]}...")
 
-                # Skip if already in database
+                # Always add to all_ops (for model_operations tracking)
+                all_ops[model_name].append((module, callable, sig_hash, sig_json))
+
+                # Skip if already in database (for profiling)
                 if sig_hash in existing_hashes:
-                    print(f" - {module.module_name} with hash {sig_hash[:16]}... already in database, skipping")
+                    print(f" - {module.module_name} with hash {sig_hash[:16]}... already in database, skipping profiling")
                     continue
 
-                # Skip if already seen this session
+                # Skip if already seen this session (for profiling)
                 if sig_hash in seen_this_session:
-                    print(f" - {module.module_name} with hash {sig_hash[:16]}... already seen this session, skipping")
+                    print(f" - {module.module_name} with hash {sig_hash[:16]}... already seen this session, skipping profiling")
                     continue
 
                 seen_this_session.add(sig_hash)
                 pruned[model_name].append((module, callable, sig_hash, sig_json))
 
-        return pruned
+        return pruned, all_ops

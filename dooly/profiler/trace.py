@@ -68,14 +68,14 @@ class TraceParser:
             profile_metadata=profile_metadata,
         )
 
-        output_data = {
-            "summary": {
-                "unique_module_profiles": len(module_infos),
-            },
-            "module_infos": [profile.to_dict() for profile in module_infos],
-        }
+        # output_data = {
+        #     "summary": {
+        #         "unique_module_profiles": len(module_infos),
+        #     },
+        #     "module_infos": [profile.to_dict() for profile in module_infos],
+        # }
 
-        self.loader.save_to_json(output_data, output_path)
+        # self.loader.save_to_json(output_data, output_path)
 
         return module_infos
 
@@ -340,6 +340,9 @@ class TraceParser:
         for (base_name, _op_name, _model_params_tuple), infos in groups.items():
             # use the first info as template since all have same signature
             template = infos[0]
+            count = len(infos)
+            
+            print(f"[DEBUG] Deduplicating {count} modules with signature: {base_name}, operation: {template.operation_name}, model_params: {_model_params_tuple}")
 
             dedup_info = ModuleInfo(
                 module_name=base_name,
@@ -350,6 +353,7 @@ class TraceParser:
                 dtype=template.dtype,
                 call_chain=template.call_chain,
                 hierarchy=template.hierarchy,
+                count = count,  # track how many were deduplicated into this one
             )
 
             # Add module_info to anchor event

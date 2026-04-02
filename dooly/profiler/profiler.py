@@ -239,7 +239,8 @@ class Profiler:
         conn = sqlite3.connect(self.db_path)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS signatures (
-                signature_hash TEXT PRIMARY KEY,
+                operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signature_hash TEXT UNIQUE NOT NULL,
                 operation_name TEXT NOT NULL,
                 signature_json TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -263,6 +264,27 @@ class Profiler:
                 FOREIGN KEY (signature_hash) REFERENCES signatures(signature_hash)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS profiled_models (
+                model_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_name TEXT NOT NULL,
+                model_family TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS model_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_id INTEGER NOT NULL,
+                operation_id INTEGER NOT NULL,
+                count INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (model_id) REFERENCES profiled_models(model_id),
+                FOREIGN KEY (operation_id) REFERENCES signatures(operation_id),
+                UNIQUE(model_id, operation_id, count)
+            )
+        """) 
         conn.commit()
         conn.close()
         print(f"[PROFILER] Initialized database at {self.db_path}")
@@ -270,8 +292,10 @@ class Profiler:
     # main profiling function
     def profile(self, models_to_profile: List[ProfileModel]) -> None:
         results, attention_results, attention_kernel_infos = self._profile_models(models_to_profile)
+    
         if self.db_path:
-            self.write_to_db(results)
+            self.write_to_models_db(models_to_profile)
+            self.write_to_results_db(results)
         else:
             self.write_csv(results, attention_results, attention_kernel_infos)
 
@@ -810,7 +834,65 @@ class Profiler:
             )
         print(f"[PROFILER] Profiling complete. Results saved to {self.output_path}")
 
-    def write_to_db(self, results: List[Dict[str, Any]]) -> None:
+    def write_to_models_db(self, models: List[ProfileModel]) -> None:
+        """Write model names to SQLite database."""
+        if not self.db_path:
+            print("[PROFILER] No database path specified, skipping models database write")
+            return
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("BEGIN")
+
+            for model in models:
+                # Insert model and get the auto-generated model_id
+                cursor = conn.execute(
+                    """INSERT INTO profiled_models (model_name, model_family, backend) VALUES (?, ?, ?)""",
+                    (model.name, model.model_family, self.attention_backend)
+                )
+                model_id = cursor.lastrowid
+
+                # Use all_resolved_ops which contains ALL operations this model uses
+                # (not just the ones that need profiling)
+                for module, callable_obj, sig_hash, sig_json in model.all_resolved_ops:
+                    if sig_hash:
+                        # First check if signature already exists
+                        cursor = conn.execute(
+                            "SELECT operation_id FROM signatures WHERE signature_hash = ?",
+                            (sig_hash,)
+                        )
+                        existing = cursor.fetchone()
+
+                        if existing:
+                            operation_id = existing[0]
+                        else:
+                            # Only insert if it doesn't exist (avoids incrementing counter)
+                            cursor = conn.execute(
+                                """INSERT INTO signatures (signature_hash, operation_name, signature_json)
+                                   VALUES (?, ?, ?)""",
+                                (sig_hash, module.operation_name, sig_json)
+                            )
+                            operation_id = cursor.lastrowid
+
+                        # Create relationship in model_operations table
+                        count = getattr(module, 'count', 1)
+                        conn.execute(
+                            """INSERT OR IGNORE INTO model_operations (model_id, operation_id, count)
+                               VALUES (?, ?, ?)""",
+                            (model_id, operation_id, count)
+                        )
+
+            conn.execute("COMMIT")
+            print(f"[PROFILER] Wrote {len(models)} models to database at {self.db_path}")
+
+        except Exception as e:
+            conn.execute("ROLLBACK")
+            print(f"[PROFILER] Error writing models to database: {e}")
+            raise
+        finally:
+            conn.close()
+
+    def write_to_results_db(self, results: List[Dict[str, Any]]) -> None:
         """Write profiling results to SQLite database."""
         if not self.db_path:
             print("[PROFILER] No database path specified, skipping database write")
@@ -825,12 +907,18 @@ class Profiler:
                 if not sig_hash:
                     continue
 
-                # Insert signature (ignore if already exists)
-                conn.execute(
-                    """INSERT OR IGNORE INTO signatures (signature_hash, operation_name, signature_json)
-                       VALUES (?, ?, ?)""",
-                    (sig_hash, result['operation_name'], result.get('signature_json'))
+                # Check if signature exists before inserting (to avoid incrementing autoincrement)
+                cursor = conn.execute(
+                    "SELECT operation_id FROM signatures WHERE signature_hash = ?",
+                    (sig_hash,)
                 )
+                if not cursor.fetchone():
+                    # Only insert if it doesn't exist
+                    conn.execute(
+                        """INSERT INTO signatures (signature_hash, operation_name, signature_json)
+                           VALUES (?, ?, ?)""",
+                        (sig_hash, result['operation_name'], result.get('signature_json'))
+                    )
 
                 # Insert result
                 conn.execute(

@@ -13,11 +13,12 @@ class ModelInfo:
         trace_dir: str,
         dtype: torch.dtype
     ):
-        # load model configuration 
+        # load model configuration
         self.config = get_config(name, trust_remote_code=True)
         self.name = name
         self.dtype = dtype
-        
+        self.model_family = self.get_model_family()
+
         # model config values
         self.vocab_size = self.get_vocab_size()
         self.hidden_size = self.get_hidden_size()
@@ -39,6 +40,7 @@ class ModelInfo:
 
         self.to_profile: List[ModuleInfo] = self.used_ops
         self.to_profile_resolved: List[Tuple[ModuleInfo, Callable]] = []
+        self.all_resolved_ops: List[Tuple[ModuleInfo, Callable, str, str]] = []  # All ops with signatures
         
     def compare_with_many(self, models: List['ModelInfo'], db_path: Optional[str] = None) -> None:
         all_models = list(models)
@@ -50,16 +52,22 @@ class ModelInfo:
         model_names = [model.name for model in all_models]
         # list of [list of (ModuleInfo, Callable)]
         model_modules = [model.to_profile_resolved for model in all_models]
-        pruned = comparator.prune_overlaps(model_modules, model_names, db_path=db_path)
+        pruned, all_ops = comparator.prune_overlaps(model_modules, model_names, db_path=db_path)
 
-        # update all models' to_profile_resolved and to_profile
-        # pruned now returns 4-tuples: (module, callable, sig_hash, sig_json)
+        # update all models
         for model in all_models:
+            # to_profile_resolved: operations that need profiling
             model.to_profile_resolved = pruned.get(model.name, [])
             model.to_profile = [module for module, _, _, _ in model.to_profile_resolved]
+            # all_resolved_ops: ALL operations with signatures (for model_operations table)
+            model.all_resolved_ops = all_ops.get(model.name, [])
 
 
     # common values across model configs
+    def get_model_family(self) -> str:
+        """Get model family from config's model_type attribute."""
+        return getattr(self.config, "model_type", "unknown")
+
     def get_hidden_size(self) -> int:
         return getattr(self.config, "hidden_size", None)
     def get_num_heads(self) -> int:
