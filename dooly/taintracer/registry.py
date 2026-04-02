@@ -98,7 +98,14 @@ def register_taint(value: int | float, taint: Taint, components: Optional[Dict[T
             is_identical = existing.get('components', {}) == components
         elif not is_existing_mix and not is_new_mix:
             is_identical = existing == taint
-
+           
+        # small addition to prevent error when testing whether decode has different call path
+        # allow overlap for num_req and num_tok since they are flipped from prefill to decode phase change
+        # if not is_identical and ((taint == Taint('NUM_REQS') and existing == Taint('NUM_TOKS')) or (taint == Taint('NUM_TOKS') and existing == Taint('NUM_REQS'))):
+        #     print(f"[DEBUG] Allowing NUM_REQ/NUM_TOK overlap for value {value} due to prefill/decode phase change")
+        #     TAINT_REGISTRY[value] = taint
+        #     return
+            
         if not is_identical:
             raise ValueError(
                 f"\n{'='*80}\n"

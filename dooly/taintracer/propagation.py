@@ -58,6 +58,10 @@ def propagate_taints(
                     elif existing_val is not None and new_val is None:
                         pass  # Keep existing non-None
                     elif existing_val != new_val:
+                        # simple check added to prevent error when testing whether decode has different call path
+                        # if existing_val == Taint("NUM_TOKS") and new_val == Taint("NUM_REQS") or existing_val == Taint("NUM_REQS") and new_val == Taint("NUM_TOKS"):
+                        #     print(f"[DEBUG] Allowing NUM_REQ/NUM_TOK overlap for input dimension size {size} due to prefill/decode phase change")
+                        # else:   
                         # Only raise error if both are non-None and different
                         raise ValueError(f"Multiple different taints for input dimension size {size}: {input_dim_taints[size]} vs {taint}")
 

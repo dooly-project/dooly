@@ -273,7 +273,7 @@ def resolve_taint_from_operands(self_taint, other_taint, result_val, self_val=No
         base_taint = None
         # Rule 2: Both contain CONFIG → CONFIG
         if 'CONFIG' in self_str and 'CONFIG' in other_str:
-            base_taint = Taint('CONFIG')
+            base_taint = Taint('MODEL_CONFIG')
         # Rule 3: NUM + CONFIG → MIX
         elif (('NUM' in self_str or 'MIX' in other_str) and 'CONFIG' in other_str) or \
              ('CONFIG' in self_str and ('NUM' in other_str or 'MIX' in other_str)):
