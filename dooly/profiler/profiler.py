@@ -250,16 +250,19 @@ class Profiler:
             CREATE TABLE IF NOT EXISTS results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 signature_hash TEXT NOT NULL,
-                num_tokens INTEGER,
-                num_requests INTEGER,
-                num_tensor_parallel_workers INTEGER,
                 mean_latency_ms REAL,
                 median_latency_ms REAL,
                 max_latency_ms REAL,
                 min_latency_ms REAL,
                 std_latency_ms REAL,
-                input_shapes TEXT,
-                workload_params TEXT,
+                num_tokens INTEGER,
+                num_requests INTEGER,
+                is_context BOOLEAN NULL,
+                is_prefill BOOLEAN NULL,
+                kv_cache_size INTEGER NULL,
+                prefill_chunk_size INTEGER NULL,
+                num_tensor_parallel_workers INTEGER,
+                input_shapes TEXT, 
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (signature_hash) REFERENCES signatures(signature_hash)
             )
@@ -417,7 +420,7 @@ class Profiler:
             dtype=str(self.dtype).split(".")[-1],
             enforce_eager=True,
             gpu_memory_utilization=0.9,
-            max_model_len=self.max_seq_len,
+            max_model_len=self.max_model_len,
             attn_backend=self.attention_backend,
             gpu=self.gpu,
         )
@@ -920,25 +923,39 @@ class Profiler:
                         (sig_hash, result['operation_name'], result.get('signature_json'))
                     )
 
-                # Insert result
+                workload_params = result.get('workload_params', {})
+                num_tokens = workload_params.get('num_tokens')
+                num_requests = workload_params.get('num_requests')
+                is_prefill = workload_params.get('is_prefill', None)
+                prefill_chunk_size = workload_params.get('prefill_chunk_size', None)
+                kv_cache_size = workload_params.get('kv_cache_size', None)
+                is_context = is_prefill is not None and kv_cache_size is not None and prefill_chunk_size is not None
+
+                # Insert result with individual columns for workload params
                 conn.execute(
                     """INSERT INTO results (
-                        signature_hash, num_tokens, num_requests, num_tensor_parallel_workers,
+                        signature_hash,
                         mean_latency_ms, median_latency_ms, max_latency_ms, min_latency_ms, std_latency_ms,
-                        input_shapes, workload_params
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        num_tokens, num_requests,
+                        is_context, is_prefill, kv_cache_size, prefill_chunk_size,
+                        num_tensor_parallel_workers,
+                        input_shapes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         sig_hash,
-                        result.get('num_tokens'),
-                        result.get('num_requests'),
-                        result.get('num_tensor_parallel_workers', self.tp_config),
                         result.get('mean_latency_ms'),
                         result.get('median_latency_ms'),
                         result.get('max_latency_ms'),
                         result.get('min_latency_ms'),
                         result.get('std_latency_ms'),
+                        num_tokens,
+                        num_requests,
+                        is_context,
+                        is_prefill,
+                        kv_cache_size,
+                        prefill_chunk_size,
+                        result.get('num_tensor_parallel_workers', self.tp_config),
                         json.dumps(result.get('input_shapes', [])),
-                        json.dumps(result.get('workload_params', {})),
                     )
                 )
 

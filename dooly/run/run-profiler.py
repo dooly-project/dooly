@@ -73,8 +73,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_model(model, dtype, attention_backend, max_model_len, result_queue, gpu):
+def resolve_model(model, dtype, attention_backend, max_seq_len, result_queue, gpu):
     importer=OpImporter()
+
+    # Get the minimum of user-specified max_seq_len and model's actual max
+    model_max = model.get_max_model_len()
+    if model_max:
+        max_model_len = min(max_seq_len, model_max)
+        print(f"[RESOLVER] Using max_model_len={max_model_len} (min of user's {max_seq_len} and model's {model_max})")
+    else:
+        max_model_len = max_seq_len
+        print(f"[RESOLVER] Using max_model_len={max_model_len} from user config")
+
     vlp = VLLMLayerProfiler(
         model_name=model.name,
         dtype=str(model.dtype).split(".")[-1],
