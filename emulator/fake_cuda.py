@@ -98,7 +98,8 @@ def apply_fake_tp_patches(tp_size: int) -> None:
 
 class Dummy:
     def __init__(self, *args, **kwargs):
-        print("In init!")
+        # print("In init!")
+        pass
 
     def __getattr__(self, name):
         def noop(*args, **kwargs):

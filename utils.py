@@ -1,11 +1,89 @@
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import List, Dict, Optional
+import csv
+import os
+
+@dataclass
+class TokenEvent:
+    """Record of a single token generation event."""
+    token_index: int  # 0 = first token, 1 = second token, etc.
+    timestamp_ms: float  # Simulation time when token was generated (milliseconds)
+    step_duration_ms: float  # Duration of the step that generated this token (milliseconds)
+    batch_size: int  # Number of requests in the batch
+    total_tokens_in_batch: int  # Total tokens generated in this step
+
+@dataclass
+class RequestTrace:
+    """Detailed trace of a single request with token-level tracking."""
+    request_id: str
+    arrival_time_ms: float  # Milliseconds
+    prompt_len: int
+    max_output_len: int
+
+    # Token generation events
+    token_events: List[TokenEvent] = field(default_factory=list)
+
+    # Scheduling info
+    scheduled_time_ms: Optional[float] = None  # When request was first scheduled (started processing)
+
+    # Completion info
+    finish_time_ms: Optional[float] = None  # Milliseconds
+    finish_reason: Optional[str] = None
+
+    @property
+    def actual_output_len(self) -> int:
+        """Number of tokens actually generated."""
+        return len(self.token_events)
+
+    @property
+    def queue_time_ms(self) -> Optional[float]:
+        """Time spent waiting in queue before processing starts (milliseconds)."""
+        if self.scheduled_time_ms is None:
+            return None
+        return self.scheduled_time_ms - self.arrival_time_ms
+
+    @property
+    def ttft_ms(self) -> Optional[float]:
+        """Time to first token (milliseconds)."""
+        if not self.token_events:
+            return None
+        return self.token_events[0].timestamp_ms - self.arrival_time_ms
+
+    @property
+    def total_latency_ms(self) -> Optional[float]:
+        """Total end-to-end latency (milliseconds)."""
+        if self.finish_time_ms is None:
+            return None
+        return self.finish_time_ms - self.arrival_time_ms
+
+    @property
+    def inter_token_latencies_ms(self) -> List[float]:
+        """List of inter-token latencies in milliseconds (time between consecutive tokens)."""
+        if len(self.token_events) < 2:
+            return []
+        return [
+            self.token_events[i].timestamp_ms - self.token_events[i-1].timestamp_ms
+            for i in range(1, len(self.token_events))
+        ]
+
+    @property
+    def mean_inter_token_latency_ms(self) -> Optional[float]:
+        """Average inter-token latency in milliseconds (decode phase)."""
+        itls = self.inter_token_latencies_ms
+        return sum(itls) / len(itls) if itls else None
+
+    @property
+    def throughput_tokens_per_sec(self) -> Optional[float]:
+        """Overall throughput in tokens/second."""
+        if self.total_latency_ms is None or self.total_latency_ms == 0:
+            return None
+        return self.actual_output_len / (self.total_latency_ms / 1000.0)
 
 @dataclass
 class SimulationStep:
     """Record of a single simulation step."""
     step_id: int
-    sim_time: float
+    sim_time_ms: float  # Simulation time in milliseconds
 
     # Scheduling info
     num_scheduled_new: int
@@ -25,16 +103,168 @@ class SimulationStep:
     running_count: int
 
 
-@dataclass
 class SimulationResult:
-    """Results from a simulation run."""
-    steps: List[SimulationStep] = field(default_factory=list)
-    total_requests: int = 0
-    total_steps: int = 0
-    total_tokens_generated: int = 0
-    preemption_count: int = 0
+    """Results from a simulation run with export capabilities."""
 
-    # Per-request stats
-    request_latencies: Dict[str, float] = field(default_factory=dict)  # req_id -> total latency
-    request_ttft: Dict[str, float] = field(default_factory=dict)  # req_id -> time to first token
+    def __init__(self):
+        self.steps: List[SimulationStep] = []
+        self.total_requests: int = 0
+        self.total_steps: int = 0
+        self.total_tokens_generated: int = 0
+        self.preemption_count: int = 0
+
+        # Per-request stats (backward compatibility)
+        self.request_latencies: Dict[str, float] = {}  # req_id -> total latency
+        self.request_ttft: Dict[str, float] = {}  # req_id -> time to first token
+
+        # Detailed per-request traces
+        self.request_traces: Dict[str, RequestTrace] = {}  # req_id -> RequestTrace
+
+    def export_aggregate_csv(self, output_path: str) -> None:
+        """Export per-request aggregate statistics to CSV.
+
+        Columns: request_id, prompt_len, output_tokens, arrival_time_ms, queue_time_ms,
+                 ttft_ms, total_latency_ms, mean_itl_ms, throughput_tokens_per_sec
+        """
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+
+            # Write header
+            writer.writerow([
+                'request_id',
+                'prompt_len',
+                'output_tokens',
+                'arrival_time_ms',
+                'queue_time_ms',
+                'ttft_ms',
+                'total_latency_ms',
+                'mean_itl_ms',
+                'throughput_tokens_per_sec'
+            ])
+
+            # Write data rows
+            for req_id, trace in self.request_traces.items():
+                writer.writerow([
+                    req_id,
+                    trace.prompt_len,
+                    trace.actual_output_len,
+                    f"{trace.arrival_time_ms:.2f}",
+                    f"{trace.queue_time_ms:.2f}" if trace.queue_time_ms is not None else "",
+                    f"{trace.ttft_ms:.2f}" if trace.ttft_ms is not None else "",
+                    f"{trace.total_latency_ms:.2f}" if trace.total_latency_ms is not None else "",
+                    f"{trace.mean_inter_token_latency_ms:.2f}" if trace.mean_inter_token_latency_ms is not None else "",
+                    f"{trace.throughput_tokens_per_sec:.2f}" if trace.throughput_tokens_per_sec is not None else ""
+                ])
+
+        print(f"Exported aggregate statistics to {output_path}")
+
+    def export_cdf_csv(self, output_path: str) -> None:
+        """Export TTFT and ITL data for CDF plotting.
+
+        Two CSV files will be created:
+        - {output_path}_ttft.csv: One TTFT value per request
+        - {output_path}_itl.csv: All inter-token latencies across all requests
+        """
+        # Remove .csv extension if present
+        base_path = output_path.replace('.csv', '')
+
+        # Export TTFT data
+        ttft_path = f"{base_path}_ttft.csv"
+        with open(ttft_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['request_id', 'ttft_ms'])
+
+            for req_id, trace in self.request_traces.items():
+                if trace.ttft_ms is not None:
+                    writer.writerow([req_id, f"{trace.ttft_ms:.2f}"])
+
+        print(f"Exported TTFT CDF data to {ttft_path}")
+
+        # Export ITL data
+        itl_path = f"{base_path}_itl.csv"
+        with open(itl_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['request_id', 'token_index', 'itl_ms'])
+
+            for req_id, trace in self.request_traces.items():
+                itls = trace.inter_token_latencies_ms
+                for i, itl in enumerate(itls):
+                    # token_index is the index of the token whose ITL this is (starts at 1)
+                    writer.writerow([req_id, i + 1, f"{itl:.2f}"])
+
+        print(f"Exported ITL CDF data to {itl_path}")
+
+    def export_throughput_vs_time_csv(self, output_path: str, window_ms: float = 100.0) -> None:
+        """Export throughput over time for plotting.
+
+        Calculates throughput in a sliding window and exports timestamped data.
+
+        Columns: time_ms, tokens_per_sec, num_active_requests
+        """
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['time_ms', 'tokens_per_sec', 'num_active_requests'])
+
+            # Collect all token generation events with timestamps
+            token_events = []
+            for req_id, trace in self.request_traces.items():
+                for event in trace.token_events:
+                    token_events.append((event.timestamp_ms, req_id))
+
+            # Sort by timestamp
+            token_events.sort(key=lambda x: x[0])
+
+            if not token_events:
+                print(f"Warning: No token events found for throughput calculation")
+                return
+
+            # Calculate throughput at regular intervals
+            start_time = token_events[0][0]
+            end_time = token_events[-1][0]
+
+            current_time = start_time
+            interval_ms = window_ms / 2  # Sample every half window for smoother curve
+
+            while current_time <= end_time:
+                # Count tokens in [current_time - window_ms, current_time]
+                window_start = current_time - window_ms
+                tokens_in_window = sum(1 for t, _ in token_events if window_start <= t <= current_time)
+
+                # Count unique active requests in window
+                active_reqs = set(req_id for t, req_id in token_events if window_start <= t <= current_time)
+
+                # Calculate throughput (tokens per second)
+                throughput = (tokens_in_window / window_ms) * 1000.0 if window_ms > 0 else 0.0
+
+                writer.writerow([
+                    f"{current_time:.2f}",
+                    f"{throughput:.2f}",
+                    len(active_reqs)
+                ])
+
+                current_time += interval_ms
+
+        print(f"Exported throughput vs time to {output_path}")
+
+    def export_all_csvs(self, output_dir: str, prefix: str = "simulation") -> None:
+        """Export all CSV files for analysis.
+
+        Args:
+            output_dir: Directory to save CSV files
+            prefix: Prefix for CSV filenames
+        """
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Export all three types of CSVs
+        aggregate_path = os.path.join(output_dir, f"{prefix}_aggregate.csv")
+        self.export_aggregate_csv(aggregate_path)
+
+        cdf_base_path = os.path.join(output_dir, f"{prefix}_cdf")
+        self.export_cdf_csv(cdf_base_path)
+
+        throughput_path = os.path.join(output_dir, f"{prefix}_throughput_vs_time.csv")
+        self.export_throughput_vs_time_csv(throughput_path)
+
+        print(f"\nAll CSV files exported to {output_dir}/")
 
