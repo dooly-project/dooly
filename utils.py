@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 import csv
 import os
+import json 
 
 @dataclass
 class TokenEvent:
@@ -350,3 +351,34 @@ class SimulationResult:
 
         print(f"\nAll CSV files exported to {output_dir}/")
 
+
+def load_requests_from_jsonl(jsonl_path: str, tokenizer):
+
+    from .request import RequestConfig 
+    
+    print(f"Loading requests from {jsonl_path}...")
+
+    requests = []
+    with open(jsonl_path, 'r') as f:
+        for line_num, line in enumerate(f, 1):
+            entry = json.loads(line)
+
+            # Tokenize prompt
+            token_ids = tokenizer.encode(entry['prompt'])
+
+            # Create RequestConfig
+            req = RequestConfig(
+                request_id=entry.get('request_id', f"req_{line_num-1}"),
+                prompt_token_ids=token_ids,
+                max_tokens=entry['output_len'],
+                arrival_time=entry['arrival_time'],
+            )
+            requests.append(req)
+
+    print(f"✓ Loaded {len(requests)} requests from dataset")
+    if len(requests) > 0:
+        print(f"  Sample prompt lengths: {[len(r.prompt_token_ids) for r in requests[:5]]}")
+        print(f"  Sample output lengths: {[r.max_tokens for r in requests[:5]]}")
+        print(f"  Sample arrival times: {[f'{r.arrival_time:.3f}s' for r in requests[:5]]}")
+
+    return requests 

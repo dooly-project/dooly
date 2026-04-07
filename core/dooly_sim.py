@@ -68,7 +68,6 @@ class DoolySim:
         print(f"  head_size              : {self.head_size}")
         print(f"  max_num_seqs           : {self.max_num_seqs}")
         print(f"  max_num_batched_tokens : {self.max_num_batched_tokens}")
-        print(f"  step_duration_ms       : {self.step_duration_ms}")
         print("=" * 60)
 
     def _create_mock_output(self, scheduler_output, token_id: int = 1000):
@@ -79,8 +78,7 @@ class DoolySim:
         print(f"Adding Request {req.request_id} of prompt length {len(req.prompt_token_ids)}")
         self.scheduler.add_request(req)
 
-        # Use actual_arrival_time_ms (current sim_time or wall-clock elapsed time)
-        # This ensures queue_time and latency calculations use consistent time base
+        # Use actual_arrival_time_ms (current sim_time)
         self.request_arrival_times_ms[config.request_id] = actual_arrival_time_ms
 
         # Create RequestTrace for detailed tracking
@@ -96,7 +94,6 @@ class DoolySim:
         request_stream: Iterator[RequestConfig],
         max_steps: int = 10000,
         verbose: bool = False,
-        use_simulated_time: bool = True,  # Set to False to use wall-clock time like vLLM streaming
     ) -> SimulationResult:
         result = SimulationResult()
         all_requests = list(request_stream)
@@ -108,29 +105,16 @@ class DoolySim:
         step_id = 0
         prev_output = None
 
-        # Track wall-clock time if needed for fair comparison
-        import time
-        benchmark_start_time = time.perf_counter() if not use_simulated_time else None
-
         if verbose:
             print(f"Starting simulation with {len(all_requests)} requests")
             print(f"Block capacity: {self.num_blocks} blocks x {self.block_size} = {self.num_blocks * self.block_size} tokens")
-            if not use_simulated_time:
-                print(f"Using wall-clock time for request arrivals (fair comparison mode)")
-            print()
 
         while step_id < max_steps:
             # 1. Add any requests that have arrived by this time
-            # Use wall-clock time or simulated time depending on mode
-            if use_simulated_time:
-                current_time_ms = sim_time_ms
-            else:
-                elapsed_time_s = time.perf_counter() - benchmark_start_time
-                current_time_ms = elapsed_time_s * 1000.0
-
+            current_time_ms = sim_time_ms
+            
             while request_idx < len(all_requests) and all_requests[request_idx].arrival_time * 1000.0 <= current_time_ms :
                 req_config = all_requests[request_idx]
-                # Pass current_time_ms (simulated or wall-clock) as actual arrival time
                 self._add_request(req_config, result, current_time_ms)
                 if verbose:
                     print(f"[t={sim_time_ms:.1f}ms] Request {req_config.request_id} arrived "
