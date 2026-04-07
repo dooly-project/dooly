@@ -229,6 +229,104 @@ class Profiler:
         self._global_kv_cache: Optional[torch.Tensor] = None
         self._global_kv_cache_spec: Optional[Tuple[int, int, int, int]] = None
 
+    def _profile_with_batched_cuda_graph(
+        self,
+        run_fn: Callable,
+        warmup_runs: int = 5,
+        profile_runs: int = 20,
+        iterations_per_graph: int = 10
+    ) -> List[float]:
+        """
+        Profile using batched CUDA graph approach for minimal CPU overhead.
+
+        Captures N consecutive kernel launches in a single CUDA graph,
+        then measures the batch execution time and divides by N.
+
+        This eliminates:
+        - CPU loop overhead between iterations
+        - graph.replay() call overhead (only 1 call per batch)
+        - GPU idle time between operations
+
+        Args:
+            run_fn: Callable that executes the operation to profile
+            warmup_runs: Number of warmup iterations
+            profile_runs: Total number of profiling measurements desired
+            iterations_per_graph: Number of operations to batch in graph
+
+        Returns:
+            List of per-operation timing measurements in milliseconds
+        """
+        # Warmup
+        for _ in range(warmup_runs):
+            run_fn()
+        torch.cuda.synchronize()
+
+        # Capture the graph with N consecutive kernel launches
+        graph = torch.cuda.CUDAGraph()
+
+        try:
+            with torch.cuda.graph(graph):
+                # Capture N operations back-to-back (no events inside graph)
+                for _ in range(iterations_per_graph):
+                    run_fn()
+        except Exception as e:
+            # CUDA graph capture failed - fall back to standard profiling
+            print(f"[PROFILER] CUDA Graph capture failed ({e}), using standard profiling")
+            return self._profile_standard(run_fn, warmup_runs, profile_runs)
+
+        # Measure the graph replay time (events OUTSIDE graph)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        batch_timings = []
+        num_replays = max(1, profile_runs // iterations_per_graph)
+
+        for _ in range(num_replays):
+            start_event.record()
+            graph.replay()  # Replays all N operations at once
+            end_event.record()
+            torch.cuda.synchronize()
+
+            batch_time = start_event.elapsed_time(end_event)
+            batch_timings.append(batch_time)
+
+        # Compute per-operation timings
+        # Each batch_time is for iterations_per_graph operations
+        per_op_timings = [t / iterations_per_graph for t in batch_timings]
+
+        return per_op_timings
+
+    def _profile_standard(
+        self,
+        run_fn: Callable,
+        warmup_runs: int = 5,
+        profile_runs: int = 20
+    ) -> List[float]:
+        """
+        Standard profiling with CUDA events (fallback method).
+
+        Sequential event recording with sync after each iteration.
+        Used when CUDA graphs fail or are not applicable.
+        """
+        # Warmup
+        for _ in range(warmup_runs):
+            run_fn()
+        torch.cuda.synchronize()
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        run_results = []
+        for _ in range(profile_runs):
+            start_event.record()
+            run_fn()
+            end_event.record()
+            torch.cuda.synchronize()
+            latency_ms = start_event.elapsed_time(end_event)
+            run_results.append(latency_ms)
+
+        return run_results
+
     def _init_db(self) -> None:
         """Initialize SQLite database with required tables."""
         # Create parent directory if needed
@@ -539,23 +637,32 @@ class Profiler:
                         callable_obj(*args, **kwargs)
 
                 try:
-                    # Warmup
-                    for _ in range(5):
-                        run_callable()
+                    # NEW: Use batched CUDA graph profiling for minimal CPU overhead
+                    run_results = self._profile_with_batched_cuda_graph(
+                        run_fn=run_callable,
+                        warmup_runs=5,
+                        profile_runs=20,
+                        iterations_per_graph=10
+                    )
 
-                    torch.cuda.synchronize()
-
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-
-                    run_results = []
-                    for _ in range(20):
-                        start_event.record()
-                        run_callable()
-                        end_event.record()
-                        torch.cuda.synchronize()
-                        latency_ms = start_event.elapsed_time(end_event)
-                        run_results.append(latency_ms)
+                    # OLD: Standard sequential profiling (commented out)
+                    # # Warmup
+                    # for _ in range(5):
+                    #     run_callable()
+                    #
+                    # torch.cuda.synchronize()
+                    #
+                    # start_event = torch.cuda.Event(enable_timing=True)
+                    # end_event = torch.cuda.Event(enable_timing=True)
+                    #
+                    # run_results = []
+                    # for _ in range(20):
+                    #     start_event.record()
+                    #     run_callable()
+                    #     end_event.record()
+                    #     torch.cuda.synchronize()
+                    #     latency_ms = start_event.elapsed_time(end_event)
+                    #     run_results.append(latency_ms)
 
                     # Use original inputs for shape tracking (not args which may have list wrapping)
                     all_inputs = inputs
@@ -675,6 +782,9 @@ class Profiler:
                 args, kwargs = prepare_op_args(callable_obj, module.operation_name, inputs)
 
                 forward_context = None
+                slot_mapping_dict = None
+                num_tokens_for_context = None
+
                 if layer_name and isinstance(workload_config, AttentionBatchConfig):
                     batch_config = AttentionBatchConfig(
                         batch_size=workload_config.batch_size,
@@ -689,9 +799,17 @@ class Profiler:
                             continue
                         layer_metadata, _ = result
                         forward_context = {layer_name: layer_metadata}
+
+                        # Get slot_mapping from CommonAttentionMetadata for KV cache updates
+                        common_meta = self.module_caller._build_common_attention_metadata(batch_config, kv_cache_gid=0)
+                        if common_meta is not None:
+                            slot_mapping_dict = {layer_name: common_meta.slot_mapping}
+                            num_tokens_for_context = common_meta.num_actual_tokens
                     except Exception as e:
                         print(f"[PROFILER] Warning: Could not build metadata: {e}")
                         forward_context = None
+                        slot_mapping_dict = None
+                        num_tokens_for_context = None
 
                 def run_callable():
                     # Reconstruct kwargs from arg_name if present (for modules called with keyword args)
@@ -732,34 +850,55 @@ class Profiler:
                             if getattr(pi, 'arg_name', None) is not None
                         }
                         with set_current_vllm_config(self.module_caller.vllm_config):
-                            with set_forward_context(forward_context, self.module_caller.vllm_config, virtual_engine=0):
+                            with set_forward_context(
+                                forward_context,
+                                self.module_caller.vllm_config,
+                                virtual_engine=0,
+                                num_tokens=num_tokens_for_context,
+                                slot_mapping=slot_mapping_dict
+                            ):
                                 callable_obj(*positional_tensors, **kwarg_tensors)
                     else:
                         with set_current_vllm_config(self.module_caller.vllm_config):
-                            with set_forward_context(forward_context, self.module_caller.vllm_config, virtual_engine=0):
+                            with set_forward_context(
+                                forward_context,
+                                self.module_caller.vllm_config,
+                                virtual_engine=0,
+                                num_tokens=num_tokens_for_context,
+                                slot_mapping=slot_mapping_dict
+                            ):
                                 callable_obj(*args, **kwargs)
 
                 run_fn = run_callable_with_context if forward_context else run_callable
 
                 try:
+                    # NEW: Use batched CUDA graph profiling for minimal CPU overhead
+                    run_results = self._profile_with_batched_cuda_graph(
+                        run_fn=run_fn,
+                        warmup_runs=5,
+                        profile_runs=20,
+                        iterations_per_graph=10
+                    )
+
+                    # OLD: Standard sequential profiling (commented out)
                     # warm up
-                    for _ in range(5):
-                        run_fn()
-
-                    torch.cuda.synchronize()
-
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-
-                    # 20 runs
-                    run_results = []
-                    for _ in range(20):
-                        start_event.record()
-                        run_fn()
-                        end_event.record()
-                        torch.cuda.synchronize()
-                        latency_ms = start_event.elapsed_time(end_event)
-                        run_results.append(latency_ms)
+                    # for _ in range(5):
+                    #     run_fn()
+                    
+                    # torch.cuda.synchronize()
+                    
+                    # start_event = torch.cuda.Event(enable_timing=True)
+                    # end_event = torch.cuda.Event(enable_timing=True)
+                    
+                    # # 20 runs
+                    # run_results = []
+                    # for _ in range(20):
+                    #     start_event.record()
+                    #     run_fn()
+                    #     end_event.record()
+                    #     torch.cuda.synchronize()
+                    #     latency_ms = start_event.elapsed_time(end_event)
+                    #     run_results.append(latency_ms)
 
                     # Use original inputs for shape tracking (before prepare_op_args wraps list args)
                     all_inputs = inputs

@@ -74,7 +74,7 @@ def main():
     parser.add_argument("--tp", "--tensor_parallel_size", nargs='+', type=int, default=[1])
     parser.add_argument("--gpu", type=int, default=0, help="GPU device index to use")
     parser.add_argument("--profile-only", action="store_true", help="Skip tracing, only run profiler")
-    parser.add_argument("--workspace-dir", type=str, default="./vllm_traces_tp", help="Directory to save trace and profile")
+    parser.add_argument("--workspace-dir", type=str, default="vllm_traces_tp", help="Directory to save trace and profile")
     parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
     parser.add_argument("--db-path", type=str, default=None, help="Path to SQLite database for persistent storage and deduplication")
     args = parser.parse_args()
