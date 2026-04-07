@@ -16,7 +16,8 @@ from vllm import LLM
 
 def emulate_init(model, args={}):
     # Create simulator with limited blocks to potentially trigger preemption
-    return LLM(model=model, load_format="dummy", enforce_eager=True, **args)
+    llm = LLM(model=model, load_format="dummy", enforce_eager=True, **args)
+    return llm
 
 if __name__ == "__main__":
     llm = emulate_init(model="gpt2", args={"max_model_len": 512})

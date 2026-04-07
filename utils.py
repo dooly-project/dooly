@@ -246,6 +246,88 @@ class SimulationResult:
 
         print(f"Exported throughput vs time to {output_path}")
 
+    def export_vllm_json(self, output_path: str, model_id: str, request_rate: float) -> None:
+        """Export results in vLLM benchmark JSON format for easy comparison.
+
+        This matches the output format from `vllm bench serve --save-result`.
+
+        Args:
+            output_path: Path to output JSON file
+            model_id: Model identifier
+            request_rate: Request arrival rate used
+        """
+        import json
+        from datetime import datetime
+
+        # Calculate aggregate metrics
+        # Sort traces by arrival_time to match input request order
+        traces = sorted(self.request_traces.values(), key=lambda t: t.arrival_time_ms)
+        if not traces:
+            print("No traces to export")
+            return
+
+        # Get simulation duration (from first arrival to last completion)
+        start_time = min(t.arrival_time_ms for t in traces)
+        end_time = max(t.finish_time_ms for t in traces if t.finish_time_ms is not None)
+        duration_sec = (end_time - start_time) / 1000.0
+
+        completed = sum(1 for t in traces if t.finish_time_ms is not None)
+        total_input_tokens = sum(t.prompt_len for t in traces)
+        total_output_tokens = sum(t.actual_output_len for t in traces)
+
+        # Build result dict matching vLLM format
+        result = {
+            "date": datetime.now().strftime("%Y%m%d-%H%M%S"),
+            "endpoint_type": "dooly_sim",
+            "backend": "dooly_sim",
+            "label": None,
+            "model_id": model_id,
+            "tokenizer_id": model_id,
+            "num_prompts": len(traces),
+            "request_rate": request_rate,
+            "burstiness": 1,
+            "max_concurrency": None,
+            "duration": duration_sec,
+            "completed": completed,
+            "failed": len(traces) - completed,
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "request_throughput": completed / duration_sec if duration_sec > 0 else 0,
+            "request_goodput": None,
+            "output_throughput": total_output_tokens / duration_sec if duration_sec > 0 else 0,
+            "total_token_throughput": (total_input_tokens + total_output_tokens) / duration_sec if duration_sec > 0 else 0,
+
+            # Per-request arrays
+            "input_lens": [t.prompt_len for t in traces],
+            "output_lens": [t.actual_output_len for t in traces],
+            "ttfts": [t.ttft_ms / 1000.0 if t.ttft_ms is not None else 0 for t in traces],  # Convert to seconds
+            "itls": [[itl / 1000.0 for itl in t.inter_token_latencies_ms] for t in traces],  # Convert to seconds
+            "e2els": [t.total_latency_ms / 1000.0 if t.total_latency_ms is not None else 0 for t in traces],  # End-to-end latency in seconds
+
+            # Additional metrics (match vLLM format)
+            # ttft_ms is already in milliseconds (don't multiply by 1000!)
+            "mean_ttft_ms": sum(t.ttft_ms for t in traces if t.ttft_ms is not None) / completed if completed > 0 else 0,
+            "mean_itl_ms": sum(t.mean_inter_token_latency_ms for t in traces if t.mean_inter_token_latency_ms is not None) / completed if completed > 0 else 0,
+
+            # Batch information per step (matching vLLM format)
+            "batch_info": [
+                {
+                    "step": step.step_id,
+                    "batch_size": len(step.scheduled_req_ids),
+                    "req_ids": step.scheduled_req_ids,
+                    "total_tokens": step.total_tokens_scheduled
+                }
+                for step in self.steps
+            ],
+        }
+
+        # Write JSON
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(result, f, indent=2)
+
+        print(f"Exported vLLM-format JSON to {output_path}")
+
     def export_all_csvs(self, output_dir: str, prefix: str = "simulation") -> None:
         """Export all CSV files for analysis.
 

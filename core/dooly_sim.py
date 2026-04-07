@@ -14,8 +14,11 @@ class DoolySim:
         cache_dir: str = "/home/jkim38/dooly/simulator/llama-3.1-8b-FLASHINFER",
         db_path: str = "/home/jkim38/dooly/profiler/database/dooly_data.db",
         backend: str = "FLASHINFER",
+        cpu_overhead: float = 10.0
     ):
-        self.llm = emulate_init(model=model, args=args)
+        self.cpu_overhead = cpu_overhead
+        self.llm= emulate_init(model=model, args=args)
+        self.tokenizer = self.llm.get_tokenizer()
         self.vllm_config = self.llm.llm_engine.vllm_config
         cache_cfg = self.vllm_config.cache_config
         model_cfg = self.vllm_config.model_config
@@ -71,19 +74,19 @@ class DoolySim:
     def _create_mock_output(self, scheduler_output, token_id: int = 1000):
         return create_mock_output(self, scheduler_output, token_id)
         
-    def _add_request(self, config: RequestConfig, result: SimulationResult):
+    def _add_request(self, config: RequestConfig, result: SimulationResult, actual_arrival_time_ms: float):
         req = make_request(self, config)
         print(f"Adding Request {req.request_id} of prompt length {len(req.prompt_token_ids)}")
         self.scheduler.add_request(req)
 
-        # Convert arrival time to milliseconds (config uses seconds)
-        arrival_time_ms = config.arrival_time * 1000.0
-        self.request_arrival_times_ms[config.request_id] = arrival_time_ms
+        # Use actual_arrival_time_ms (current sim_time or wall-clock elapsed time)
+        # This ensures queue_time and latency calculations use consistent time base
+        self.request_arrival_times_ms[config.request_id] = actual_arrival_time_ms
 
         # Create RequestTrace for detailed tracking
         result.request_traces[config.request_id] = RequestTrace(
             request_id=config.request_id,
-            arrival_time_ms=arrival_time_ms,
+            arrival_time_ms=actual_arrival_time_ms,
             prompt_len=len(config.prompt_token_ids),
             max_output_len=config.max_tokens,
         )
@@ -93,6 +96,7 @@ class DoolySim:
         request_stream: Iterator[RequestConfig],
         max_steps: int = 10000,
         verbose: bool = False,
+        use_simulated_time: bool = True,  # Set to False to use wall-clock time like vLLM streaming
     ) -> SimulationResult:
         result = SimulationResult()
         all_requests = list(request_stream)
@@ -100,20 +104,34 @@ class DoolySim:
         result.total_requests = len(all_requests)
 
         request_idx = 0
-        sim_time_ms = 0.0 
+        sim_time_ms = 0.0  # Simulated time (advances by predicted latency)
         step_id = 0
         prev_output = None
+
+        # Track wall-clock time if needed for fair comparison
+        import time
+        benchmark_start_time = time.perf_counter() if not use_simulated_time else None
 
         if verbose:
             print(f"Starting simulation with {len(all_requests)} requests")
             print(f"Block capacity: {self.num_blocks} blocks x {self.block_size} = {self.num_blocks * self.block_size} tokens")
+            if not use_simulated_time:
+                print(f"Using wall-clock time for request arrivals (fair comparison mode)")
             print()
 
         while step_id < max_steps:
             # 1. Add any requests that have arrived by this time
-            while request_idx < len(all_requests) and all_requests[request_idx].arrival_time * 1000.0 <= sim_time_ms:
+            # Use wall-clock time or simulated time depending on mode
+            if use_simulated_time:
+                current_time_ms = sim_time_ms
+            else:
+                elapsed_time_s = time.perf_counter() - benchmark_start_time
+                current_time_ms = elapsed_time_s * 1000.0
+
+            while request_idx < len(all_requests) and all_requests[request_idx].arrival_time * 1000.0 <= current_time_ms :
                 req_config = all_requests[request_idx]
-                self._add_request(req_config, result)
+                # Pass current_time_ms (simulated or wall-clock) as actual arrival time
+                self._add_request(req_config, result, current_time_ms)
                 if verbose:
                     print(f"[t={sim_time_ms:.1f}ms] Request {req_config.request_id} arrived "
                           f"(prompt={len(req_config.prompt_token_ids)}, max_out={req_config.max_tokens})")
@@ -176,7 +194,7 @@ class DoolySim:
                             # Update request trace with finish information
                             if out.request_id in result.request_traces:
                                 trace = result.request_traces[out.request_id]
-                                trace.finish_time_ms = sim_time_ms
+                                trace.finish_time_ms = sim_time_ms 
                                 trace.finish_reason = str(out.finish_reason)
 
                             if verbose:
@@ -229,12 +247,15 @@ class DoolySim:
                       f"free_blocks={free_blocks}, "
                       f"waiting={len(self.scheduler.waiting)}, "
                       f"running={len(self.scheduler.running)}")
+                # Log scheduling decision for comparison
+                print(f"  └─ SCHED: reqs={sorted(sched_output.num_scheduled_tokens.keys())}, "
+                      f"tokens_per_req={dict(sorted(sched_output.num_scheduled_tokens.items()))}")
                 if preempted:
                     print(f"           PREEMPTED: {preempted}")
 
             # 5.5. Estimate the step duration using regression models
             if sched_output.total_num_scheduled_tokens > 0:
-                self.step_duration_ms = self.latency_estimator.estimate_step_latency(sched_output, step_id=step_id)
+                self.step_duration_ms = self.latency_estimator.estimate_step_latency(sched_output, step_id=step_id) + self.cpu_overhead
 
             # 6. Advance simulation time
             if sched_output.total_num_scheduled_tokens > 0:
@@ -246,7 +267,7 @@ class DoolySim:
                 if request_idx < len(all_requests):
                     sim_time_ms = all_requests[request_idx].arrival_time * 1000.0
                 else:
-                    sim_time_ms += self.step_duration_ms
+                    sim_time_ms += 1  # Advance by a small amount to check for completion
 
             # this is wrong because this assumes that 
             # scheduler output is the same as engine output, which is not true when we have chunked prefill 

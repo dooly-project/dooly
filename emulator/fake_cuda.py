@@ -282,6 +282,7 @@ def apply_fake_cuda():
     torch.Tensor.cuda = fake_cuda
     torch.tensor = fake_tensor
     torch.arange = fake_arange
+    torch.Tensor.uniform_ = lambda self, *args, **kwargs: self
 
     torch.cuda.memory_stats = lambda *a, **k: {"allocated_bytes.all.peak": 0}
 
