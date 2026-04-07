@@ -138,7 +138,7 @@ def register_taint(value: int | float, taint: Taint, components: Optional[Dict[T
         # Pure taint
         TAINT_REGISTRY[value] = taint
 
-    print(f"[REGISTRY] Registered value {value} with taint {TAINT_REGISTRY[value]}")
+    # print(f"[REGISTRY] Registered value {value} with taint {TAINT_REGISTRY[value]}")
 
 def lookup_taint(value: int | float):
     """Look up taint info for a value in the global registry.

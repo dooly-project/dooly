@@ -101,18 +101,12 @@ try:
             if _orig_dummy_run is None:
                 _orig_dummy_run = GPUModelRunner._dummy_run
                 def debug_dummy_run(self, num_tokens, *args, **kwargs):
-                    print(f"\n[DEBUG _dummy_run] Called with num_tokens={num_tokens}, type={type(num_tokens)}, is_tainted={isinstance(num_tokens, TaintedInt)}", flush=True)
-                    if isinstance(num_tokens, TaintedInt):
-                        print(f"[DEBUG _dummy_run] num_tokens has taint: {num_tokens.taint}", flush=True)
                     return _orig_dummy_run(self, num_tokens, *args, **kwargs)
                 GPUModelRunner._dummy_run = debug_dummy_run
 
             if _orig_get_slot_mappings is None:
                 _orig_get_slot_mappings = GPUModelRunner._get_slot_mappings
                 def debug_get_slot_mappings(self, num_tokens_padded, *args, **kwargs):
-                    print(f"[DEBUG _get_slot_mappings] num_tokens_padded={num_tokens_padded}, type={type(num_tokens_padded)}, is_tainted={isinstance(num_tokens_padded, TaintedInt)}", flush=True)
-                    if isinstance(num_tokens_padded, TaintedInt):
-                        print(f"[DEBUG _get_slot_mappings] num_tokens_padded has taint: {num_tokens_padded.taint}", flush=True)
                     return _orig_get_slot_mappings(self, num_tokens_padded, *args, **kwargs)
                 GPUModelRunner._get_slot_mappings = debug_get_slot_mappings
 

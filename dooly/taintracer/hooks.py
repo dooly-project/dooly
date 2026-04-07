@@ -699,7 +699,7 @@ def _wrap_view_reshape(original_fn, fn_name):
                             else:
                                 aggregated[dim_taint.taint] = aggregated.get(dim_taint.taint, 1) * dim_size
                             
-                print(f"[DEBUG @ _wrap_view_reshape] Step 1 - aggregated input taints: {aggregated}")
+                # print(f"[DEBUG @ _wrap_view_reshape] Step 1 - aggregated input taints: {aggregated}")
 
                 # STEP 2: Extract consumed taints from reshape args (TaintedInt objects)
                 consumed = {}
@@ -716,7 +716,7 @@ def _wrap_view_reshape(original_fn, fn_name):
                         value = int(arg)
                         consumed[taint] = consumed.get(taint, 1) * value
                         
-                print(f"[DEBUG @ _wrap_view_reshape] Step 2 - consumed taints from reshape args: {consumed}, minus_one_idx: {minus_one_idx}")
+                # print(f"[DEBUG @ _wrap_view_reshape] Step 2 - consumed taints from reshape args: {consumed}, minus_one_idx: {minus_one_idx}")
 
                 # STEP 3: Validate and compute remaining taints
                 remaining = {}
@@ -746,7 +746,7 @@ def _wrap_view_reshape(original_fn, fn_name):
                         # Taint not consumed at all
                         remaining[taint] = agg_qty
 
-                print(f"[DEBUG @ _wrap_view_reshape] aggregated: {aggregated}, consumed: {consumed}, remaining: {remaining}, minus_one_idx: {minus_one_idx}")
+                # print(f"[DEBUG @ _wrap_view_reshape] aggregated: {aggregated}, consumed: {consumed}, remaining: {remaining}, minus_one_idx: {minus_one_idx}")
 
                 # STEP 4: Build output taints
                 output_taints = []
@@ -794,8 +794,8 @@ def _wrap_view_reshape(original_fn, fn_name):
                                 qty = remaining[taint]
 
                                 # Register as pure
-                                print(f"[DEBUG @ _wrap_view_reshape] Registering {resolved_value} as pure taint {taint} with quantity {qty}")
-
+                                # print(f"[DEBUG @ _wrap_view_reshape] Registering {resolved_value} as pure taint {taint} with quantity {qty}")
+ 
                                 # Ensure taint is not already a DimTaint before registering
                                 if isinstance(taint, DimTaint):
                                     # Extract the actual Taint object
@@ -819,7 +819,7 @@ def _wrap_view_reshape(original_fn, fn_name):
                                     # print(f"  components keys: {list(remaining.keys()) if remaining else 'N/A'}")
 
                                 # Register with components
-                                print(f"[DEBUG @ _wrap_view_reshape] Registering {resolved_value} as MIX with components: {remaining}")
+                                # print(f"[DEBUG @ _wrap_view_reshape] Registering {resolved_value} as MIX with components: {remaining}")
                                 register_taint(resolved_value, Taint('MIX'), components=remaining)
 
                                 # Create DimTaint with history for logging
@@ -833,12 +833,6 @@ def _wrap_view_reshape(original_fn, fn_name):
                             # Already a DimTaint - preserve it as-is (including merge_history)
                             if arg.taint.merge_history:
                                 # Has existing history - use it
-                                # if arg_value == 960:
-                                    # print(f"\n[RESHAPE DEBUG] Processing TaintedInt(960) with DimTaint that has merge_history")
-                                    # print(f"  arg.taint: {arg.taint}")
-                                    # print(f"  arg.taint.taint: {arg.taint.taint}")
-                                    # print(f"  arg.taint.merge_history: {arg.taint.merge_history}")
-                                    # print(f"  Preserving merge_history as-is")
                                 output_taints.append(DimTaint(arg.taint.taint, merge_history=arg.taint.merge_history))
                             else:
                                 output_taints.append(DimTaint(arg.taint.taint, merge_history={arg.taint.taint: arg_value}))
@@ -2532,6 +2526,10 @@ def install_hooks(int_patch_modules=()):
         torch.full = _wrap_factory_output(torch._original_full)
         torch.as_tensor = _wrap_factory_output(torch._original_as_tensor)
         torch.from_numpy = _wrap_factory_output(torch._original_from_numpy)
+        
+                
+        # to speed up init process
+        torch.Tensor.uniform_ = lambda self, *args, **kwargs: self
 
     # Swap dispatch to profiler-annotated version
     # DEBUG: Set DISABLE_PROFILER_DISPATCH=1 to use original dispatch
