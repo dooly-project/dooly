@@ -222,6 +222,7 @@ class HierarchicalTraceParser:
         self.cpu_ops: List[Event] = []      # CPU operation events
         self.kernels: List[Event] = []      # GPU kernel events
         self.taints: List[Event] = []       # user_annotation events
+        self.comm_ops: List[Event] = []     # Communication operations (separate from hierarchy)
         self.external_id_to_events: Dict[int, List[Event]] = {}
 
     def parse(self):
@@ -404,8 +405,43 @@ class HierarchicalTraceParser:
                 # CPU operation
                 event_cat = 'cpu_op'
                 event_name = name
+            elif cat == 'user_annotation' and name.startswith('COMM:'):
+                # Communication operation annotation - handle separately
+                # Name format: "COMM: vllm::all_reduce IN:[...] ARGS:[...]"
+                event_cat = 'comm'
+                event_name = name.split(' IN:')[0].replace('COMM: ', '').strip()
+                if ' IN:' in name:
+                    # Extract IN section (tensor shapes)
+                    in_section = name.split(' IN:')[1]
+                    if ' ARGS:' in in_section:
+                        event_param = in_section.split(' ARGS:')[0]
+                        # Extract ARGS section and store in args dict
+                        args_section = in_section.split(' ARGS:')[1]
+                        args['comm_args'] = args_section.strip('[]')
+                    else:
+                        event_param = in_section
+
+                # Create comm event and add to comm_ops list only (not hierarchy)
+                comm_event = Event(
+                    cat=event_cat,
+                    name=event_name,
+                    params=event_param,
+                    ts=event_data['ts'],
+                    dur=event_data['dur'],
+                    ev_idx=args.get('Ev Idx'),
+                    external_id=args.get('External id'),
+                    python_id=args.get('Python id'),
+                    python_parent_id=args.get('Python parent id'),
+                    args=args,
+                    pid=event_data.get('pid'),
+                    tid=event_data.get('tid')
+                )
+                self.comm_ops.append(comm_event)
+                # Skip adding to self.events - comm ops are separate from hierarchy
+                continue
+
             elif cat == 'user_annotation':
-                # Taint/user annotation: API:, aten::, etc. (not MODULE:)
+                # Taint/user annotation: API:, aten::, etc. (not MODULE: or COMM:)
                 event_cat = 'taint'
                 event_name = name
                 if " IN" in name:
