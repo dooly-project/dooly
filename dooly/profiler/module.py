@@ -29,6 +29,7 @@ class ModuleInfo:
     call_chain: List[str] = field(default_factory=list)
     backend: str = ""
     dtype: str = ""
+    is_collective_op: bool = False
     count: int = 0 # count of occurance (before deduplication)
     hierarchy: Optional[OperationHierarchy] = field(default=None, repr=False)
     absorbed_ops: List[str] = field(default_factory=list)  # ops merged into this module by resolver

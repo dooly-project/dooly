@@ -89,6 +89,7 @@ class TraceParser:
 
         # return list of ModuleInfo
         module_infos: List[ModuleInfo] = []
+        collective_infos: List[Any] = []
 
         # extract module and operation relationships from trace file using HierarchicalTraceParser
 
@@ -97,6 +98,9 @@ class TraceParser:
 
         print(f"Parsing trace events...")
         hierarchical_parser.parse_from_events()
+        
+        # collective_infos = hierarchical_parser.comm_ops
+        # print(collective_infos)
 
         # Returns List[OperationHierarchy] with full ancestry info:
         # - hierarchy.anchor: the profiling target (cpu_op or module)
@@ -113,86 +117,113 @@ class TraceParser:
         backend = profile_metadata.get("backend", "")
         dtype = profile_metadata.get("dtype", "bfloat16")
 
+
         for hierarchy in operation_hierarchies:
-            module_name = hierarchy.nearest_module_name   # root_module.name or "Global/Unassigned"
-            anchor_name = hierarchy.operation_name        # anchor.name
-            anchor_args = hierarchy.operation_args        # anchor.args
+            
+            module_name, op_name, inputs, is_module, is_collective = "", "", [], False, False
+            
+            if hierarchy.anchor.cat == 'comm':
+                module_name = hierarchy.nearest_module_name  
+                comm_event = hierarchy.anchor
+                op_name = comm_event.name 
 
+                if not comm_event.params:
+                    continue
 
-            # Non-module (cpu_op) anchored hierarchy: use trace args for input extraction
-            shapes = anchor_args.get("Input Dims", [])
-            dtypes = anchor_args.get("Input type", [])
-            concrete_inputs = anchor_args.get("Concrete Inputs", [])
+                # Parse dims from comm event's taint string
+                dims_lists = comm_event.get_dims_from_taint_string(comm_event.params)
+                if not dims_lists:
+                    continue
 
-            # Get taint string from hierarchy
-            matching_taint = hierarchy.get_taint_string()
-            # print(f"[DEBUG @ extract_module_infos] extracting module info from {module_name} with anchor {anchor_name} with arguments {anchor_args}")
-            # print(f"[DEBUG @ extract_module_infos] {module_name} has taint string: {matching_taint} ")
-            if matching_taint is None:
-                print(f"⚠ No taint for {anchor_name}, skipping")
-                continue
-
-            # Try taint-based extraction
-            inputs = []
-            if matching_taint:
+                # Extract inputs
                 try:
                     inputs = extract_inputs_from_taint(
-                        taint_string=matching_taint,
-                        trace_input_dims=shapes,
-                        trace_input_dtypes=dtypes,
-                        concrete_inputs=concrete_inputs
+                        taint_string=comm_event.params,
+                        trace_input_dims=dims_lists,
+                        trace_input_dtypes=[],
+                        concrete_inputs=[]
                     )
                 except Exception as e:
-                    print(f"⚠ Taint-based extraction failed for {anchor_name}: {e}")
-                    inputs = []
+                    print(f"⚠ Input extraction failed for {op_name}: {e}")
+                    continue
 
-            # Skip if no inputs extracted
-            if not inputs:
-                print(f"⚠ No inputs extracted for {anchor_name}, skipping")
-                continue
+                if not inputs:
+                    continue
+                
+                is_collective = True
+
+            else: 
+                    
+                module_name = hierarchy.nearest_module_name   # root_module.name or "None" 
+                op_name = hierarchy.operation_name        # anchor.name
+                anchor_args = hierarchy.operation_args        # anchor.args
+                is_module = hierarchy.is_module
+                
+                if len(hierarchy.comm_ops) > 0:
+                    print(f"[DEBUG] Module {op_name} has {len(hierarchy.comm_ops)}, nearest_modul_name: {module_name}, comm ops: {[c.name for c in hierarchy.comm_ops]}, module_taint={hierarchy.get_taint_string()[:50] if hierarchy.get_taint_string() else None}, anchor_args={anchor_args if anchor_args else None}")
+
+
+                # Non-module (cpu_op) anchored hierarchy: use trace args for input extraction
+                shapes = anchor_args.get("Input Dims", [])
+                dtypes = anchor_args.get("Input type", [])
+                concrete_inputs = anchor_args.get("Concrete Inputs", [])
+
+                # Get taint string from hierarchy
+                matching_taint = hierarchy.get_taint_string()
+                
+                
+
+                # Debug module anchors with comm ops (to understand why input extraction fails)
+                if hierarchy.comm_ops:
+                    first_comm = hierarchy.comm_ops[0]
+                    print(f"[DEBUG] Module {anchor_name} has comm: {first_comm.name}, module_taint={matching_taint[:50] if matching_taint else None}, shapes={shapes[:2] if shapes else []}")
+
+                if matching_taint is None:
+                    print(f"⚠ No taint for {anchor_name}, skipping")
+                    continue
+
+                # Try taint-based extraction
+                inputs = []
+                if matching_taint:
+                    try:
+                        inputs = extract_inputs_from_taint(
+                            taint_string=matching_taint,
+                            trace_input_dims=shapes,
+                            trace_input_dtypes=dtypes,
+                            concrete_inputs=concrete_inputs
+                        )
+                    except Exception as e:
+                        print(f"⚠ Taint-based extraction failed for {anchor_name}: {e}")
+                        inputs = []
+
+                # Skip if no inputs extracted
+                if not inputs:
+                    if not hierarchy.comm_ops:
+                        print(f"⚠ No inputs extracted for {anchor_name}, skipping")
+                    continue
 
             # Create ModuleInfo with hierarchy reference for full ancestry navigation
             info = ModuleInfo(
                 module_name=module_name,
-                operation_name=anchor_name,
+                operation_name=op_name,
                 inputs=inputs,
                 backend=backend,
                 dtype=dtype,
-                is_module=hierarchy.is_module,
+                is_module=is_module,
+                is_collective_op=is_collective,
                 hierarchy=hierarchy,
             )
 
             # Add module_info to anchor event
             hierarchy.anchor.module_info = info
 
-            # Add module_info for all children events (for signature comparison)
-            # for idx, child in hierarchy.anchor.children.items():
-            #     if child.params:  # Child has taint info
-            #         child_inputs = extract_inputs_from_taint(
-            #             taint_string=child.params,
-            #             trace_input_dims=child.args.get("Input Dims", []),
-            #             trace_input_dtypes=child.args.get("Input type", []),
-            #             concrete_inputs=child.args.get("Concrete Inputs", [])
-            #         )
-            #         if child_inputs:
-            #             child_info = ModuleInfo(
-            #                 module_name=child.name,
-            #                 operation_name=child.name,
-            #                 inputs=child_inputs,
-            #                 backend=backend,
-            #                 dtype=dtype,
-            #                 is_module=(child.cat == 'module'),
-            #                 hierarchy=None,  # Children don't need full hierarchy
-            #             )
-            #             child.module_info = child_info
-
             module_infos.append(info)
 
-
+        # print(f"Processed {comm_count} communication operations")
         print(f"Deduplicating module infos...")
 
-        for module in module_infos:
-            print(f"Module: {module.module_name}, Operation: {module.operation_name}, Inputs: {len(module.inputs)}")
+        # for module in module_infos:
+        #     print(f"Module: {module.module_name}, Operation: {module.operation_name}, Inputs: {len(module.inputs)}")
 
         dedup_module_infos = self._deduplicate_module_infos(module_infos)
 
@@ -272,41 +303,6 @@ class TraceParser:
 
         return chain
 
-    # @staticmethod
-    # def _call_chain_for_window(
-    #     ts: float | None,
-    #     dur: float | None,
-    #     pid: int | None,
-    #     tid: int | None,
-    #     python_events_by_thread: Dict[tuple, List[Dict[str, Any]]],
-    # ) -> List[str]:
-    #     if ts is None or dur is None:
-    #         return []
-    #     te = ts + dur
-    #     key = (pid, tid)
-    #     chain = []
-
-    #     for event in python_events_by_thread.get(key, []):
-    #         ev_start = event["ts"]
-    #         ev_end = ev_start + event["dur"]
-    #         if ts <= ev_start and ev_end <= te:
-    #             name = event["name"]
-    #             if not name.startswith("nn.Module:"):
-    #                 chain.append(name)
-
-    #     return chain
-
-    # @staticmethod
-    # def _merge_call_chains(module_chain: List[str], op_chain: List[str]) -> List[str]:
-    #     merged = []
-    #     seen = set()
-    #     for entry in module_chain + op_chain:
-    #         if entry in seen:
-    #             continue
-    #         seen.add(entry)
-    #         merged.append(entry)
-    #     return merged
-
     @staticmethod
     def _deduplicate_module_infos(module_infos: List[ModuleInfo]) -> List[ModuleInfo]:
         """
@@ -339,6 +335,7 @@ class TraceParser:
         deduplicated: List[ModuleInfo] = []
         for (base_name, _op_name, _model_params_tuple), infos in groups.items():
             # use the first info as template since all have same signature
+            print(infos[0])
             template = infos[0]
             count = len(infos)
             
@@ -353,6 +350,7 @@ class TraceParser:
                 dtype=template.dtype,
                 call_chain=template.call_chain,
                 hierarchy=template.hierarchy,
+                is_collective_op=template.is_collective_op,
                 count = count,  # track how many were deduplicated into this one
             )
 

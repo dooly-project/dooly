@@ -159,6 +159,7 @@ class OperationHierarchy:
     nearest_module: Optional[Event]            # Nearest nn.Module parent of anchor
     kernels: List[Event] = field(default_factory=list)  # Kernels using this anchor
     taints: List[Event] = field(default_factory=list)   # Taint events for the anchor
+    comm_ops: List[Event] = field(default_factory=list)  # Communication ops associated with this anchor
 
     @property
     def module_name(self) -> str:
@@ -257,10 +258,11 @@ class HierarchicalTraceParser:
         # 1. Group by Thread
         thread_events = defaultdict(list)
         for event in self.events:
-            # We only stack CPU-side events (modules, ops)
+            # We only stack CPU-side events (modules, ops, comm)
             # Taints are excluded as per user request
             # Kernels are on GPU/different thread, handled separately
-            if event.cat in ('module', 'cpu_op'):
+            if event.cat in ('module', 'cpu_op', 'comm'):
+            # if event.cat in ('module', 'cpu_op'):
                 # Use a combined key for pid/tid
                 key = (event.pid, event.tid)
                 thread_events[key].append(event)
@@ -333,9 +335,10 @@ class HierarchicalTraceParser:
 
     def _prune_non_kernel_paths_optimized(self):
         """Optimized pruning using two-pass marking instead of recursive rebuild."""
-        # Pass 1: Mark all ancestors of kernels (bottom-up)
+        # Pass 1: Mark all ancestors of kernels AND comm ops (bottom-up)
         has_kernel_descendant = set()
 
+        # Mark kernel ancestry
         for kernel in self.kernels:
             current = kernel
             while current:
@@ -345,9 +348,19 @@ class HierarchicalTraceParser:
                 has_kernel_descendant.add(event_id)
                 current = current.parent
 
+        # Mark comm op ancestry (so comm ops survive pruning)
+        for comm in self.comm_ops:
+            current = comm
+            while current:
+                event_id = id(current)
+                if event_id in has_kernel_descendant:
+                    break  # Already marked, ancestors are marked too
+                has_kernel_descendant.add(event_id)
+                current = current.parent
+
         # Pass 2: Prune children that aren't marked (single pass, in-place)
         for event in self.events:
-            if event.cat in ('module', 'cpu_op'):
+            if event.cat in ('module', 'cpu_op', 'comm'):
                 # Filter children in-place (only one dict rebuild per node)
                 event.children = {
                     k: v for k, v in event.children.items()
@@ -421,24 +434,24 @@ class HierarchicalTraceParser:
                     else:
                         event_param = in_section
 
-                # Create comm event and add to comm_ops list only (not hierarchy)
-                comm_event = Event(
-                    cat=event_cat,
-                    name=event_name,
-                    params=event_param,
-                    ts=event_data['ts'],
-                    dur=event_data['dur'],
-                    ev_idx=args.get('Ev Idx'),
-                    external_id=args.get('External id'),
-                    python_id=args.get('Python id'),
-                    python_parent_id=args.get('Python parent id'),
-                    args=args,
-                    pid=event_data.get('pid'),
-                    tid=event_data.get('tid')
-                )
-                self.comm_ops.append(comm_event)
-                # Skip adding to self.events - comm ops are separate from hierarchy
-                continue
+                # # Create comm event and add to comm_ops list only (not hierarchy)
+                # comm_event = Event(
+                #     cat=event_cat,
+                #     name=event_name,
+                #     params=event_param,
+                #     ts=event_data['ts'],
+                #     dur=event_data['dur'],
+                #     ev_idx=args.get('Ev Idx'),
+                #     external_id=args.get('External id'),
+                #     python_id=args.get('Python id'),
+                #     python_parent_id=args.get('Python parent id'),
+                #     args=args,
+                #     pid=event_data.get('pid'),
+                #     tid=event_data.get('tid')
+                # )
+                # self.comm_ops.append(comm_event)
+                # # Skip adding to self.events - comm ops are separate from hierarchy
+                # continue
 
             elif cat == 'user_annotation':
                 # Taint/user annotation: API:, aten::, etc. (not MODULE: or COMM:)
@@ -478,6 +491,9 @@ class HierarchicalTraceParser:
             # Categorize events
             if event_cat == 'module':
                 self.modules.append(event)
+            elif event_cat == 'comm':
+                # print(f"[DEBUG] Adding comm event: {event}")
+                self.comm_ops.append(event)
             elif event_cat == 'cpu_op':
                 self.cpu_ops.append(event)
             elif event_cat == 'kernel':
@@ -498,9 +514,12 @@ class HierarchicalTraceParser:
 
         # IMPORTANT: find associated taints and add to events
         # this links taints to events and can be looked up later by resolver
+        tainted_categories = set()
         for event in self.events:
-            if event.cat != 'taint':
+            if event.cat != 'taint': # only link taints to computation events
                 associated_taints = self.find_associated_taints(event)
+                if associated_taints:
+                    tainted_categories.add(event.cat)
                 assert(len(associated_taints) <= 1)
                 if len(associated_taints) == 1:
                     taint = associated_taints[0]
@@ -518,6 +537,7 @@ class HierarchicalTraceParser:
                     # that name so ModuleInfo.operation_name carries the exact overload.
                     if event.cat == 'cpu_op' and '::' in taint.name and '.' in taint.name.split('::')[-1]:
                         event.name = taint.name
+        print(f"Taint association done. Tainted categories: {tainted_categories}")
 
         print("Finding taints done.")
 
@@ -542,6 +562,9 @@ class HierarchicalTraceParser:
             event_base = event.name.rsplit('_', 1)[0] if '_' in event.name and event.name.rsplit('_', 1)[-1].isdigit() else event.name
         else:
             event_base = event.name.split("::")[-1]
+            
+        # if (event.cat == 'comm'):
+        #     print(f"event_base: {event_base}, event.name: {event.name}, event.params: {event.params}")
 
         # Find the single best taint (shortest duration) that matches by name
         best_taint = None
@@ -558,6 +581,8 @@ class HierarchicalTraceParser:
                 taint_base = taint_name.replace("MODULE: ", "")
             elif taint_name.startswith("API: "):
                 taint_base = taint_name.replace("API: ", "")
+            elif taint_name.startswith("COMM: "):
+                taint_base = taint_name.replace("COMM: ", "")
             else:
                 taint_base = taint_name.split("::")[-1]
 
@@ -714,6 +739,41 @@ class HierarchicalTraceParser:
         # 1. Collect kernel → anchor mappings
         anchor_to_kernels: Dict[int, List[Event]] = defaultdict(list)  # id(anchor) → kernels
         anchor_events: Dict[int, Event] = {}  # id(anchor) → anchor Event
+        anchor_to_collectives: Dict[int, List[Event]] = defaultdict(list)  # id(anchor) → comm ops
+        
+        # Note: We don't create OperationHierarchy objects for comm ops here.
+        # Comm ops are processed separately in trace.py to create ModuleInfo objects.
+        # This avoids creating module anchors that fail input extraction.
+
+        # Link communication ops to anchors
+        comm_module_anchors = set()
+        comm_cpu_op_anchors = set()
+        for comm in self.comm_ops:
+            # if comm.parent is None:
+            #     continue
+            # if comm.parent.cat == 'module':
+            #     ancestor = comm.parent
+            # else:
+            #     ancestor = self.find_nearest_tainted_ancestor(comm.parent)
+            # for comm ops, anchor becomes itself 
+            ancestor = comm 
+            anchor_id = id(ancestor)
+            anchor_events[anchor_id] = ancestor
+            anchor_to_collectives[anchor_id].append(comm)
+
+            # Track anchor type for comm ops
+            if ancestor.cat == 'module':
+                comm_module_anchors.add(anchor_id)
+            elif ancestor.cat == 'cpu_op':
+                comm_cpu_op_anchors.add(anchor_id)
+
+        print(f"[DEBUG] Linked {len(self.comm_ops)} comm ops to {len(anchor_to_collectives)} unique anchors")
+        print(f"[DEBUG]   - Comm module anchors: {len(comm_module_anchors)}")
+        print(f"[DEBUG]   - Comm cpu-op anchors: {len(comm_cpu_op_anchors)}")
+
+        # Track which anchors are modules vs cpu_ops
+        module_anchors = set()
+        cpu_op_anchors = set()
 
         for kernel in self.kernels:
             start_node = kernel.parent
@@ -724,6 +784,16 @@ class HierarchicalTraceParser:
                 anchor_id = id(ancestor)
                 anchor_events[anchor_id] = ancestor
                 anchor_to_kernels[anchor_id].append(kernel)
+
+                # Track anchor type
+                if ancestor.cat == 'module':
+                    module_anchors.add(anchor_id)
+                elif ancestor.cat == 'cpu_op':
+                    cpu_op_anchors.add(anchor_id)
+
+        print(f"[DEBUG] Linked {len(self.kernels)} kernels to {len(anchor_to_kernels)} unique anchors")
+        print(f"[DEBUG]   - Module anchors: {len(module_anchors)}")
+        print(f"[DEBUG]   - CPU-op anchors: {len(cpu_op_anchors)}")
 
         # 2. Deduplicate: Remove anchors that are descendants of other anchors
         # If A contains B (A is ancestor of B), keep only A and remap B's kernels to A
@@ -748,9 +818,17 @@ class HierarchicalTraceParser:
         # 3. Build OperationHierarchy for each canonical anchor
         results: List[OperationHierarchy] = []
 
+        # print(f"[DEBUG] Building OperationHierarchy for {len(canonical_anchors)} canonical anchors")
         for anchor_id, anchor in canonical_anchors.items():
+            # if anchor.cat == 'module' and anchor.params:
+            #     print(f"[DEBUG] MODULE anchor with params: {anchor.name}, params={anchor.params[:80] if anchor.params else None}")
+            # if anchor.cat == 'comm': 
+            #     print(f"[DEBUG] COMM anchor: {anchor.name}")
+            # print(f"[DEBUG] Processing anchor: {anchor.name} (cat={anchor.cat}, has_params={bool(anchor.params)})")
             # Find nearest module (first module in parent chain)
             nearest_module = self._find_nearest_module(anchor)
+            if anchor.cat == 'comm':
+                print(f"[DEBUG COMM] anchor={anchor.name}, anchor.parent={anchor.parent.name if anchor.parent else None}, nearest_module={nearest_module.name if nearest_module else None}")
 
             # Find root module (outermost module in parent chain)
             root_module = self._find_root_module(anchor)
@@ -758,20 +836,29 @@ class HierarchicalTraceParser:
             # Get taints for this anchor
             taints = self.find_associated_taints(anchor)
 
-            # Get kernels using this anchor
+            # Get kernels and comm ops using this anchor
             kernels = anchor_to_kernels[anchor_id]
-
+            comm_ops = anchor_to_collectives.get(anchor_id, [])
+ 
             hierarchy = OperationHierarchy(
                 anchor=anchor,
                 root_module=root_module,
                 nearest_module=nearest_module,
                 kernels=kernels,
                 taints=taints,
+                comm_ops=comm_ops,
             )
             results.append(hierarchy)
 
+            # if comm_ops:
+                # print(f"[DEBUG] Anchor {anchor.name} has {len(kernels)} kernels and {len(comm_ops)} comm ops: {[c.name for c in comm_ops]}")
+
         # Sort by anchor timestamp
         results.sort(key=lambda h: h.anchor.ts)
+
+        # print(f"[DEBUG] Created {len(results)} OperationHierarchy objects")
+        # hierarchies_with_comm = sum(1 for h in results if h.comm_ops)
+        # print(f"[DEBUG] {hierarchies_with_comm} hierarchies have comm ops")
 
         return results
 

@@ -120,8 +120,6 @@ def main() -> None:
         for name, trace_path in zip(args.models, args.traces)
     ]
 
-    resolved_modules = []
-
     mp.set_start_method("spawn", force=True)
 
     result_queue = mp.Queue()

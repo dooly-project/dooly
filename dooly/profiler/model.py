@@ -1,4 +1,4 @@
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Callable
 import torch
 import json
 
@@ -32,15 +32,18 @@ class ModelInfo:
             assert self.head_dim * self.num_heads == self.hidden_size, f"head_dim * num_heads != hidden_size for {self.name}"
         
         parser = TraceParser()
-        self.used_ops: List[ModuleInfo] = parser.parse_trace(
+        self.all_ops: List[ModuleInfo] = parser.parse_trace(
             trace_path=trace_dir,
             verbose=False,
             metadata_path=None
         )
-
+        
+        self.used_ops: List[ModuleInfo] = [op for op in self.all_ops if not op.is_collective_op]
         self.to_profile: List[ModuleInfo] = self.used_ops
-        self.to_profile_resolved: List[Tuple[ModuleInfo, Callable]] = []
+        self.collective_ops: List[ModuleInfo] = [op for op in self.used_ops if op.is_collective_op]
+        
         self.all_resolved_ops: List[Tuple[ModuleInfo, Callable, str, str]] = []  # All ops with signatures
+        self.to_profile_resolved: List[Tuple[ModuleInfo, Callable]] = []
         
     def compare_with_many(self, models: List['ModelInfo'], db_path: Optional[str] = None) -> None:
         all_models = list(models)
