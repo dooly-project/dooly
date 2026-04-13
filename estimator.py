@@ -42,9 +42,17 @@ class EstimatorConfig:
 
     # Prediction parameters
     prediction_max_tokens: int = 16384
-    prediction_max_batch_size: int = 16
-    prediction_max_prefill_chunk_size: int = 10240  # Max prefill chunk size for predictions
+    prediction_max_batch_size: int = 32
+    prediction_max_prefill_chunk_size: int = prediction_max_tokens
     kv_cache_granularity: int = 64  # Granularity for KV cache size predictions
+
+    # Collective communication parameters
+    train_comm_models: bool = False  # Whether to train collective communication models
+    train_comm_only: bool = False  # Train ONLY comm models, skip operation models
+    tp_size: Optional[int] = None  # Tensor parallel size filter
+    topology: Optional[str] = None  # Network topology filter
+    collective_backend: Optional[str] = None  # Collective backend filter (e.g., "NCCL")
+    embedding_dim: int = 4096  # Model embedding dimension (for calculating max size_bytes)
 
     def __post_init__(self):
         """Set default values for mutable parameters (matching Vidur)."""
@@ -113,11 +121,21 @@ class SimplifiedExecutionTimeEstimator:
             where_conditions.append("pm.backend = ?")
             params.append(self.config.backend)
 
+        if self.config.tp_size is not None:
+            where_conditions.append("pm.tp_degree = ?")
+            params.append(self.config.tp_size)
+
         if where_conditions:
             query += " WHERE " + " AND ".join(where_conditions)
 
         # Load results data with filtering
         self.results_df = pd.read_sql_query(query, conn, params=params)
+
+        # Load collective communication data if enabled
+        if self.config.train_comm_models:
+            self._load_comm_data(conn)
+        else:
+            self.comm_df = pd.DataFrame()
 
         conn.close()
 
@@ -127,6 +145,8 @@ class SimplifiedExecutionTimeEstimator:
             filter_info.append(f"model={self.config.model_name}")
         if self.config.backend:
             filter_info.append(f"backend={self.config.backend}")
+        if self.config.tp_size is not None:
+            filter_info.append(f"tp={self.config.tp_size}")
 
         filter_str = f" (filtered by {', '.join(filter_info)})" if filter_info else ""
         print(f"Loaded {len(self.results_df)} results{filter_str}")
@@ -141,6 +161,68 @@ class SimplifiedExecutionTimeEstimator:
 
         # Build operation_is_context mapping from the data
         self._build_operation_is_context_mapping()
+
+    def _load_comm_data(self, conn: sqlite3.Connection):
+        """Load collective communication data from coll_op_results table."""
+        try:
+            # Check if table exists
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='coll_op_results'")
+            if not cursor.fetchone():
+                print("Note: coll_op_results table not found, skipping collective communication data")
+                self.comm_df = pd.DataFrame()
+                return
+
+            # Build query with optional filtering
+            query = "SELECT * FROM coll_op_results WHERE 1=1"
+            params = []
+
+            if self.config.tp_size is not None:
+                query += " AND tp_size = ?"
+                params.append(self.config.tp_size)
+
+            if self.config.topology is not None:
+                query += " AND topology = ?"
+                params.append(self.config.topology)
+
+            if self.config.collective_backend is not None:
+                query += " AND backend = ?"
+                params.append(self.config.collective_backend)
+
+            self.comm_df = pd.read_sql_query(query, conn, params=params)
+
+            if len(self.comm_df) > 0:
+                # New schema uses dim_param and num_dims
+                # Check for legacy columns and handle accordingly
+                if 'num_dims' not in self.comm_df.columns:
+                    if 'ndim' in self.comm_df.columns:
+                        print("  Note: Renaming 'ndim' to 'num_dims' (legacy schema)")
+                        self.comm_df['num_dims'] = self.comm_df['ndim']
+                    else:
+                        print("  Note: Adding num_dims=2 to comm data (legacy profiling)")
+                        self.comm_df['num_dims'] = 2
+
+                # Ensure dim_param exists
+                if 'dim_param' not in self.comm_df.columns:
+                    print("  Note: Adding dim_param=-1 to comm data (legacy profiling)")
+                    self.comm_df['dim_param'] = -1
+
+                filter_info = []
+                if self.config.tp_size is not None:
+                    filter_info.append(f"tp_size={self.config.tp_size}")
+                if self.config.topology is not None:
+                    filter_info.append(f"topology={self.config.topology}")
+                if self.config.collective_backend is not None:
+                    filter_info.append(f"backend={self.config.collective_backend}")
+
+                filter_str = f" (filtered by {', '.join(filter_info)})" if filter_info else ""
+                print(f"Loaded {len(self.comm_df)} collective communication samples{filter_str}")
+            else:
+                print("Note: No collective communication data found with current filters")
+
+        except Exception as e:
+            print(f"Warning: Could not load comm_latencies: {e}")
+            self.comm_df = pd.DataFrame()
 
     def _ensure_columns(self):
         """Ensure required columns exist, parsing from workload_params if needed."""
@@ -261,6 +343,16 @@ class SimplifiedExecutionTimeEstimator:
     def train_all_models(self):
         """Train models for all operation signatures in the database."""
 
+        # If train_comm_only is set, skip operation models and only train comm
+        if self.config.train_comm_only:
+            print("\n=== Training ONLY Collective Communication Models ===")
+            if self.config.train_comm_models:
+                self._train_comm_models()
+            else:
+                print("Warning: train_comm_only is set but train_comm_models is False")
+            print(f"\n=== Training Complete: {len(self.models)} models trained ===")
+            return
+
         print("\n=== Training or Loading Models for All Operation Signatures ===")
 
         # Note: operation_groups now returns (operation_name, signature_hash), group_df
@@ -302,7 +394,21 @@ class SimplifiedExecutionTimeEstimator:
             # Train unified model for this operation signature
             self._train_operation_model(model_key, group_df)
 
+        # Train collective communication models if enabled
+        if self.config.train_comm_models:
+            self._train_comm_models()
+
         print(f"\n=== Training Complete: {len(self.models)} models trained ===")
+
+        # Automatically save predictions to CSV cache
+        print(f"\n=== Saving Predictions to CSV Cache ===")
+        from simulator.core.prediction_cache import generate_prediction_cache_from_estimator
+        generate_prediction_cache_from_estimator(
+            estimator=self,
+            cache_dir=self.config.cache_dir,
+            force_regenerate=False  # Don't overwrite existing CSV files
+        )
+        print(f"CSV cache saved to {self.config.cache_dir}")
 
     def _get_model_hash(self, model_name: str, df: pd.DataFrame) -> str:
         """
@@ -379,6 +485,136 @@ class SimplifiedExecutionTimeEstimator:
                 pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception as e:
             print(f"    Warning: Could not cache {model_name}: {e}")
+
+    def _train_comm_models(self):
+        """Train models for collective communication operations.
+
+        Uses operation-specific features:
+        - all_reduce: num_tokens (derived from size_bytes / model_config_dim / dtype_bytes)
+        - all_gather: num_requests (derived from size_bytes / model_config_dim / dtype_bytes)
+
+        Groups by (operation, dim_param, num_dims) to capture different memory access patterns.
+        """
+        if not hasattr(self, 'comm_df') or len(self.comm_df) == 0:
+            print("\n=== No collective communication data to train ===")
+            return
+
+        print("\n=== Training Collective Communication Models ===")
+
+        # Group by (operation, dim_param, num_dims) to capture different memory patterns
+        # Note: Use dropna=False to include NULL dim_param values (for all_reduce)
+        grouping_cols = ['operation', 'dim_param', 'num_dims']
+
+        for group_key, op_df in self.comm_df.groupby(grouping_cols, dropna=False):
+            operation, dim_param, num_dims = group_key
+
+            # Handle NULL dim_param (e.g., all_reduce has no dimension parameter)
+            dim_str = "None" if pd.isna(dim_param) else str(int(dim_param))
+            model_key = f"{operation}_dim{dim_str}_ndims{int(num_dims)}"
+
+            if len(op_df) < 5:
+                print(f"  Skipping {model_key}: insufficient data ({len(op_df)} samples)")
+                continue
+
+            print(f"\nProcessing: {model_key} ({len(op_df)} samples)")
+
+            # Determine feature based on operation type
+            # For now, use size_bytes as feature (we'll update this to use num_tokens/num_requests)
+            # TODO: Back-calculate num_tokens or num_requests from size_bytes
+            feature_cols = ['size_bytes']
+            target_col = 'latency_ms'
+
+            # Store metadata about what this operation uses
+            # all_reduce typically uses NUM_TOKS, all_gather uses NUM_REQS
+            batch_param = "num_tokens" if "reduce" in operation.lower() else "num_requests"
+
+            # Prepare training data
+            train_df = op_df[feature_cols + [target_col]].copy()
+            train_df = train_df.dropna()
+
+            if len(train_df) < 5:
+                print(f"  Skipping {model_key}: insufficient data after cleanup ({len(train_df)} samples)")
+                continue
+
+            # Generate hash for caching
+            model_hash = self._get_model_hash(model_key, train_df)
+
+            # Try to load from cache
+            cached_model = self._load_model_from_cache(model_key, model_hash)
+            if cached_model is not None:
+                self.models[model_key] = cached_model
+                # Still generate predictions for the cached model
+                # Convert NaN to None for consistency
+                dim_param_val = None if pd.isna(dim_param) else int(dim_param)
+                self._generate_comm_predictions(model_key, cached_model, feature_cols, dim_param_val, int(num_dims))
+                continue
+
+            print(f"  Training {model_key} with features: {feature_cols}")
+
+            try:
+                model = self._train_model(
+                    operation_name=model_key,
+                    df=train_df,
+                    feature_cols=feature_cols,
+                    target_col=target_col
+                )
+                self.models[model_key] = model
+
+                # Store in cache
+                self._store_model_in_cache(model_key, model_hash, model)
+
+                # Generate predictions for common input ranges
+                # Convert NaN to None for consistency
+                dim_param_val = None if pd.isna(dim_param) else int(dim_param)
+                self._generate_comm_predictions(model_key, model, feature_cols, dim_param_val, int(num_dims))
+
+            except Exception as e:
+                print(f"  Error training model for {model_key}: {e}")
+                import traceback
+                traceback.print_exc()
+
+    def _generate_comm_predictions(
+        self,
+        operation_name: str,
+        model: BaseEstimator,
+        feature_cols: List[str],
+        dim_param: int,
+        num_dims: int
+    ):
+        """
+        Generate predictions for collective communication operations.
+
+        Uses features: size_bytes
+        Predictions are indexed by (size_bytes,) for lookup.
+        """
+        # Calculate max size_bytes from max_tokens
+        # For float16: size_bytes = num_tokens * embedding_dim * 2
+        max_size_bytes = self.config.prediction_max_tokens * self.config.embedding_dim * 2
+
+        # Generate size_bytes range with exponential spacing
+        min_size = 1024  # 1KB minimum
+        num_size_points = 100  # Denser grid for better interpolation
+
+        size_bytes_range = np.unique(
+            np.geomspace(min_size, max_size_bytes, num_size_points, dtype=int)
+        )
+
+        # Create prediction inputs
+        predictions_list = [{'size_bytes': size_bytes} for size_bytes in size_bytes_range]
+
+        # Create DataFrame and generate predictions
+        X = pd.DataFrame(predictions_list)
+        predictions = model.predict(X[feature_cols])
+
+        # Store predictions with size_bytes as key
+        pred_dict = {}
+        for idx, row in X.iterrows():
+            key = int(row['size_bytes'])
+            pred_dict[key] = predictions[idx]
+
+        self.predictions[operation_name] = pred_dict
+        print(f"    Generated {len(pred_dict)} predictions for {operation_name}")
+        print(f"      Size range: {min_size/1024:.1f}KB to {max_size_bytes/1024/1024:.1f}MB")
 
     def _train_operation_model(self, operation_name: str, df: pd.DataFrame):
         """Train a model for a specific operation."""
@@ -581,6 +817,7 @@ class SimplifiedExecutionTimeEstimator:
         Args:
             operation_name: Name of the operation (possibly with _prefill/_decode suffix)
             **kwargs: Feature values (e.g., num_tokens=128, batch_size=4, kv_cache_size=512)
+                     For comm operations: size_bytes and ndim (or num_tokens which gets converted)
 
         Returns:
             Predicted execution time in milliseconds
@@ -591,26 +828,48 @@ class SimplifiedExecutionTimeEstimator:
 
         model = self.models[operation_name]
 
-        # Determine which features this model expects
-        # This is stored when we train the model
-        if operation_name in self.predictions and len(self.predictions[operation_name]) > 0:
-            # Get feature names from a sample prediction key
-            sample_key = next(iter(self.predictions[operation_name].keys()))
-            num_features = len(sample_key)
+        # Check if this is a collective communication operation
+        comm_ops = ['all_reduce', 'all_gather', 'reduce_scatter']
+        is_comm_op = operation_name in comm_ops
 
-            # Map common features based on number and operation name
-            if '_prefill' in operation_name:
-                feature_names = ['kv_cache_size', 'prefill_chunk_size_squared']
-                # Handle prefill_chunk_size -> prefill_chunk_size_squared
-                if 'prefill_chunk_size' in kwargs and 'prefill_chunk_size_squared' not in kwargs:
-                    kwargs['prefill_chunk_size_squared'] = kwargs['prefill_chunk_size'] ** 2
-            elif '_decode' in operation_name:
-                feature_names = ['batch_size', 'kv_cache_size']
-            else:
-                feature_names = ['num_tokens']
+        if is_comm_op:
+            # Collective communication operations use size_bytes + dim_param + dim0 + dim1
+            # Convert num_tokens to size_bytes if needed
+            if 'size_bytes' not in kwargs and 'num_tokens' in kwargs:
+                # size_bytes = num_tokens * embedding_dim * 2 (for float16)
+                kwargs['size_bytes'] = kwargs['num_tokens'] * self.config.embedding_dim * 2
+
+            # Default values for tensor shape
+            if 'dim_param' not in kwargs:
+                kwargs['dim_param'] = -1  # Default to last dimension
+            if 'dim0' not in kwargs:
+                # For 1D tensor: dim0 = num_elements
+                num_elements = kwargs['size_bytes'] // 2
+                kwargs['dim0'] = num_elements
+            if 'dim1' not in kwargs:
+                kwargs['dim1'] = -1  # -1 indicates 1D tensor
+
+            feature_names = ['size_bytes', 'dim_param', 'dim0', 'dim1']
         else:
-            # Fallback
-            feature_names = ['num_tokens']
+            # Regular operations - determine features from predictions or operation type
+            if operation_name in self.predictions and len(self.predictions[operation_name]) > 0:
+                # Get feature names from a sample prediction key
+                sample_key = next(iter(self.predictions[operation_name].keys()))
+                num_features = len(sample_key)
+
+                # Map common features based on number and operation name
+                if '_prefill' in operation_name:
+                    feature_names = ['kv_cache_size', 'prefill_chunk_size_squared']
+                    # Handle prefill_chunk_size -> prefill_chunk_size_squared
+                    if 'prefill_chunk_size' in kwargs and 'prefill_chunk_size_squared' not in kwargs:
+                        kwargs['prefill_chunk_size_squared'] = kwargs['prefill_chunk_size'] ** 2
+                elif '_decode' in operation_name:
+                    feature_names = ['batch_size', 'kv_cache_size']
+                else:
+                    feature_names = ['num_tokens']
+            else:
+                # Fallback
+                feature_names = ['num_tokens']
 
         # Prepare input
         features = []
@@ -620,7 +879,7 @@ class SimplifiedExecutionTimeEstimator:
             features.append(kwargs[col])
 
         # Check if we have pre-computed prediction
-        feature_tuple = tuple(features)
+        feature_tuple = tuple(int(f) for f in features)  # Convert to int for consistent keys
         if operation_name in self.predictions and feature_tuple in self.predictions[operation_name]:
             return self.predictions[operation_name][feature_tuple]
 
@@ -758,15 +1017,24 @@ class SimplifiedExecutionTimeEstimator:
                     print(f"      [{features_str}] → Actual: {y_actual[i]:.4f} ms, Predicted: {y_pred[i]:.4f} ms, Error: {errors[i]:.1f}%")
 
 
-def main(model_name=None, backend=None, db_path=None, cache_dir=None):
+def main(model_name=None, backend=None, db_path=None, cache_dir=None,
+         max_tokens=16384, max_batch_size=32,
+         train_comm=False, train_comm_only=False, tp_size=None, embedding_dim=4096,
+         topology="DGX", collective_backend="NCCL"):
     """
-    Example usage of the simplified estimator.
+    Train regression models and generate CSV prediction cache.
 
     Args:
         model_name: Optional model name to filter (e.g., "meta-llama/Llama-3.1-8B")
         backend: Optional backend to filter (e.g., "FLASHINFER" or "FLASH_ATTN")
         db_path: Optional database path (defaults to dooly_data.db)
-        cache_dir: Optional cache directory for models
+        cache_dir: Optional cache directory for models and CSV predictions
+        train_comm: Whether to train collective communication models
+        train_comm_only: Train ONLY comm models, skip operation models
+        tp_size: Tensor parallel size filter for comm data
+        embedding_dim: Model embedding dimension (for max size_bytes calculation)
+        topology: Network topology for collective operations (e.g., "DGX")
+        collective_backend: Collective communication backend (e.g., "NCCL")
     """
 
     # Initialize estimator with optional filtering
@@ -775,7 +1043,15 @@ def main(model_name=None, backend=None, db_path=None, cache_dir=None):
         model_name=model_name,
         backend=backend,
         db_path=db_path if db_path else "/home/jkim38/dooly/profiler/database/dooly_data.db",
-        no_cache=False
+        no_cache=False,
+        train_comm_models=train_comm or train_comm_only,  # Enable if either flag is set
+        train_comm_only=train_comm_only,
+        tp_size=tp_size,
+        embedding_dim=embedding_dim,
+        topology=topology,
+        collective_backend=collective_backend,
+        prediction_max_tokens=max_tokens,
+        prediction_max_batch_size=max_batch_size
     )
 
     print(f"\n=== Initializing Simplified Estimator ===")
@@ -809,7 +1085,10 @@ def main(model_name=None, backend=None, db_path=None, cache_dir=None):
     )
 
     # Try some simple predictions
-    for op_name in list(estimator.models.keys())[:5]:  # Limit to first 5 for brevity
+    comm_ops = [op for op in estimator.models.keys() if op in ['all_reduce', 'all_gather', 'reduce_scatter']]
+    regular_ops = [op for op in estimator.models.keys() if op not in comm_ops][:3]  # Limit to 3
+
+    for op_name in regular_ops:
         print(f"\nOperation: {op_name}")
 
         try:
@@ -838,6 +1117,23 @@ def main(model_name=None, backend=None, db_path=None, cache_dir=None):
 
         except Exception as e:
             print(f"  Could not predict: {e}")
+
+    # Test collective communication operations with proper parameters
+    if comm_ops:
+        print("\n=== Collective Communication Predictions ===")
+        for op_name in comm_ops:
+            print(f"\nOperation: {op_name}")
+            try:
+                # Test with num_tokens (will be converted to size_bytes)
+                pred = estimator.predict(op_name, num_tokens=256)
+                print(f"  With 256 tokens (2MB): {pred:.4f} ms")
+
+                # Test with explicit size_bytes
+                pred = estimator.predict(op_name, size_bytes=1048576, ndim=1)
+                print(f"  With 1MB (1D tensor): {pred:.4f} ms")
+
+            except Exception as e:
+                print(f"  Could not predict: {e}")
 
     # Demonstrate batch-aware prediction (Vidur-style)
     print("\n=== Batch-aware Predictions (Vidur-style) ===")
@@ -891,8 +1187,29 @@ if __name__ == "__main__":
     parser.add_argument("--backend", type=str, default=None,
                        help="Backend to filter (e.g., 'FLASHINFER' or 'FLASH_ATTN')")
     parser.add_argument("--db-path", type=str, default="/home/jkim38/dooly/profiler/database/results.db", help="Path to SQLite database for results")
-    parser.add_argument("--cache-dir", type=str, default="/home/jkim38/dooly/simulator/cache", help="Directory for caching trained models") 
+    parser.add_argument("--cache-dir", type=str, default="/home/jkim38/dooly/simulator/cache", help="Directory for caching trained models")
+    parser.add_argument("--max-batch-size", type=int, default=32)
+    parser.add_argument("--max-token-count", type=int, default=16384)
+    parser.add_argument("--train-comm", action="store_true", help="Train collective communication models")
+    parser.add_argument("--train-comm-only", action="store_true", help="Train ONLY comm models, skip operation models")
+    parser.add_argument("--tp-size", type=int, default=None, help="Filter comm data by tensor parallel size")
+    parser.add_argument("--embedding-dim", type=int, default=4096, help="Model embedding dimension (for max size_bytes calculation)")
+    parser.add_argument("--topology", type=str, default="DGX", help="Filter comm data by topology (e.g., 'DGX', 'NVLINK')")
+    parser.add_argument("--collective-backend", type=str, default="NCCL", help="Collective communication backend (e.g., 'NCCL')")
 
     args = parser.parse_args()
-    estimator = main(model_name=args.model, backend=args.backend,
-                    db_path=args.db_path, cache_dir=args.cache_dir)
+    
+    estimator = main(
+        model_name=args.model,
+        backend=args.backend,
+        db_path=args.db_path,
+        cache_dir=args.cache_dir,
+        train_comm=args.train_comm,
+        train_comm_only=args.train_comm_only,
+        tp_size=args.tp_size,
+        embedding_dim=args.embedding_dim,
+        topology=args.topology,
+        collective_backend=args.collective_backend,
+        max_tokens=args.max_token_count,
+        max_batch_size=args.max_batch_size
+    )

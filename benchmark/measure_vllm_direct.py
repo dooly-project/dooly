@@ -563,17 +563,17 @@ def create_test_cases() -> List[Tuple[str, Dict]]:
     """Create test configurations matching DoolySim tests."""
 
     return [
-        # ("Single Prefill 1024", {
-        #     'prompt_lens': [1024],
-        #     'output_lens': [1],
-        #     'description': 'Single 1024-token prefill + 1 decode'
-        # }),
+        ("Single Prefill 32", {
+            'prompt_lens': [32],
+            'output_lens': [1],
+            'description': 'Single 8-token prefill + 1 decode'
+        }),
 
-        # ("Batch of 3 Prefill 1024", {
-        #     'prompt_lens': [1024, 1024, 1024],
-        #     'output_lens': [1, 1, 1],
-        #     'description': 'Multiple 1024-token prefill + 1 decode'
-        # }),
+        ("Batch of 4 Prefill 32", {
+            'prompt_lens': [8, 8, 8, 8],
+            'output_lens': [1, 1, 1, 1],
+            'description': 'Multiple 8-token prefill + 1 decode'
+        }),
 
         # ("Single Prefill 3072", {
         #     'prompt_lens': [3072],
@@ -593,11 +593,11 @@ def create_test_cases() -> List[Tuple[str, Dict]]:
         #     'description': '3 prefill requests'
         # }),
 
-        ("Single Decode Long", {
-            'prompt_lens': [256],
-            'output_lens': [3],
-            'description': 'Single request with 32 output tokens'
-        }),
+        # ("Single Prefill Short", {
+        #     'prompt_lens': [32],
+        #     'output_lens': [1],
+        #     'description': 'Single request with 32 output tokens'
+        # }),
 
         # ("Batch Decode", {
         #     'prompt_lens': [256, 512, 768, 1024],

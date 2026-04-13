@@ -75,7 +75,12 @@ class PredictionCache:
 
             # Write predictions
             for feature_tuple, prediction in predictions.items():
-                row = list(feature_tuple) + [prediction]
+                # Handle both tuple keys (regular ops) and int keys (collective ops)
+                if isinstance(feature_tuple, tuple):
+                    row = list(feature_tuple) + [prediction]
+                else:
+                    # Single feature (e.g., size_bytes for collective ops)
+                    row = [feature_tuple, prediction]
                 writer.writerow(row)
 
         print(f"  Saved {len(predictions)} predictions to {cache_path}")
@@ -200,16 +205,22 @@ def generate_prediction_cache_from_estimator(
 
         # Infer feature names from operation type
         sample_key = next(iter(predictions.keys()))
-        num_features = len(sample_key)
 
-        if '_prefill' in operation_name:
+        # Check for collective operations first (they have integer keys, not tuples)
+        if operation_name.startswith(('all_reduce_', 'all_gather_', 'reduce_scatter_')):
+            # Collective communication operations use size_bytes
+            feature_names = ['size_bytes']
+        elif '_prefill' in operation_name:
             feature_names = ['kv_cache_size', 'prefill_chunk_size_squared']
         elif '_decode' in operation_name:
             feature_names = ['batch_size', 'kv_cache_size']
-        elif num_features == 1:
-            feature_names = ['num_tokens']
         else:
-            feature_names = [f'feature_{i}' for i in range(num_features)]
+            # For other operations, infer from key structure
+            num_features = len(sample_key) if isinstance(sample_key, tuple) else 1
+            if num_features == 1:
+                feature_names = ['num_tokens']
+            else:
+                feature_names = [f'feature_{i}' for i in range(num_features)]
 
         # Save to cache
         cache.save_predictions(operation_name, predictions, feature_names)

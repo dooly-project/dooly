@@ -165,28 +165,27 @@ def create_test_cases() -> List[Tuple[str, dict]]:
 
     return [
         # Test 1: Pure prefill (single request)
-        # (
-        #     "Pure Prefill (single)",
-        #     {
-        #         'total_tokens': 1024,
-        #         'has_prefill': True,
-        #         'has_decode': False,
-        #         'agg_kv_cache_prefill': 0,
-        #         'agg_prefill_chunk': 128,  # L2 norm = 128 for single request
-        #     }
-        # ),
-
-        # # Test 2: Pure prefill (multiple requests)
-        # (
-        #     "Pure Prefill (multiple)",
-        #     {
-        #         'total_tokens': 3072,  #  1024 + 1024 + 1024
-        #         'has_prefill': True,
-        #         'has_decode': False,
-        #         'agg_kv_cache_prefill': 0,
-        #         'agg_prefill_chunk': (1024**2 + 1024**2 + 1024**2)**0.5,  # L2 norm
-        #     }
-        # ),
+        (
+            "Pure Prefill (single)",
+            {
+                'total_tokens': 32,
+                'has_prefill': True,
+                'has_decode': False,
+                'agg_kv_cache_prefill': 0,
+                'agg_prefill_chunk': 32,  # L2 norm = 128 for single request
+            }
+        ),
+        # Test 2: Pure prefill (multiple requests)
+        (
+            "Pure Prefill (multiple)",
+            {
+                'total_tokens': 32,  #  1024 + 1024 + 1024
+                'has_prefill': True,
+                'has_decode': False,
+                'agg_kv_cache_prefill': 0,
+                'agg_prefill_chunk': (8**2 + 8**2 + 8**2 + 8**2)**0.5,  # L2 norm
+            }
+        ),
         # (
         #     "Pure Prefill (single)",
         #     {
@@ -197,16 +196,16 @@ def create_test_cases() -> List[Tuple[str, dict]]:
         #         'agg_prefill_chunk': 3072,  # L2 norm
         #     }
         # ),
-        (
-            "Decode (single)",
-            {
-                'total_tokens': 1,
-                'has_prefill': False,
-                'has_decode': True,
-                'agg_kv_cache_prefill': 512,
-                'agg_prefill_chunk': 0,  # L2 norm = 128 for single request
-            }
-        ),
+        # (
+        #     "Decode (single)",
+        #     {
+        #         'total_tokens': 1,
+        #         'has_prefill': False,
+        #         'has_decode': True,
+        #         'agg_kv_cache_prefill': 512,
+        #         'agg_prefill_chunk': 0,  # L2 norm = 128 for single request
+        #     }
+        # ),
 
         # # Test 2: Pure prefill (multiple requests)
         # (
@@ -320,8 +319,8 @@ def main():
 
     # Configuration
     MODEL = "meta-llama/Llama-3.1-8B"
-    CACHE_DIR = "/home/jkim38/dooly/simulator/core/cache/llama-3.1-8b-FLASHINFER/csv_predictions"
-    DB_PATH = "/home/jkim38/dooly/profiler/database/dooly_data.db"
+    CACHE_DIR = "/home/jkim38/dooly/cache/tp1/meta-llama/Llama-3.1-8B/csv_predictions/"
+    DB_PATH = "/home/jkim38/dooly/profiler/database/dooly_data_new_new.db"
     BACKEND = "FLASHINFER"
 
     print("=" * 80)

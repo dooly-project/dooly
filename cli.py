@@ -2,6 +2,7 @@
 
 import argparse
 import os
+from pathlib import Path
 from .core.dooly_sim import DoolySim
 from .request import RequestStream
 from .analysis.reporters import print_summary
@@ -17,7 +18,10 @@ def main():
                        help="Model name to simulate")
     parser.add_argument("--backend", type=str, default="FLASHINFER",
                        help="Backend used for profiling")
-
+    parser.add_argument("--tp", type=int, default=1,
+                       help="Tensor parallel size (sets VLLM_FAKE_TP env var)")
+    parser.add_argument("--topology", type=str, default="mew1",
+                       help="GPU interconnect topology for collective operations (default: mew1)")
     # Paths ################################################
     parser.add_argument("--cache-dir", type=str,
                        default="/home/jkim38/dooly/simulator/core/cache/llama-3.1-8b-FLASHINFER/csv_predictions",
@@ -31,7 +35,7 @@ def main():
                        help="Maximum number of sequences")
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192,
                        help="Maximum number of batched tokens (set high enough to avoid prefill chunking)")
-    parser.add_argument("--max-model-len", type=int, default=8192,
+    parser.add_argument("--max-model-len", type=int, default=16384,
                        help="Maximum model context length") 
     parser.add_argument("--gpu-mem-util", type=float, default=0.9,
                        help="GPU memory utilization")
@@ -97,13 +101,56 @@ def main():
                        help="Export JSON in vLLM benchmark format")
     parser.add_argument("--json-output", type=str,
                        help="Output path for vLLM-format JSON file")
+    parser.add_argument("--export-batch-composition", action="store_true",
+                       help="Export detailed batch composition to JSON")
+    parser.add_argument("--batch-composition-output", type=str,
+                       help="Output path for batch composition JSON file")
 
     # Fallback ################################################
     parser.add_argument("--fallback-duration-ms", type=float, default=0.0,
                        help="Fallback step duration in ms if models fail to load")
-    parser.add_argument("--cpu-overhead-ms", type=float, default=10.0)
+    parser.add_argument("--cpu-overhead-ms", type=float, default=0.0)
 
     args = parser.parse_args()
+
+    # Auto-generate output filenames based on dataset parameters if not explicitly provided
+    if args.load_dataset and args.load_dataset.endswith('.jsonl'):
+        # Extract dataset name from load-dataset path
+        dataset_name = Path(args.load_dataset).stem
+
+        # Auto-set output files if they're not explicitly provided
+        if not args.json_output:
+            args.json_output = f"./comparison/dooly_{dataset_name}.json"
+
+        if not args.batch_composition_output and args.export_batch_composition:
+            args.batch_composition_output = f"./comparison/dooly_batch_{dataset_name}.json"
+
+    elif args.sharegpt_path:
+        # ShareGPT dataset: sharegpt-{rate}rps-{num_requests}reqs
+        dataset_name = f"sharegpt-{args.arrival_rate:.0f}rps-{args.num_requests}reqs"
+
+        # Auto-set output files if they're not explicitly provided
+        if not args.json_output:
+            args.json_output = f"./comparison/dooly_{dataset_name}.json"
+
+        if not args.batch_composition_output and args.export_batch_composition:
+            args.batch_composition_output = f"./comparison/dooly_batch_{dataset_name}.json"
+
+    elif not args.load_dataset:
+        # Generate dataset name pattern based on request generation parameters
+        if args.synthetic:
+            # vLLM RandomDataset: syn-{rate}rps-uniform-{input_len}-{output_len}
+            dataset_name = f"syn-{args.arrival_rate:.0f}rps-uniform-{args.input_len}-{args.output_len}"
+        else:
+            # DoolySim RequestStream: range-based naming
+            dataset_name = f"dooly-{args.arrival_rate:.0f}rps-{args.prompt_len_min}-{args.prompt_len_max}-{args.output_len_min}-{args.output_len_max}"
+
+        # Auto-set output files if they're not explicitly provided
+        if not args.json_output:
+            args.json_output = f"./comparison/dooly_{dataset_name}.json"
+
+        if not args.batch_composition_output and args.export_batch_composition:
+            args.batch_composition_output = f"./comparison/dooly_batch_{dataset_name}.json"
 
     # End of CLI Options ################################################
 
@@ -136,6 +183,7 @@ def main():
         cache_dir=args.cache_dir,
         db_path=args.db_path,
         backend=args.backend,
+        topology=args.topology,  # Pass topology for collective operations
         cpu_overhead=args.cpu_overhead_ms,
     )
 
@@ -216,6 +264,11 @@ def main():
     if args.export_json or args.json_output:
         json_path = args.json_output if args.json_output else os.path.join(args.csv_output_dir, f"{args.csv_prefix}.json")
         result.export_vllm_json(json_path, args.model, args.arrival_rate)
+
+    # Export batch composition if requested
+    if args.export_batch_composition or args.batch_composition_output:
+        batch_path = args.batch_composition_output if args.batch_composition_output else os.path.join(args.csv_output_dir, "batch-composition.json")
+        result.export_batch_composition_json(batch_path)
 
 
 if __name__ == "__main__":

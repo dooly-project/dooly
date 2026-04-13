@@ -85,6 +85,7 @@ class SimulationStep:
     """Record of a single simulation step."""
     step_id: int
     sim_time_ms: float  # Simulation time in milliseconds
+    elapsed_time_ms: float  # Step duration in milliseconds (for comparison with vLLM)
 
     # Scheduling info
     num_scheduled_new: int
@@ -276,50 +277,36 @@ class SimulationResult:
         total_input_tokens = sum(t.prompt_len for t in traces)
         total_output_tokens = sum(t.actual_output_len for t in traces)
 
+        import numpy as np
+            
         # Build result dict matching vLLM format
         result = {
-            "date": datetime.now().strftime("%Y%m%d-%H%M%S"),
             "endpoint_type": "dooly_sim",
             "backend": "dooly_sim",
-            "label": None,
-            "model_id": model_id,
-            "tokenizer_id": model_id,
+            "model": model_id,
             "num_prompts": len(traces),
-            "request_rate": request_rate,
-            "burstiness": 1,
-            "max_concurrency": None,
+            "arrival_rate": request_rate,
             "duration": duration_sec,
-            "completed": completed,
-            "failed": len(traces) - completed,
-            "total_input_tokens": total_input_tokens,
-            "total_output_tokens": total_output_tokens,
             "request_throughput": completed / duration_sec if duration_sec > 0 else 0,
-            "request_goodput": None,
             "output_throughput": total_output_tokens / duration_sec if duration_sec > 0 else 0,
-            "total_token_throughput": (total_input_tokens + total_output_tokens) / duration_sec if duration_sec > 0 else 0,
-
+            "total_throughput": (total_input_tokens + total_output_tokens) / duration_sec if duration_sec > 0 else 0,
+            # "completed": completed,
+            # "failed": len(traces) - completed,
+            "mean_ttft_ms": sum(t.ttft_ms for t in traces if t.ttft_ms is not None) / completed if completed > 0 else 0,
+            "median_ttft_ms": np.median([t.ttft_ms for t in traces if t.ttft_ms is not None]) if completed > 0 else 0,
+            "p95_ttft_ms": np.percentile([t.ttft_ms for t in traces if t.ttft_ms is not None], 95) if completed > 0 else 0,
+            "p99_ttft_ms": np.percentile([t.ttft_ms for t in traces if t.ttft_ms is not None], 99) if completed > 0 else 0,
+            "mean_itl_ms": sum(t.mean_inter_token_latency_ms for t in traces if t.mean_inter_token_latency_ms is not None) / completed if completed > 0 else 0,
+            "median_itl_ms": np.median([itl for t in traces if t.mean_inter_token_latency_ms is not None for itl in t.inter_token_latencies_ms]) if completed > 0 else 0,
+            "p95_itl_ms": np.percentile([itl for t in traces if t.mean_inter_token_latency_ms is not None for itl in t.inter_token_latencies_ms], 95) if completed > 0 else 0,
+            "p99_itl_ms": np.percentile([itl for t in traces if t.mean_inter_token_latency_ms is not None for itl in t.inter_token_latencies_ms], 99) if completed > 0 else 0,
+            
             # Per-request arrays
-            "input_lens": [t.prompt_len for t in traces],
-            "output_lens": [t.actual_output_len for t in traces],
             "ttfts": [t.ttft_ms / 1000.0 if t.ttft_ms is not None else 0 for t in traces],  # Convert to seconds
             "itls": [[itl / 1000.0 for itl in t.inter_token_latencies_ms] for t in traces],  # Convert to seconds
-            "e2els": [t.total_latency_ms / 1000.0 if t.total_latency_ms is not None else 0 for t in traces],  # End-to-end latency in seconds
-
-            # Additional metrics (match vLLM format)
-            # ttft_ms is already in milliseconds (don't multiply by 1000!)
-            "mean_ttft_ms": sum(t.ttft_ms for t in traces if t.ttft_ms is not None) / completed if completed > 0 else 0,
-            "mean_itl_ms": sum(t.mean_inter_token_latency_ms for t in traces if t.mean_inter_token_latency_ms is not None) / completed if completed > 0 else 0,
-
-            # Batch information per step (matching vLLM format)
-            "batch_info": [
-                {
-                    "step": step.step_id,
-                    "batch_size": len(step.scheduled_req_ids),
-                    "req_ids": step.scheduled_req_ids,
-                    "total_tokens": step.total_tokens_scheduled
-                }
-                for step in self.steps
-            ],
+            "latencies": [t.total_latency_ms / 1000.0 if t.total_latency_ms is not None else 0 for t in traces],  # End-to-end latency in seconds
+            "input_lens": [t.prompt_len for t in traces],
+            "output_lens": [t.actual_output_len for t in traces],
         }
 
         # Write JSON
@@ -350,6 +337,43 @@ class SimulationResult:
         self.export_throughput_vs_time_csv(throughput_path)
 
         print(f"\nAll CSV files exported to {output_dir}/")
+
+    def export_batch_composition_json(self, output_path: str) -> None:
+        """Export detailed batch composition for each step.
+
+        Outputs a JSON file with per-step batch information including:
+        - Step metadata (time, step_id)
+        - Requests scheduled (new vs cached)
+        - Per-request token counts
+        - Queue states
+        - Preemptions
+        """
+        batch_data = []
+
+        for step in self.steps:
+            step_info = {
+                "step_id": step.step_id,
+                "sim_time_ms": round(step.sim_time_ms, 2),
+                "elapsed_time_ms": round(step.elapsed_time_ms, 2),  # **Add elapsed_time_ms for comparison with vLLM**
+                "batch_size": len(step.scheduled_req_ids),
+                "scheduled_req_ids": step.scheduled_req_ids,
+                "num_scheduled_new": step.num_scheduled_new,
+                "num_scheduled_cached": step.num_scheduled_cached,
+                "total_tokens_scheduled": step.total_tokens_scheduled,
+                "free_blocks": step.free_blocks,
+                "waiting_count": step.waiting_count,
+                "running_count": step.running_count,
+                "finished_req_ids": step.finished_req_ids,
+                "preempted_req_ids": step.preempted_req_ids,
+            }
+            batch_data.append(step_info)
+
+        # Write JSON
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(batch_data, f, indent=2)
+
+        print(f"Exported batch composition to {output_path}")
 
 
 def load_requests_from_jsonl(jsonl_path: str, tokenizer):

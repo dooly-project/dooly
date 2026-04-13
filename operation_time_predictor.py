@@ -238,6 +238,7 @@ class OperationTimePredictor:
         batch_size: int = None,
         kv_cache_size: int = None,
         prefill_chunk_size: int = None,
+        size_bytes: int = None,
     ) -> float:
         """
         Simple prediction interface without creating Batch objects.
@@ -248,12 +249,23 @@ class OperationTimePredictor:
             batch_size: Batch size (for decode attention)
             kv_cache_size: KV cache size (for attention) - will be rounded to granularity
             prefill_chunk_size: Prefill chunk size (for prefill attention)
+            size_bytes: Tensor size in bytes (for collective communication ops)
 
         Returns:
             Predicted execution time in milliseconds
         """
         if operation_name not in self.predictions:
             raise ValueError(f"No model trained for operation: {operation_name}")
+
+        # Check if this is a collective communication operation
+        if operation_name.startswith(('all_reduce_', 'all_gather_', 'reduce_scatter_')):
+            if size_bytes is None:
+                raise ValueError(f"Need size_bytes for collective operation {operation_name}")
+            key = (size_bytes,)
+            if key in self.predictions[operation_name]:
+                return self.predictions[operation_name][key]
+            else:
+                raise KeyError(f"Prediction not available for {operation_name} with size_bytes={size_bytes}")
 
         # Check if context operation
         # Remove _prefill, _decode, and signature hash to get base operation name

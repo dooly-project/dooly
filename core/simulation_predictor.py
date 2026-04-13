@@ -1,13 +1,32 @@
-"""Latency estimation for simulation steps."""
+"""Simulation predictor for per-step latency estimation.
+
+This module provides the SimulationPredictor class, which loads pre-generated
+CSV prediction caches and estimates latency for each simulation step based on
+batch composition and operation counts.
+
+This is a runtime-only component - it does NOT train models. Training must be
+done separately using simulator.estimator.
+"""
 
 from typing import Dict, Tuple, Optional
 import sqlite3
 import os
 import sys
+import numpy as np
 from pathlib import Path
 
 from ..request import BatchConfig
 
+import torch
+# Dtype to bytes mapping
+DTYPE_TO_BYTES = {
+    torch.float32: 4,
+    torch.float16: 2,
+    torch.bfloat16: 2,
+    torch.int64: 8,
+    torch.int32: 4,
+    torch.int8: 1,
+}
 
 def is_verbose() -> bool:
     """Check if verbose mode is enabled."""
@@ -18,16 +37,28 @@ def is_verbose() -> bool:
         return False
 
 
-class LatencyEstimator:
-    """Handles latency prediction using regression models."""
+class SimulationPredictor:
+    """Runtime predictor for simulation step latencies.
+
+    This class loads pre-generated CSV prediction caches and estimates
+    per-step latency based on:
+    - Batch composition (prefill vs decode)
+    - Operation counts from profiling
+    - Collective communication configurations
+
+    NOTE: This class does NOT train models. Use simulator.estimator for training.
+    """
 
     def __init__(
         self,
         model_name: str,
+        tensor_parallel_size: int,
+        dtype: torch.dtype,
         backend: str,
         vllm_config,
         cache_dir: str,
         db_path: str,
+        topology: str = "mew1",
         fallback_duration_ms: float = 10.0,
         use_csv_cache: bool = True,
     ):
@@ -39,6 +70,7 @@ class LatencyEstimator:
             vllm_config: vLLM configuration object
             cache_dir: Directory containing cached prediction CSV files
             db_path: Path to profiling database
+            topology: GPU interconnect topology for collective operations
             fallback_duration_ms: Fallback step duration if models fail to load
             use_csv_cache: If True, try to load from CSV cache first (faster)
         """
@@ -47,94 +79,89 @@ class LatencyEstimator:
         self.vllm_config = vllm_config
         self.fallback_duration_ms = fallback_duration_ms
         self.use_csv_cache = use_csv_cache
+        self.db_path = db_path
+
+        # Extract TP size and topology for collective operations
+        self.tp_size = tensor_parallel_size
+        self.topology = topology
+
+        # Extract model config for size calculations
+        self.dtype_bytes = DTYPE_TO_BYTES.get(dtype)
 
         # Initialize predictor and load operations
         self.latency_predictor = self._init_predictor(cache_dir, db_path)
         self.model_operations = self._load_model_operations(db_path)
+        self.model_collectives = self._load_model_collectives(db_path)
+        self.collective_configs = self._load_model_collective_configs(db_path)
 
     def _init_predictor(self, cache_dir: str, db_path: str):
-        """Initialize latency predictor from cached models or CSV files."""
+        """Initialize latency predictor from CSV cache ONLY.
+
+        This method ONLY loads pre-generated CSV predictions.
+        If CSV cache is missing, it fails with a helpful error message.
+        Training must be done separately using estimator.py.
+
+        Args:
+            cache_dir: Directory containing CSV prediction files
+            db_path: Path to profiling database (unused, kept for compatibility)
+
+        Returns:
+            OperationTimePredictor instance
+
+        Raises:
+            RuntimeError: If CSV cache is not found or empty
+        """
         try:
             # Add simulator directory to path if not already there
             simulator_dir = Path(__file__).parent.parent
             if str(simulator_dir) not in sys.path:
                 sys.path.insert(0, str(simulator_dir))
 
-            # Try to load from CSV cache first (much faster)
-            if self.use_csv_cache:
-                try:
-                    from simulator.core.prediction_cache import load_all_predictions
-                    from simulator.operation_time_predictor import OperationTimePredictor
+            from simulator.core.prediction_cache import load_all_predictions
+            from simulator.operation_time_predictor import OperationTimePredictor
 
-                    print(f"Attempting to load CSV prediction cache from {cache_dir}...")
-                    cache = load_all_predictions(cache_dir)
+            print(f"Loading CSV prediction cache from {cache_dir}...")
+            cache = load_all_predictions(cache_dir)
 
-                    if len(cache.predictions) > 0:
-                        # Create a simple predictor from CSV cache
-                        # We need to infer operation_is_context from operation names
-                        operation_is_context = {}
-                        for op_name in cache.predictions.keys():
-                            # Attention operations have _prefill or _decode suffix
-                            base_name = op_name.replace('_prefill', '').replace('_decode', '')
-                            # Remove signature hash
-                            import re
-                            base_name = re.sub(r'_[0-9a-f]{8}$', '', base_name)
-                            operation_is_context[base_name] = 'Attention' in base_name or 'attention' in base_name.lower()
+            if len(cache.predictions) == 0:
+                raise RuntimeError(
+                    f"\n{'='*80}\n"
+                    f"ERROR: No CSV predictions found in {cache_dir}\n"
+                    f"\nPlease run training first:\n"
+                    f"  python -m simulator.estimator \\\n"
+                    f"    --model {self.model_name} \\\n"
+                    f"    --backend {self.backend} \\\n"
+                    f"    --tp-size {self.tp_size} \\\n"
+                    f"    --topology {self.topology} \\\n"
+                    f"    --cache-dir {cache_dir} \\\n"
+                    f"    --db-path {db_path}\n"
+                    f"{'='*80}"
+                )
 
-                        predictor = OperationTimePredictor(
-                            models={},  # No sklearn models needed for CSV cache
-                            predictions=cache.predictions,
-                            operation_is_context=operation_is_context,
-                            kv_cache_granularity=64,
-                        )
-                        print(f"Successfully loaded {len(cache.predictions)} operations from CSV cache")
-                        return predictor
-                    else:
-                        print("CSV cache is empty, falling back to model loading...")
-                except Exception as e:
-                    print(f"CSV cache loading failed: {e}")
-                    print("Falling back to model loading...")
+            # Infer operation_is_context from operation names
+            operation_is_context = {}
+            for op_name in cache.predictions.keys():
+                # Attention operations have _prefill or _decode suffix
+                base_name = op_name.replace('_prefill', '').replace('_decode', '')
+                # Remove signature hash
+                import re
+                base_name = re.sub(r'_[0-9a-f]{8}$', '', base_name)
+                operation_is_context[base_name] = 'Attention' in base_name or 'attention' in base_name.lower()
 
-            # Fall back to loading regression models
-            from simulator.estimator import EstimatorConfig, SimplifiedExecutionTimeEstimator
-
-            # Infer backend from vllm_config if available
-            backend = self.backend
-            if hasattr(self.vllm_config, 'attention_config'):
-                backend_enum = getattr(self.vllm_config.attention_config, 'backend', None)
-                if backend_enum:
-                    backend = str(backend_enum).split('.')[-1].upper()
-
-            # Try to extract model name from vllm_config if needed
-            model_name = self.model_name
-            if hasattr(self.vllm_config, 'model_config') and hasattr(self.vllm_config.model_config, 'model'):
-                config_model = self.vllm_config.model_config.model
-                if config_model:
-                    model_name = config_model
-                    print(f"Using model name from vllm_config: {model_name}")
-
-            config = EstimatorConfig(
-                cache_dir=cache_dir,
-                model_name=model_name,
-                backend=backend,
-                db_path=db_path,
-                no_cache=False,  # Use cached models
+            predictor = OperationTimePredictor(
+                models={},  # No sklearn models needed for CSV cache
+                predictions=cache.predictions,
+                operation_is_context=operation_is_context,
+                kv_cache_granularity=64,
             )
-
-            print(f"Loading regression models...")
-            estimator = SimplifiedExecutionTimeEstimator(config)
-            estimator.train_all_models()  # Loads from cache
-
-            predictor = estimator.get_predictor()
-            print(f"Loaded {len(predictor.models)} operation models")
+            print(f"Successfully loaded {len(cache.predictions)} operations from CSV cache")
             return predictor
 
         except Exception as e:
-            print(f"Warning: Failed to initialize latency predictor: {e}")
-            print(f"Falling back to fixed step duration ({self.fallback_duration_ms}ms)")
+            print(f"\nERROR: Failed to initialize simulation predictor: {e}")
             import traceback
             traceback.print_exc()
-            return None
+            raise
 
     def _load_model_operations(self, db_path: str) -> Dict[Tuple[str, str], int]:
         """Load operation counts from model_operations table.
@@ -169,6 +196,185 @@ class LatencyEstimator:
         except Exception as e:
             print(f"Warning: Failed to load model operations: {e}")
             return {}
+
+    def _load_model_collectives(self, db_path: str):
+        """Load collective operations for this model configuration.
+
+        Returns:
+            List of (operation_name, dim_param, num_dims, count) tuples
+        """
+        if not os.path.exists(db_path):
+            print(f"Warning: Database not found at {db_path}")
+            return []
+
+        try:
+            conn = sqlite3.connect(db_path)
+            query = """
+                SELECT co.operation_name, co.dim_param, co.num_dims, mc.count
+                FROM model_collectives mc
+                JOIN coll_ops co ON mc.collective_id = co.collective_id
+                JOIN profiled_models pm ON mc.model_id = pm.model_id
+                WHERE pm.model_name = ?
+                  AND pm.backend = ?
+                  AND co.topology = ?
+                  AND co.tp_degree = ?
+            """
+
+            cursor = conn.execute(query, (self.model_name, self.backend, self.topology, self.tp_size))
+            collectives = cursor.fetchall()
+            conn.close()
+
+            if collectives:
+                print(f"Loaded {len(collectives)} collective operations (topology={self.topology}, tp={self.tp_size})")
+                for op_name, dim_param, num_dims, count in collectives:
+                    print(f"  - {op_name} (dim={dim_param}, ndims={num_dims}) × {count}")
+            else:
+                print(f"No collective operations found for {self.model_name} (topology={self.topology}, tp={self.tp_size})")
+
+            return collectives
+
+        except Exception as e:
+            print(f"Warning: Failed to load collective operations: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    def _load_model_collective_configs(self, db_path: str) -> Dict[Tuple, Dict]:
+        """Load collective operation configurations for this model.
+
+        Returns:
+            Dict mapping (operation_name, dim_param, num_dims) -> config dict
+            where config dict contains 'batch_param' and 'model_config_dim'
+        """
+        if not os.path.exists(db_path):
+            print(f"Warning: Database not found at {db_path}")
+            return {}
+
+        try:
+            conn = sqlite3.connect(db_path)
+            query = """
+                SELECT co.operation_name, co.dim_param, co.num_dims,
+                       mcc.batch_param, mcc.model_config_dim
+                FROM model_collective_configs mcc
+                JOIN coll_ops co ON mcc.collective_id = co.collective_id
+                JOIN profiled_models pm ON mcc.model_id = pm.model_id
+                WHERE pm.model_name = ?
+                  AND pm.backend = ?
+                  AND pm.tp_degree = ?
+                  AND co.topology = ?
+            """
+
+            cursor = conn.execute(query, (self.model_name, self.backend, self.tp_size, self.topology))
+            configs = {}
+            for row in cursor:
+                op_name, dim_param, num_dims, batch_param, model_config_dim = row
+                key = (op_name, dim_param, num_dims)
+                configs[key] = {
+                    'batch_param': batch_param,
+                    'model_config_dim': model_config_dim
+                }
+            conn.close()
+
+            if configs:
+                print(f"Loaded {len(configs)} collective operation configs")
+                for key, config in configs.items():
+                    op_name, dim_param, num_dims = key
+                    print(f"  - {op_name} (dim={dim_param}, ndims={num_dims}): "
+                          f"{config['batch_param']} × {config['model_config_dim']}")
+            else:
+                print(f"No collective configs found for {self.model_name} (tp={self.tp_size}, topology={self.topology})")
+
+            return configs
+
+        except Exception as e:
+            print(f"Warning: Failed to load collective configs: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+
+    def _calculate_collective_size(self, op_name: str, dim_param: int, num_dims: int, batch) -> int:
+        """Calculate tensor size in bytes for collective operation using model-specific config.
+
+        Uses stored MODEL_CONFIG dimension and batch parameter (NUM_TOKS or NUM_REQS)
+        from the model_collective_configs table.
+
+        Args:
+            op_name: Operation name (all_reduce, all_gather, reduce_scatter)
+            dim_param: Dimension parameter from collective operation
+            num_dims: Number of tensor dimensions
+            batch: BatchConfig containing batch information
+
+        Returns:
+            Size in bytes
+        """
+        # Look up configuration
+        key = (op_name, dim_param, num_dims)
+        config = self.collective_configs.get(key)
+
+        # Use stored configuration
+        batch_param = config['batch_param']
+        model_config_dim = config['model_config_dim']
+
+        if batch_param == "NUM_TOKS":
+            num_elements = batch.total_tokens
+        elif batch_param == "NUM_REQS":
+            num_elements = len(batch.requests)  # Number of requests in batch
+        else:
+            raise ValueError(f"Unknown batch_param: {batch_param}")
+
+        size_bytes = num_elements * model_config_dim * self.dtype_bytes
+
+        if is_verbose():
+            print(f"  Collective size: {batch_param}({num_elements}) × MODEL_CONFIG({model_config_dim}) × {self.dtype_bytes} = {size_bytes} bytes")
+
+        return size_bytes
+
+    def _estimate_collective_latency(
+        self,
+        op_name: str,
+        dim_param: int,
+        num_dims: int,
+        size_bytes: int
+    ) -> float:
+        """Estimate collective operation latency using regression models.
+
+        Uses trained regression models from cache to predict latency based on size_bytes.
+
+        Args:
+            op_name: Operation name (all_reduce, all_gather, reduce_scatter)
+            dim_param: Dimension parameter (-1, 0, 1, 2, or None)
+            num_dims: Number of tensor dimensions
+            size_bytes: Tensor size in bytes
+
+        Returns:
+            Estimated latency in milliseconds
+        """
+        # Build model key matching the training format
+        # Format: "{operation}_dim{dim_param}_ndims{num_dims}"
+        dim_str = "None" if dim_param is None or (isinstance(dim_param, float) and np.isnan(dim_param)) else str(int(dim_param))
+        model_key = f"{op_name}_dim{dim_str}_ndims{int(num_dims)}"
+
+        # Use regression model from predictor
+        if self.latency_predictor is None:
+            print(f"  Warning: No latency predictor available for {model_key}")
+            return 0.0
+
+        try:
+            # Check if model exists in either models or predictions (CSV cache)
+            if model_key not in self.latency_predictor.models and model_key not in self.latency_predictor.predictions:
+                print(f"  Warning: No model found for {model_key}")
+                return 0.0
+
+            # Use predict_simple with size_bytes feature
+            pred = self.latency_predictor.predict_simple(
+                model_key,
+                size_bytes=size_bytes
+            )
+            return float(pred)
+
+        except Exception as e:
+            print(f"  Warning: Model prediction failed for {model_key}: {e}")
+            return 0.0
 
     def estimate_step_latency(self, sched_output, step_id: int = -1) -> float:
         """Estimate step latency using regression models.
@@ -257,6 +463,30 @@ class LatencyEstimator:
                         print(f"  [{model_key}] FAILED: {e}")
                         pass
 
+            # Add collective communication overhead
+            comm_latency_ms = 0.0
+
+            if self.model_collectives:
+                for op_name, dim_param, num_dims, count in self.model_collectives:
+                    # Calculate tensor size for this batch using model-specific config
+                    size_bytes = self._calculate_collective_size(op_name, dim_param, num_dims, batch)
+
+                    # Estimate latency for one occurrence
+                    op_latency = self._estimate_collective_latency(op_name, dim_param, num_dims, size_bytes)
+
+                    # Multiply by count
+                    contribution = op_latency * count
+                    comm_latency_ms += contribution
+
+                    if is_verbose() and step_id == 0:
+                        print(f"  [Comm {op_name}] size={size_bytes/1e6:.2f}MB, "
+                              f"latency={op_latency:.3f}ms × {count} = {contribution:.3f}ms")
+
+            total_latency_ms += comm_latency_ms
+
+            if is_verbose() and comm_latency_ms > 0 and step_id == 0:
+                print(f"  Total comm overhead: {comm_latency_ms:.3f}ms")
+
             # Return latency in milliseconds
             # DEBUG: Show total for decode steps
             if len(batch.decode_requests) > 0 and step_id >= 0:
@@ -335,8 +565,8 @@ class LatencyEstimator:
             avg_kv_cache = sum(batch.decode_requests) / decode_batch_size
 
             # DEBUGGING: Check if batch_size exceeds profiled range
-            MAX_PROFILED_BATCH_SIZE = 16
-            MAX_PROFILED_KV_CACHE = 16128
+            MAX_PROFILED_BATCH_SIZE = 32
+            MAX_PROFILED_KV_CACHE = 16384
 
             print(f"\n[DECODE DEBUG] Step {step_id}:")
             print(f"  decode_batch_size: {decode_batch_size}")

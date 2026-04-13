@@ -1,25 +1,43 @@
+import torch
+import time
+
 from ..utils import SimulationResult, SimulationStep, RequestTrace, TokenEvent
 from ..request import RequestConfig, make_request, create_mock_output
 from ..emulator import emulate_init
-from .latency_estimator import LatencyEstimator
+from .simulation_predictor import SimulationPredictor
 
 from typing import Dict, Iterator
+
+# Import vLLM components for process_outputs
+try:
+    from vllm.v1.engine import EngineCoreOutput
+    from vllm.v1.engine.output_processor import RequestState
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+    print("Warning: vLLM components not available for process_outputs")
 
 class DoolySim:
     def __init__(
         self,
         model: str = "gpt2",
-        args: Dict = {"max_model_len": 512, "gpu_memory_utilization": 0.0003439735828288387, "max_num_seqs": 10, "max_num_batched_tokens": 512},
+        args: Dict = {"max_model_len": 16384, "gpu_memory_utilization": 0.9, "max_num_seqs": 10, "max_num_batched_tokens": 512},
+        tensor_parallel_size: int = 1,
         step_duration_ms: float = 10.0,  # Simulated time per forward pass (fallback)
-        cache_dir: str = "/home/jkim38/dooly/simulator/llama-3.1-8b-FLASHINFER",
-        db_path: str = "/home/jkim38/dooly/profiler/database/dooly_data.db",
+        cache_dir: str = "/home/jkim38/dooly/cache/tp1/meta-llama/Llama-3.1-8B/",
+        db_path: str = "/home/jkim38/dooly/profiler/database/dooly_data_new_new.db",
         backend: str = "FLASHINFER",
-        cpu_overhead: float = 10.0
+        topology: str = "mew1",  # GPU interconnect topology for collective operations
+        cpu_overhead: float = 10.0,
+        use_actual_process_outputs: bool = True  # Use actual vLLM process_outputs for CPU overhead
     ):
         self.cpu_overhead = cpu_overhead
+        self.use_actual_process_outputs = use_actual_process_outputs
         self.llm= emulate_init(model=model, args=args)
         self.tokenizer = self.llm.get_tokenizer()
         self.vllm_config = self.llm.llm_engine.vllm_config
+
+        
         cache_cfg = self.vllm_config.cache_config
         model_cfg = self.vllm_config.model_config
         parallel_cfg = self.vllm_config.parallel_config
@@ -34,19 +52,25 @@ class DoolySim:
 
         # Create scheduler
         self.scheduler= self.llm.llm_engine.engine_core.engine_core.scheduler
+        
+        # Access the output processor for CPU overhead estimation
+        self.output_processor = self.llm.llm_engine.output_processor if use_actual_process_outputs else None
 
         self.max_num_seqs: int = self.scheduler.max_num_running_reqs
         self.max_num_batched_tokens: int = self.scheduler.max_num_scheduled_tokens
 
-        # Initialize latency estimator
+        # Initialize simulation predictor
         self.model_name = model
         self.backend = backend
-        self.latency_estimator = LatencyEstimator(
+        self.latency_estimator = SimulationPredictor(
             model_name=model,
             backend=backend,
+            tensor_parallel_size=tensor_parallel_size,
+            dtype=torch.bfloat16,
             vllm_config=self.vllm_config,
             cache_dir=cache_dir,
             db_path=db_path,
+            topology=topology,  # Pass topology for collective operations
             fallback_duration_ms=step_duration_ms
         )
 
@@ -72,110 +96,181 @@ class DoolySim:
 
     def _create_mock_output(self, scheduler_output, token_id: int = 1000):
         return create_mock_output(self, scheduler_output, token_id)
-        
+
+    def _estimate_process_outputs(self, engine_outputs, has_prefill: bool) -> float:
+        if not VLLM_AVAILABLE or not self.output_processor:
+            # Fallback to fixed overhead
+            return self.cpu_overhead if has_prefill else 0.0
+
+        try:
+            # Time the actual process_outputs call
+            
+            start_time = time.perf_counter()
+            _ = self.output_processor.process_outputs(
+                engine_outputs.get(0).outputs,
+                engine_core_timestamp=None,
+                iteration_stats=None
+            )
+            end_time = time.perf_counter()
+
+            process_output_ms = (end_time - start_time) * 1000.0
+
+            print(f"Estimated process_outputs overhead: {process_output_ms:.1f}ms (has_prefill={has_prefill})")
+            return process_output_ms
+
+        except Exception as e:
+            import traceback
+            print(f"Error estimating process_outputs overhead: {e}")
+            print(f"Traceback: {traceback.format_exc()}")
+            # Fallback to fixed overhead
+            return self.cpu_overhead if has_prefill else 0.0
+
     def _add_request(self, config: RequestConfig, result: SimulationResult, actual_arrival_time_ms: float):
         req = make_request(self, config)
         print(f"Adding Request {req.request_id} of prompt length {len(req.prompt_token_ids)}")
-        self.scheduler.add_request(req)
+        # req_id = config.request_id
+        
+        process_input_start = time.perf_counter()
+        # self.scheduler.add_request(req)
+        req_id = self.llm.llm_engine.add_request(req.request_id, req.prompt_token_ids, req.sampling_params)
+        process_input_end = time.perf_counter()
+        process_input_ms = (process_input_end - process_input_start) * 1000.0
+        
+        self.request_arrival_times_ms[req_id] = actual_arrival_time_ms
 
-        # Use actual_arrival_time_ms (current sim_time)
-        self.request_arrival_times_ms[config.request_id] = actual_arrival_time_ms
 
         # Create RequestTrace for detailed tracking
-        result.request_traces[config.request_id] = RequestTrace(
+        result.request_traces[req_id] = RequestTrace(
             request_id=config.request_id,
             arrival_time_ms=actual_arrival_time_ms,
             prompt_len=len(config.prompt_token_ids),
             max_output_len=config.max_tokens,
         )
+        
+        return process_input_ms
 
     def run(
-        self,
-        request_stream: Iterator[RequestConfig],
-        max_steps: int = 10000,
-        verbose: bool = False,
-    ) -> SimulationResult:
-        result = SimulationResult()
-        all_requests = list(request_stream)
-        all_requests.sort(key=lambda r: r.arrival_time)
-        result.total_requests = len(all_requests)
+            self,
+            request_stream: Iterator[RequestConfig],
+            max_steps: int = 10000,
+            verbose: bool = False,
+        ) -> SimulationResult:
+            result = SimulationResult()
+            all_requests = list(request_stream)
+            all_requests.sort(key=lambda r: r.arrival_time)
+            result.total_requests = len(all_requests)
 
-        request_idx = 0
-        sim_time_ms = 0.0  # Simulated time (advances by predicted latency)
-        step_id = 0
-        prev_output = None
+            request_idx = 0
+            sim_time_ms = 0.0
+            step_id = 1
 
-        if verbose:
-            print(f"Starting simulation with {len(all_requests)} requests")
-            print(f"Block capacity: {self.num_blocks} blocks x {self.block_size} = {self.num_blocks * self.block_size} tokens")
+            if verbose:
+                print(f"Starting simulation with {len(all_requests)} requests")
+                print(f"Block capacity: {self.num_blocks} blocks x {self.block_size} = {self.num_blocks * self.block_size} tokens")
 
-        while step_id < max_steps:
-            # 1. Add any requests that have arrived by this time
-            current_time_ms = sim_time_ms
-            
-            while request_idx < len(all_requests) and all_requests[request_idx].arrival_time * 1000.0 <= current_time_ms :
-                req_config = all_requests[request_idx]
-                self._add_request(req_config, result, current_time_ms)
-                if verbose:
-                    print(f"[t={sim_time_ms:.1f}ms] Request {req_config.request_id} arrived "
-                          f"(prompt={len(req_config.prompt_token_ids)}, max_out={req_config.max_tokens})")
-                request_idx += 1
-
-            # 2. Check if there's work to do
-            if not self.scheduler.has_requests() and request_idx >= len(all_requests):
-                if verbose:
-                    print(f"\n[t={sim_time_ms:.1f}ms] All requests completed!")
-                break
-
-            if not self.scheduler.has_requests():
-                # No requests yet, advance time to next arrival
-                if request_idx < len(all_requests):
-                    sim_time_ms = all_requests[request_idx].arrival_time * 1000.0
-                continue
-
-            # 3. If we have a previous output, update scheduler state
-            if prev_output is not None and prev_output.total_num_scheduled_tokens > 0:
-                # Create mock output
-                mock_output = self._create_mock_output(prev_output, token_id=1000 + step_id)
-                engine_outputs = self.scheduler.update_from_output(prev_output, mock_output)
+            while step_id < max_steps:
                 
-                # Track finished requests and token events
-                batch_size = len(prev_output.num_scheduled_tokens) if prev_output else 0
+                # 1. Add any requests that have arrived by this time
+                process_input_times = []
+                current_time_ms = sim_time_ms
+                while request_idx < len(all_requests) and all_requests[request_idx].arrival_time * 1000.0 <= current_time_ms:
+                    req_config = all_requests[request_idx]
+                    process_input_ms = self._add_request(req_config, result, current_time_ms)
+                    process_input_times.append(process_input_ms)
+                    if verbose:
+                        print(f"[t={sim_time_ms:.1f}ms] Request {req_config.request_id} arrived "
+                            f"(prompt={len(req_config.prompt_token_ids)}, max_out={req_config.max_tokens})")
+                    request_idx += 1
 
-                for _, outputs in engine_outputs.items():
+                # 2. Check if there's work to do
+                if not self.scheduler.has_requests() and request_idx >= len(all_requests):
+                    if verbose:
+                        print(f"\n[t={sim_time_ms:.1f}ms] All requests completed!")
+                    break
+
+                if not self.scheduler.has_requests():
+                    # No requests yet, advance time to next arrival
+                    if request_idx < len(all_requests):
+                        sim_time_ms = all_requests[request_idx].arrival_time * 1000.0
+                    continue
+
+                # 3. Schedule next batch (Moved up to follow vLLM's step() flow)
+                sched_output = self.scheduler.schedule()
+
+                # Track when requests are first scheduled
+                for new_req in sched_output.scheduled_new_reqs:
+                    if new_req.req_id in result.request_traces:
+                        trace = result.request_traces[new_req.req_id]
+                        if trace.scheduled_time_ms is None:
+                            trace.scheduled_time_ms = sim_time_ms
+                            if verbose:
+                                queue_time = sim_time_ms - trace.arrival_time_ms
+                                print(f"[t={sim_time_ms:.1f}ms] Request {new_req.req_id} first scheduled "
+                                    f"(queue_time={queue_time:.1f}ms)")
+
+                # If nothing scheduled, advance time slightly
+                if sched_output.total_num_scheduled_tokens == 0:
+                    if request_idx < len(all_requests):
+                        sim_time_ms = all_requests[request_idx].arrival_time * 1000.0
+                    else:
+                        sim_time_ms += 1.0
+                    continue
+                
+                # 4. Execute and Update Scheduler (Replaces prev_output logic)
+                mock_output = self._create_mock_output(sched_output, token_id=1000 + step_id)
+                
+                # 5. Estimate the step duration 
+                has_prefill = len(sched_output.scheduled_new_reqs) > 0 or any(sched_output.scheduled_cached_reqs.is_context_phase(req_id) for req_id in sched_output.scheduled_cached_reqs.req_ids)
+
+                gpu_latency_ms = self.latency_estimator.estimate_step_latency(
+                    sched_output=sched_output,
+                    step_id=step_id
+                )
+                
+                # update scheduler
+                engine_outputs = self.scheduler.update_from_output(sched_output, mock_output)
+                
+                # process output
+                if self.use_actual_process_outputs and self.output_processor:
+                    process_output_ms = self._estimate_process_outputs(engine_outputs, True)
+                else:
+                    process_output_ms = self.cpu_overhead if has_prefill else 0.0
+
+                self.step_duration_ms = gpu_latency_ms + process_output_ms + (sum(process_input_times) if process_input_times else 0.0)
+
+                if verbose:
+                    print(f"  └─ TIMING: GPU={gpu_latency_ms:.1f}ms, CPU={process_output_ms:.1f}ms, Total={self.step_duration_ms:.1f}ms")
+
+                # 6. Advance simulation time 
+                sim_time_ms += self.step_duration_ms
+                result.total_tokens_generated += sched_output.total_num_scheduled_tokens
+
+                # 7. Process Events based on actual engine_outputs
+                batch_size = len(sched_output.num_scheduled_tokens)
+                
+                for req_id, outputs in engine_outputs.items():
                     for out in outputs.outputs:
-                        # Record token events for newly generated tokens
+                        # Record token events
                         if out.new_token_ids and len(out.new_token_ids) > 0:
                             if out.request_id not in self.request_first_token_times_ms:
                                 self.request_first_token_times_ms[out.request_id] = sim_time_ms
 
-                            # Record each newly generated token
                             if out.request_id in result.request_traces:
                                 trace = result.request_traces[out.request_id]
-                                for _ in out.new_token_ids:
-                                    # Calculate per-token latency
-                                    if len(trace.token_events) == 0:
-                                        # First token: step_dur = TTFT (time from arrival to first token)
-                                        arrival_time = self.request_arrival_times_ms[out.request_id]
-                                        per_token_latency = sim_time_ms - arrival_time
-                                    else:
-                                        # Subsequent tokens: step_dur = inter-token latency
-                                        prev_token_time = trace.token_events[-1].timestamp_ms
-                                        per_token_latency = sim_time_ms - prev_token_time
 
+                                for token_idx, _ in enumerate(out.new_token_ids):
                                     token_event = TokenEvent(
                                         token_index=len(trace.token_events),
-                                        timestamp_ms=sim_time_ms,
-                                        step_duration_ms=per_token_latency,
+                                        timestamp_ms=sim_time_ms, # Now correctly reflects time AFTER execution
+                                        step_duration_ms=self.step_duration_ms,
                                         batch_size=batch_size,
-                                        total_tokens_in_batch=prev_output.total_num_scheduled_tokens if prev_output else 0,
+                                        total_tokens_in_batch=sched_output.total_num_scheduled_tokens,
                                     )
                                     trace.token_events.append(token_event)
 
+                        # Record finishes
                         if out.finish_reason:
                             self.request_finish_times_ms[out.request_id] = sim_time_ms
-
-                            # Update request trace with finish information
                             if out.request_id in result.request_traces:
                                 trace = result.request_traces[out.request_id]
                                 trace.finish_time_ms = sim_time_ms 
@@ -184,87 +279,39 @@ class DoolySim:
                             if verbose:
                                 latency_ms = sim_time_ms - self.request_arrival_times_ms[out.request_id]
                                 print(f"[t={sim_time_ms:.1f}ms] Request {out.request_id} FINISHED "
-                                      f"(reason={out.finish_reason}, latency={latency_ms:.1f}ms)")
+                                    f"(reason={out.finish_reason}, latency={latency_ms:.1f}ms)")
 
-            # 4. Schedule next batch
-            sched_output = self.scheduler.schedule()
-
-            # 4.5. Track when requests are first scheduled (for queue time calculation)
-            for new_req in sched_output.scheduled_new_reqs:
-                if new_req.req_id in result.request_traces:
-                    trace = result.request_traces[new_req.req_id]
-                    if trace.scheduled_time_ms is None:
-                        trace.scheduled_time_ms = sim_time_ms
-                        if verbose:
-                            queue_time = sim_time_ms - trace.arrival_time_ms
-                            print(f"[t={sim_time_ms:.1f}ms] Request {new_req.req_id} first scheduled "
-                                  f"(queue_time={queue_time:.1f}ms)")
-
-            # 5. Record step metrics
-            free_blocks = self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
-
-            # Check for preemptions (requests that were running but moved back to waiting)
-            preempted = []
-            if sched_output.preempted_req_ids:
-                preempted = list(sched_output.preempted_req_ids)
-                result.preemption_count += len(preempted)
-
-            step_record = SimulationStep(
-                step_id=step_id,
-                sim_time_ms=sim_time_ms,
-                num_scheduled_new=len(sched_output.scheduled_new_reqs),
-                num_scheduled_cached=sched_output.scheduled_cached_reqs.num_reqs,
-                total_tokens_scheduled=sched_output.total_num_scheduled_tokens,
-                scheduled_req_ids=list(sched_output.num_scheduled_tokens.keys()),
-                free_blocks=free_blocks,
-                finished_req_ids=list(sched_output.finished_req_ids),
-                preempted_req_ids=preempted,
-                waiting_count=len(self.scheduler.waiting),
-                running_count=len(self.scheduler.running),
-            )
-            result.steps.append(step_record)
-
-            if verbose and sched_output.total_num_scheduled_tokens > 0:
-                print(f"[t={sim_time_ms:.1f}ms] Step {step_id}: "
-                      f"batch={len(sched_output.num_scheduled_tokens)}, "
-                      f"tokens={sched_output.total_num_scheduled_tokens}, "
-                      f"free_blocks={free_blocks}, "
-                      f"waiting={len(self.scheduler.waiting)}, "
-                      f"running={len(self.scheduler.running)}")
-                # Log scheduling decision for comparison
-                print(f"  └─ SCHED: reqs={sorted(sched_output.num_scheduled_tokens.keys())}, "
-                      f"tokens_per_req={dict(sorted(sched_output.num_scheduled_tokens.items()))}")
+                # 8. Record step metrics
+                free_blocks = self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+                preempted = list(sched_output.preempted_req_ids) if sched_output.preempted_req_ids else []
                 if preempted:
-                    print(f"           PREEMPTED: {preempted}")
+                    result.preemption_count += len(preempted)
 
-            # 5.5. Estimate the step duration using regression models
-            if sched_output.total_num_scheduled_tokens > 0:
-                self.step_duration_ms = self.latency_estimator.estimate_step_latency(sched_output, step_id=step_id) + self.cpu_overhead
-
-            # 6. Advance simulation time
-            if sched_output.total_num_scheduled_tokens > 0:
-                result.total_tokens_generated += sched_output.total_num_scheduled_tokens
-                sim_time_ms += self.step_duration_ms
+                step_record = SimulationStep(
+                    step_id=step_id,
+                    sim_time_ms=sim_time_ms,
+                    elapsed_time_ms=self.step_duration_ms,
+                    num_scheduled_new=len(sched_output.scheduled_new_reqs),
+                    num_scheduled_cached=sched_output.scheduled_cached_reqs.num_reqs,
+                    total_tokens_scheduled=sched_output.total_num_scheduled_tokens,
+                    scheduled_req_ids=list(sched_output.num_scheduled_tokens.keys()),
+                    free_blocks=free_blocks,
+                    finished_req_ids=list(sched_output.finished_req_ids),
+                    preempted_req_ids=preempted,
+                    waiting_count=len(self.scheduler.waiting),
+                    running_count=len(self.scheduler.running),
+                )
+                result.steps.append(step_record)
+                
                 step_id += 1
-            else:
-                # No work scheduled, advance to next arrival or small increment
-                if request_idx < len(all_requests):
-                    sim_time_ms = all_requests[request_idx].arrival_time * 1000.0
-                else:
-                    sim_time_ms += 1  # Advance by a small amount to check for completion
 
-            # this is wrong because this assumes that 
-            # scheduler output is the same as engine output, which is not true when we have chunked prefill 
-            prev_output = sched_output
+            result.total_steps = step_id
 
-        result.total_steps = step_id
+            # Calculate final latencies
+            for req_id, arrival_ms in self.request_arrival_times_ms.items():
+                if req_id in self.request_finish_times_ms:
+                    result.request_latencies[req_id] = self.request_finish_times_ms[req_id] - arrival_ms
+                if req_id in self.request_first_token_times_ms:
+                    result.request_ttft[req_id] = self.request_first_token_times_ms[req_id] - arrival_ms
 
-        # Calculate latencies (in milliseconds)
-        for req_id, arrival_ms in self.request_arrival_times_ms.items():
-            if req_id in self.request_finish_times_ms:
-                result.request_latencies[req_id] = self.request_finish_times_ms[req_id] - arrival_ms
-            if req_id in self.request_first_token_times_ms:
-                result.request_ttft[req_id] = self.request_first_token_times_ms[req_id] - arrival_ms
-
-        return result
-
+            return result

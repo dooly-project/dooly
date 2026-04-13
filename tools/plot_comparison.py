@@ -1,19 +1,9 @@
-#!/usr/bin/env python3
-"""
-Plot CDF comparison between DoolySim and vLLM results.
-
-Usage:
-    python plot_comparison.py --dooly dooly.json --vllm vllm.json --metric ttft
-    python plot_comparison.py --dooly dooly.json --vllm vllm.json --metric itl
-    python plot_comparison.py --dooly dooly.json --vllm vllm.json --metric latency
-"""
-
 import json
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import List, Tuple
-
+import os
 
 def load_json(filepath: str) -> dict:
     """Load JSON results file."""
@@ -222,6 +212,112 @@ def plot_cdf_comparison(
     else:
         plt.show()
 
+def calculate_stats(dooly_file, vllm_file):
+    # calculate p50, p95, p99 for both dooly and vllm and print them out
+    dooly_data = load_json(dooly_file)
+    vllm_data = load_json(vllm_file)
+    
+    dooly_ttft_values = extract_metric(dooly_data, 'ttft')
+    dooly_itl_values = extract_metric(dooly_data, 'itl')
+    vllm_ttft_values = extract_metric(vllm_data, 'ttft')
+    vllm_itl_values = extract_metric(vllm_data, 'itl')
+    
+    dooly_values={
+        'ttft': dooly_ttft_values,
+        'itl': dooly_itl_values,
+        'duration': dooly_data.get('duration', 0),
+        'output_throughput': dooly_data.get('output_throughput', 0)
+    }
+    
+    vllm_values={
+        'ttft': vllm_ttft_values,
+        'itl': vllm_itl_values,
+        'duration': vllm_data.get('duration', 0),
+        'output_throughput': vllm_data.get('output_throughput', 0)
+    }
+    
+    summary_values ={}
+    for metric in ['ttft', 'itl', 'duration', 'output_throughput']:
+        summary_values[metric] = {}
+        for model in ['dooly', 'vllm']:
+            if model == 'dooly':
+                source = dooly_values            
+            else:
+                source = vllm_values
+                
+            if metric in ['ttft', 'itl']:
+                summary_values[metric][model] = {}
+                summary_values[metric][model]['p50'] = np.percentile(source[metric], 50)
+                summary_values[metric][model]['p95'] = np.percentile(source[metric], 95)
+                summary_values[metric][model]['p99'] = np.percentile(source[metric], 99)
+            else:
+                summary_values[metric][model] = source[metric]
+        
+        if metric in ['ttft', 'itl']:
+            summary_values[metric]['p50_perc_diff'] = (summary_values[metric]['dooly']['p50'] - summary_values[metric]['vllm']['p50'])/summary_values[metric]['vllm']['p50'] * 100
+            summary_values[metric]['p95_perc_diff'] = (summary_values[metric]['dooly']['p95'] - summary_values[metric]['vllm']['p95'])/summary_values[metric]['vllm']['p95'] * 100
+            summary_values[metric]['p99_perc_diff'] = (summary_values[metric]['dooly']['p99'] - summary_values[metric]['vllm']['p99'])/summary_values[metric]['vllm']['p99'] * 100
+        else:
+            summary_values[metric]['perc_diff'] = (summary_values[metric]['dooly'] - summary_values[metric]['vllm'])/summary_values[metric]['vllm'] * 100
+    return summary_values
+
+def plot_stats(stats: dict, output_dir: str = "."):
+    """Plot summary statistics (bar charts) comparing DoolySim and vLLM."""
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    colors = {'dooly': '#0173b2', 'vllm': '#de8f05'}
+    
+    # --- 1. TTFT Percentiles (Grouped Bar Chart) ---
+    ax = axes[0,0]  # Top Left
+    labels = ['P50', 'P95', 'P99']
+    x = np.arange(len(labels))
+    width = 0.35
+    
+    dooly_ttft = [stats['ttft']['dooly']['p50'], stats['ttft']['dooly']['p95'], stats['ttft']['dooly']['p99']]
+    vllm_ttft = [stats['ttft']['vllm']['p50'], stats['ttft']['vllm']['p95'], stats['ttft']['vllm']['p99']]
+    
+    ax.bar(x - width/2, dooly_ttft, width, label='DoolySim', color=colors['dooly'])
+    ax.bar(x + width/2, vllm_ttft, width, label='vLLM', color=colors['vllm'])
+    ax.set_ylabel('Latency (ms)', fontweight='semibold')
+    ax.set_title('TTFT Percentiles', fontsize=14, fontweight='bold', pad=10)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontweight='semibold')
+    ax.legend()
+
+    # --- 2. ITL Percentiles (Grouped Bar Chart) ---
+    ax = axes[0,1]  # Top Right
+    dooly_itl = [stats['itl']['dooly']['p50'], stats['itl']['dooly']['p95'], stats['itl']['dooly']['p99']]
+    vllm_itl = [stats['itl']['vllm']['p50'], stats['itl']['vllm']['p95'], stats['itl']['vllm']['p99']]
+    
+    ax.bar(x - width/2, dooly_itl, width, label='DoolySim', color=colors['dooly'])
+    ax.bar(x + width/2, vllm_itl, width, label='vLLM', color=colors['vllm'])
+    ax.set_ylabel('Latency (ms)', fontweight='semibold')
+    ax.set_title('ITL Percentiles', fontsize=14, fontweight='bold', pad=10)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontweight='semibold')
+    ax.legend()
+
+    # --- 3. Total Duration (Standard Bar Chart) ---
+    ax = axes[1,0]  # Bottom Left
+    models = ['DoolySim', 'vLLM']
+    durations = [stats['duration']['dooly'], stats['duration']['vllm']]
+    bars = ax.bar(models, durations, color=[colors['dooly'], colors['vllm']])
+    ax.set_ylabel('Time (seconds)', fontweight='semibold')
+    ax.set_title('Total Generation Duration', fontsize=14, fontweight='bold', pad=10)
+    
+    # --- 4. Output Throughput (Standard Bar Chart) ---
+    ax = axes[1,1]  # Bottom Right
+    throughputs = [stats['output_throughput']['dooly'], stats['output_throughput']['vllm']]
+    bars = ax.bar(models, throughputs, color=[colors['dooly'], colors['vllm']])
+    ax.set_ylabel('Tokens / second', fontweight='semibold')
+    ax.set_title('Output Throughput', fontsize=14, fontweight='bold', pad=10)
+
+    plt.tight_layout(pad=3.0)
+    
+    # Save the plot
+    output_path = os.path.join(output_dir, 'summary_stats.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"✓ Saved summary statistics plot to {output_path}")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -253,7 +349,14 @@ def main():
         title=args.title,
         style=args.style,
     )
+    
+    stats = calculate_stats(args.dooly, args.vllm)
 
+    import json
+    json_output = json.dumps(stats, indent=4)
+    print(json_output)
+
+    plot_stats(stats, output_dir=os.path.dirname(args.output) if args.output else ".")
 
 if __name__ == "__main__":
     main()
