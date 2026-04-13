@@ -767,10 +767,6 @@ class HierarchicalTraceParser:
             elif ancestor.cat == 'cpu_op':
                 comm_cpu_op_anchors.add(anchor_id)
 
-        print(f"[DEBUG] Linked {len(self.comm_ops)} comm ops to {len(anchor_to_collectives)} unique anchors")
-        print(f"[DEBUG]   - Comm module anchors: {len(comm_module_anchors)}")
-        print(f"[DEBUG]   - Comm cpu-op anchors: {len(comm_cpu_op_anchors)}")
-
         # Track which anchors are modules vs cpu_ops
         module_anchors = set()
         cpu_op_anchors = set()
@@ -790,10 +786,6 @@ class HierarchicalTraceParser:
                     module_anchors.add(anchor_id)
                 elif ancestor.cat == 'cpu_op':
                     cpu_op_anchors.add(anchor_id)
-
-        print(f"[DEBUG] Linked {len(self.kernels)} kernels to {len(anchor_to_kernels)} unique anchors")
-        print(f"[DEBUG]   - Module anchors: {len(module_anchors)}")
-        print(f"[DEBUG]   - CPU-op anchors: {len(cpu_op_anchors)}")
 
         # 2. Deduplicate: Remove anchors that are descendants of other anchors
         # If A contains B (A is ancestor of B), keep only A and remap B's kernels to A
@@ -820,15 +812,8 @@ class HierarchicalTraceParser:
 
         # print(f"[DEBUG] Building OperationHierarchy for {len(canonical_anchors)} canonical anchors")
         for anchor_id, anchor in canonical_anchors.items():
-            # if anchor.cat == 'module' and anchor.params:
-            #     print(f"[DEBUG] MODULE anchor with params: {anchor.name}, params={anchor.params[:80] if anchor.params else None}")
-            # if anchor.cat == 'comm': 
-            #     print(f"[DEBUG] COMM anchor: {anchor.name}")
-            # print(f"[DEBUG] Processing anchor: {anchor.name} (cat={anchor.cat}, has_params={bool(anchor.params)})")
             # Find nearest module (first module in parent chain)
             nearest_module = self._find_nearest_module(anchor)
-            if anchor.cat == 'comm':
-                print(f"[DEBUG COMM] anchor={anchor.name}, anchor.parent={anchor.parent.name if anchor.parent else None}, nearest_module={nearest_module.name if nearest_module else None}")
 
             # Find root module (outermost module in parent chain)
             root_module = self._find_root_module(anchor)
@@ -850,15 +835,8 @@ class HierarchicalTraceParser:
             )
             results.append(hierarchy)
 
-            # if comm_ops:
-                # print(f"[DEBUG] Anchor {anchor.name} has {len(kernels)} kernels and {len(comm_ops)} comm ops: {[c.name for c in comm_ops]}")
-
         # Sort by anchor timestamp
         results.sort(key=lambda h: h.anchor.ts)
-
-        # print(f"[DEBUG] Created {len(results)} OperationHierarchy objects")
-        # hierarchies_with_comm = sum(1 for h in results if h.comm_ops)
-        # print(f"[DEBUG] {hierarchies_with_comm} hierarchies have comm ops")
 
         return results
 
@@ -897,7 +875,6 @@ def main():
     parser = HierarchicalTraceParser(trace_path=trace_path)
     parser.parse()
 
-    # print(f"Parsed {len(parser.events)} events")
     # print(f"Found {len(parser.modules)} modules, {len(parser.cpu_ops)} CPU ops, "
         #   f"{len(parser.kernels)} kernels, {len(parser.taints)} taints")
 

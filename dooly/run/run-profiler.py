@@ -18,18 +18,16 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import torch
 import multiprocessing as mp
-
-from dooly.profiler.importer import OpImporter
-from dooly.profiler.resolver import ModuleResolver
-from dooly.profiler.vllm_layer_profiler import VLLMLayerProfiler
-
 from dooly.profiler.model import ModelInfo
 from dooly.profiler.profiler import Profiler 
 
 DTYPE_MAP = {
+    "float32": torch.float32,
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
-    "float32": torch.float32,
+    "int64": torch.int64,
+    "int32": torch.int32,
+    "int8": torch.int8,
 }
 
 def parse_args() -> argparse.Namespace:
@@ -74,6 +72,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_model(model, dtype, attention_backend, max_seq_len, result_queue, gpu):
+    from dooly.profiler.importer import OpImporter
+    from dooly.profiler.resolver import ModuleResolver
+    from dooly.profiler.vllm_layer_profiler import VLLMLayerProfiler
+    
     importer=OpImporter()
 
     # Get the minimum of user-specified max_seq_len and model's actual max
@@ -108,6 +110,55 @@ def resolve_model(model, dtype, attention_backend, max_seq_len, result_queue, gp
     vlp.close()
     print(f"=== Resolution complete for {model.name} ({dtype}) ({attention_backend}) ===\n")
 
+def run_comm_profiler(models, dtype_str, tp_size, db_path):
+    """Run comm profiler via subprocess with clean environment (no fake TP)."""
+    import subprocess
+    import pickle
+    import tempfile
+
+    print(f"\n{'='*60}")
+    print(f"Launching comm profiler via subprocess (REAL TP={tp_size})")
+    print(f"Clean environment WITHOUT VLLM_FAKE_TP")
+    print(f"{'='*60}\n")
+
+    # Extract collective ops from first model
+    model_name = models[0].name
+    collective_ops = models[0].collective_ops
+
+    # Save collective_ops to temp file
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='.pkl', delete=False) as f:
+        pickle.dump(collective_ops, f)
+        collective_ops_path = f.name
+
+    # Create clean environment WITHOUT VLLM_FAKE_TP
+    clean_env = os.environ.copy()
+    clean_env.pop('VLLM_FAKE_TP', None)
+
+    try:
+        # Run comm_worker.py directly
+        comm_worker_path = os.path.join(os.path.dirname(__file__), 'comm_worker.py')
+        result = subprocess.run(
+            [
+                sys.executable, comm_worker_path,
+                '--model', model_name,
+                '--collective-ops-pkl', collective_ops_path,
+                '--dtype', dtype_str,
+                '--tp-size', str(tp_size),
+                '--db-path', db_path,
+            ],
+            env=clean_env,
+            check=False
+        )
+
+        if result.returncode != 0:
+            print(f"\n✗ Comm profiling failed with exit code {result.returncode}")
+            sys.exit(result.returncode)
+        else:
+            print(f"\n✓ Comm profiling completed successfully")
+    finally:
+        # Cleanup temp file
+        os.unlink(collective_ops_path)
+
 
 def main() -> None:
     args = parse_args()
@@ -123,39 +174,26 @@ def main() -> None:
     mp.set_start_method("spawn", force=True)
 
     result_queue = mp.Queue()
-    importer = OpImporter()
+
     for i, model in enumerate(models):
         print(f"[RUNNER] Starting RESOLVER for {model.name}...")
         p = mp.Process(target=resolve_model, args=(model, dtype, args.attention_backend, args.max_seq_len, result_queue, args.gpu))
         p.start()
-
-        # we initialize the to_profile_resolved with just the module names for now
-        # and we will add the callables later during profiling
         model.to_profile_resolved = result_queue.get()
-
         p.join()
 
         if p.exitcode != 0:
             print(f"Run {i + 1} failed with exit code {p.exitcode}")
+            
     # Compare modules across models
     models[0].compare_with_many(models[1:], db_path=args.db_path)
     
-    print("Profiling Plan: ")
-    from dooly.profiler.module import ModuleComparator
-    comparator = ModuleComparator()
+    print("Profiling Plan (Computation): ")
+    
     for model in models:
         print(f"Model: {model.name}\n Modules to Profile: {len(model.to_profile)}")
         for module in model.to_profile:
             print(f"  - {module.module_name}, {module.operation_name}")
-            # print the parameter and values
-
-            # signature = comparator._module_signature(module)
-            # print(f"      Signature: {signature}")
-
-            # for _, child in module.hierarchy.anchor.children.items():
-            #     print(f"      Child: {child.name}")
-            #     print(f"      Child Params: {child.params}")
-
         print()
 
     profile_output = Path(args.profile_output)
@@ -178,6 +216,18 @@ def main() -> None:
     start_time = time()
     profiler.profile(models)
     elapsed_s = time() - start_time
+   
+    # limit model to profile by one
+    if models[0].collective_ops and len(models) == 1:
+        # Run comm profiling in separate process (no fake TP)
+        run_comm_profiler(
+            models=models,
+            dtype_str=args.dtype,
+            tp_size=args.tp,
+            db_path=args.db_path
+        )
+    
+    
     print(f"Profiling completed in {elapsed_s:.2f}s")
 
 if __name__ == "__main__":

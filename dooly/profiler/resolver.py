@@ -238,7 +238,7 @@ class ModuleResolver:
             layer_name = None
             if module.is_module and self.vlp is not None:
                 layer_name = self.vlp.get_layer_name_by_module(module.operation_name, self._name_to_module)
-                print(f"[RESOLVER DEBUG] layer_name for {module.operation_name}: {layer_name}")
+                # print(f"[RESOLVER DEBUG] layer_name for {module.operation_name}: {layer_name}")
 
             generator = InputGenerator(
                 module=module,
@@ -255,10 +255,10 @@ class ModuleResolver:
             assert(workload_configs is not None)
 
             workload_batch = workload_configs[0]
-            print(f"[RESOLVER DEBUG] workload_batch type: {type(workload_batch).__name__}")
+            # print(f"[RESOLVER DEBUG] workload_batch type: {type(workload_batch).__name__}")
             if isinstance(workload_batch, AttentionBatchConfig):
-                print(f"[RESOLVER DEBUG] AttentionBatchConfig: batch_size={workload_batch.batch_size}, "
-                      f"is_prefill={workload_batch.is_prefill}, kv_cache_size={workload_batch.kv_cache_size}")
+                # print(f"[RESOLVER DEBUG] AttentionBatchConfig: batch_size={workload_batch.batch_size}, "
+                    #   f"is_prefill={workload_batch.is_prefill}, kv_cache_size={workload_batch.kv_cache_size}")
                 if workload_batch.is_prefill:
                     # Prefill: num_tokens = prefill_chunk_size
                     tensor_workload = [workload_batch.prefill_chunk_size + workload_batch.kv_cache_size]
@@ -274,22 +274,22 @@ class ModuleResolver:
                 return False
 
             # Debug: Show what inputs were generated and how they'll be called
-            print(f"[RESOLVER DEBUG] Module: {module.operation_name}")
-            print(f"[RESOLVER DEBUG] Generated {len(inputs)} inputs:")
-            for i, inp in enumerate(inputs):
-                if hasattr(inp, 'shape'):
-                    pi = module.inputs[i] if i < len(module.inputs) else None
-                    pi_arg_name = getattr(pi, 'arg_name', None) if pi else None
-                    print(f"[RESOLVER DEBUG]   [{i}] shape={inp.shape}, arg_name={pi_arg_name}")
-                else:
-                    print(f"[RESOLVER DEBUG]   [{i}] {type(inp).__name__}: {inp}")
+            # print(f"[RESOLVER DEBUG] Module: {module.operation_name}")
+            # print(f"[RESOLVER DEBUG] Generated {len(inputs)} inputs:")
+            # for i, inp in enumerate(inputs):
+            #     if hasattr(inp, 'shape'):
+            #         pi = module.inputs[i] if i < len(module.inputs) else None
+            #         pi_arg_name = getattr(pi, 'arg_name', None) if pi else None
+            #         print(f"[RESOLVER DEBUG]   [{i}] shape={inp.shape}, arg_name={pi_arg_name}")
+            #     else:
+            #         print(f"[RESOLVER DEBUG]   [{i}] {type(inp).__name__}: {inp}")
 
             from dooly.profiler.profiler import prepare_op_args
             args, kwargs = prepare_op_args(callable_obj, module.operation_name, inputs)
 
             forward_context = None
             if layer_name and isinstance(workload_batch, AttentionBatchConfig):
-                print(f"[RESOLVER DEBUG] Setting up forward_context for layer: {layer_name}")
+                # print(f"[RESOLVER DEBUG] Setting up forward_context for layer: {layer_name}")
                 batch_config = AttentionBatchConfig(
                     batch_size=workload_batch.batch_size,
                     prefill_chunk_size=workload_batch.prefill_chunk_size,
@@ -304,13 +304,14 @@ class ModuleResolver:
                         return False
                     layer_metadata, _ = result
                     forward_context = {layer_name: layer_metadata}
-                    print(f"[RESOLVER DEBUG] forward_context set successfully")
+                    # print(f"[RESOLVER DEBUG] forward_context set successfully")
                 except Exception as e:
                     print(f"[RESOLVER]   Could not build metadata for {layer_name}: {e}")
                     forward_context = None
             else:
-                print(f"[RESOLVER DEBUG] No forward_context needed (layer_name={layer_name}, is_AttentionBatchConfig={isinstance(workload_batch, AttentionBatchConfig)})")
-
+                # print(f"[RESOLVER DEBUG] No forward_context needed (layer_name={layer_name}, is_AttentionBatchConfig={isinstance(workload_batch, AttentionBatchConfig)})")
+                pass
+            
             def run_callable():
                 with torch.no_grad():
                     has_named = any(
@@ -332,10 +333,10 @@ class ModuleResolver:
                         # print(f"[RESOLVER DEBUG] Calling {module.operation_name} with:")
                         # print(f"[RESOLVER DEBUG]   Positional: {len(positional_tensors)} args")
                         # print(f"[RESOLVER DEBUG]   Kwargs: {list(kwarg_tensors.keys())}")
+                        # for k, v in kwarg_tensors.items():
+                        #     if hasattr(v, 'shape'):
+                        #         print(f"[RESOLVER DEBUG]     {k}={v.shape}")
                         
-                        for k, v in kwarg_tensors.items():
-                            if hasattr(v, 'shape'):
-                                print(f"[RESOLVER DEBUG]     {k}={v.shape}")
                         callable_obj(*positional_tensors, **kwarg_tensors)
                     else:
                         callable_obj(*args, **kwargs)
@@ -363,10 +364,10 @@ class ModuleResolver:
                         # print(f"[RESOLVER DEBUG] Calling {module.operation_name} WITH CONTEXT:")
                         # print(f"[RESOLVER DEBUG]   Positional: {len(positional_tensors)} args")
                         # print(f"[RESOLVER DEBUG]   Kwargs: {list(kwarg_tensors.keys())}")
+                        # for k, v in kwarg_tensors.items():
+                        #     if hasattr(v, 'shape'):
+                        #         # print(f"[RESOLVER DEBUG]     {k}={v.shape}")
                         
-                        for k, v in kwarg_tensors.items():
-                            if hasattr(v, 'shape'):
-                                print(f"[RESOLVER DEBUG]     {k}={v.shape}")
                         with set_current_vllm_config(self.vlp.vllm_config):
                             with set_forward_context(forward_context, self.vlp.vllm_config, virtual_engine=0):
                                 callable_obj(*positional_tensors, **kwarg_tensors)

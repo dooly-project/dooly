@@ -31,7 +31,7 @@ class ProfileInput:
     def get_reqs_dim(self) -> List[int]:
         """Get indices of NUM_REQS dimensions (sweep these during profiling)"""
         return [i for i, dim_type in enumerate(self.dimensions)
-                if dim_type == DimensionType.NUM_REQUESTS ]
+                if dim_type == DimensionType.NUM_REQUESTS]
 
     def get_toks_dim(self) -> List[int]:
         """Get indices of NUM_TOKS dimensions (sweep these during profiling)"""

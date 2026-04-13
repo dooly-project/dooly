@@ -224,8 +224,7 @@ class Profiler:
             "random_pages": True,
         }
 
-        self.attention_profiler: Optional[FlashInferProfile] = None
-        # Shape: [num_blocks, 2, block_size, num_kv_heads, head_dim]
+        self.attention_profiler: Optional[VLLMLayerProfiler] = None
         self._global_kv_cache: Optional[torch.Tensor] = None
         self._global_kv_cache_spec: Optional[Tuple[int, int, int, int]] = None
 
@@ -371,6 +370,7 @@ class Profiler:
                 model_name TEXT NOT NULL,
                 model_family TEXT NOT NULL,
                 backend TEXT NOT NULL,
+                tp_degree INTEGER NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -385,7 +385,61 @@ class Profiler:
                 FOREIGN KEY (operation_id) REFERENCES signatures(operation_id),
                 UNIQUE(model_id, operation_id, count)
             )
-        """) 
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS coll_ops (
+                collective_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signature_hash TEXT UNIQUE NOT NULL,
+                operation_name TEXT NOT NULL,
+                topology TEXT NOT NULL,
+                tp_degree INTEGER NOT NULL,
+                num_dims INTEGER,
+                dim_param INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS model_collectives (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_id INTEGER NOT NULL,
+                collective_id INTEGER NOT NULL,
+                count INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (model_id) REFERENCES profiled_models(model_id),
+                FOREIGN KEY (collective_id) REFERENCES coll_ops(collective_id),
+                UNIQUE(model_id, collective_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS model_collective_configs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_id INTEGER NOT NULL,
+                collective_id INTEGER NOT NULL,
+                batch_param TEXT NOT NULL,
+                model_config_dim INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (model_id) REFERENCES profiled_models(model_id),
+                FOREIGN KEY (collective_id) REFERENCES coll_ops(collective_id),
+                UNIQUE(model_id, collective_id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_model_collective_configs_lookup
+            ON model_collective_configs(model_id, collective_id)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS coll_op_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation TEXT NOT NULL,
+                topology TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                tp_size INTEGER NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                dtype TEXT,
+                dim_param INTEGER,
+                num_dims INTEGER,
+                latency_ms REAL NOT NULL,
+                UNIQUE(operation, topology, backend, dtype, tp_size, size_bytes, dim_param, num_dims)
+            )
+        """)
         conn.commit()
         conn.close()
         print(f"[PROFILER] Initialized database at {self.db_path}")
@@ -987,12 +1041,26 @@ class Profiler:
             conn.execute("BEGIN")
 
             for model in models:
-                # Insert model and get the auto-generated model_id
+                # Check if this model configuration already exists
                 cursor = conn.execute(
-                    """INSERT INTO profiled_models (model_name, model_family, backend) VALUES (?, ?, ?)""",
-                    (model.name, model.model_family, self.attention_backend)
+                    """SELECT model_id FROM profiled_models
+                       WHERE model_name = ? AND model_family = ? AND backend = ? AND tp_degree = ?""",
+                    (model.name, model.model_family, self.attention_backend, self.tp_config)
                 )
-                model_id = cursor.lastrowid
+                existing = cursor.fetchone()
+
+                if existing:
+                    # Model already exists, use existing model_id
+                    model_id = existing[0]
+                    print(f"[PROFILER] Model {model.name} (backend={self.attention_backend}, tp={self.tp_config}) already exists (model_id={model_id})")
+                else:
+                    # Insert new model and get the auto-generated model_id
+                    cursor = conn.execute(
+                        """INSERT INTO profiled_models (model_name, model_family, backend, tp_degree) VALUES (?, ?, ?, ?)""",
+                        (model.name, model.model_family, self.attention_backend, self.tp_config)
+                    )
+                    model_id = cursor.lastrowid
+                    print(f"[PROFILER] Created new model entry (model_id={model_id})")
 
                 # Use all_resolved_ops which contains ALL operations this model uses
                 # (not just the ones that need profiling)
@@ -1023,6 +1091,102 @@ class Profiler:
                                VALUES (?, ?, ?)""",
                             (model_id, operation_id, count)
                         )
+
+                # Write collective operations
+                import hashlib
+                from collections import defaultdict
+                topology = os.environ.get("DOOLY_TOPOLOGY", "mew1")  # Get from environment or default
+
+                # Aggregate counts for each unique collective operation signature
+                # Key: (operation_name, dim_param, num_dims), Value: total_count
+                collective_counts = defaultdict(int)
+                collective_metadata = {}  # Store first occurrence metadata
+
+                for collective_op in model.collective_ops:
+                    # Extract dim_param from trace
+                    dim_param_str = collective_op.hierarchy.anchor.args.get('comm_args')
+                    dim_param = int(dim_param_str) if dim_param_str else None
+
+                    # Get num_dims from tensor shape
+                    tensor_shape = collective_op.inputs[0].actual_shape
+                    num_dims = len(tensor_shape)
+
+                    # Create key for aggregation
+                    key = (collective_op.operation_name, dim_param, num_dims)
+
+                    # Aggregate count
+                    count = getattr(collective_op, 'count', 1)
+                    collective_counts[key] += count
+
+                    # Store metadata from first occurrence
+                    if key not in collective_metadata:
+                        # Extract MODEL_CONFIG dimension
+                        model_config_idxs = collective_op.inputs[0].get_model_config_dims()
+                        model_config_dim = 1
+                        for idx in model_config_idxs:
+                            model_config_dim *= tensor_shape[idx]
+
+                        # Determine batch parameter based on tensor taints
+                        # NUM_TOKS typically appears in first dimension for all_reduce
+                        # NUM_REQS typically appears in first dimension for all_gather
+                        tensor_taints = collective_op.inputs[0].dimensions
+                        batch_param = "NUM_TOKS" if "NUM_TOKS" in str(tensor_taints) else "NUM_REQS"
+
+                        collective_metadata[key] = {
+                            'operation_name': collective_op.operation_name,
+                            'dim_param': dim_param,
+                            'num_dims': num_dims,
+                            'model_config_dim': model_config_dim,
+                            'batch_param': batch_param
+                        }
+
+                # Now insert aggregated collectives
+                for key, total_count in collective_counts.items():
+                    op_name, dim_param, num_dims = key
+
+                    # Generate signature (MUST match comm_profiler logic)
+                    sig_data = f"{op_name}|{topology}|{self.tp_config}|{dim_param}|{num_dims}"
+                    sig_hash = hashlib.sha256(sig_data.encode()).hexdigest()
+
+                    # Check if collective exists in coll_ops
+                    cursor = conn.execute(
+                        "SELECT collective_id FROM coll_ops WHERE signature_hash = ?",
+                        (sig_hash,)
+                    )
+                    existing = cursor.fetchone()
+
+                    if existing:
+                        collective_id = existing[0]
+                    else:
+                        # Insert into coll_ops (comm_profiler will populate profiling data later)
+                        cursor = conn.execute("""
+                            INSERT INTO coll_ops
+                            (signature_hash, operation_name, topology, tp_degree, dim_param, num_dims)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (sig_hash, op_name, topology, self.tp_config, dim_param, num_dims))
+                        collective_id = cursor.lastrowid
+
+                    # Link model to collective with AGGREGATED count
+                    # Use INSERT OR IGNORE to preserve original profiling data (matches model_operations behavior)
+                    conn.execute("""
+                        INSERT OR IGNORE INTO model_collectives (model_id, collective_id, count)
+                        VALUES (?, ?, ?)
+                    """, (model_id, collective_id, total_count))
+
+                    # Store model-specific collective configuration
+                    # Use INSERT OR IGNORE to preserve original config (matches model_operations behavior)
+                    metadata = collective_metadata[key]
+                    conn.execute("""
+                        INSERT OR IGNORE INTO model_collective_configs
+                        (model_id, collective_id, batch_param, model_config_dim)
+                        VALUES (?, ?, ?, ?)
+                    """, (model_id, collective_id, metadata['batch_param'], metadata['model_config_dim']))
+
+                if collective_counts:
+                    print(f"[PROFILER] Wrote {len(collective_counts)} unique collective operations for {model.name}:")
+                    for key, total_count in collective_counts.items():
+                        op_name, dim_param, num_dims = key
+                        print(f"  - {op_name} (dim={dim_param}, ndims={num_dims}): count={total_count}")
 
             conn.execute("COMMIT")
             print(f"[PROFILER] Wrote {len(models)} models to database at {self.db_path}")

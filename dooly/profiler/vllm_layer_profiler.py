@@ -121,19 +121,6 @@ class VLLMLayerProfiler:
         # vLLM already calculates this based on available GPU memory
         self.actual_num_blocks = self.kv_cache_config.num_blocks
 
-        print(f"self.model_runner: {self.model_runner}")
-        print(f"self.model_runner.model: {self.model_runner.model}")
-        print(f"self.model_runner.vllm_config: {self.model_runner.vllm_config}")
-        print(f"self.model_runner.kv_cache_config: {self.model_runner.kv_cache_config}")
-        print(f"self.model_runner.attn_groups: {self.model_runner.attn_groups}")
-        
-        print(f"[VLLMLayerProfiler] Model loaded: {type(self.model).__name__}")
-        print(f"[VLLMLayerProfiler] KV cache num_blocks: {self.actual_num_blocks}")
-        print(f"[VLLMLayerProfiler] KV cache groups: {len(self.kv_cache_config.kv_cache_groups)}")
-        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
-            spec_type = type(group.kv_cache_spec).__name__
-            print(f"  Group {gid}: {len(group.layer_names)} layers, spec={spec_type}")
-
     def _get_actual_num_blocks(self) -> int:
         """
         Get the actual number of blocks from the KV cache tensor.

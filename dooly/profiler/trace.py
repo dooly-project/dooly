@@ -223,9 +223,17 @@ class TraceParser:
         print(f"Deduplicating module infos...")
 
         # for module in module_infos:
-        #     print(f"Module: {module.module_name}, Operation: {module.operation_name}, Inputs: {len(module.inputs)}")
+        #     if module.is_collective_op:
+        #         print(f"Module: {module.module_name}, Operation: {module.operation_name}, Inputs: {len(module.inputs)}")
+        #         print(f"  - Count: {module.count}")
 
         dedup_module_infos = self._deduplicate_module_infos(module_infos)
+
+        # for module in dedup_module_infos:
+        #     if module.is_collective_op:
+        #         print(f"Module: {module.module_name}, Operation: {module.operation_name}, Inputs: {len(module.inputs)}")
+        #         print(f"  - Count: {module.count}")
+
 
         print(f"\nDeduplicated module infos:")
         for module in dedup_module_infos:
@@ -335,7 +343,6 @@ class TraceParser:
         deduplicated: List[ModuleInfo] = []
         for (base_name, _op_name, _model_params_tuple), infos in groups.items():
             # use the first info as template since all have same signature
-            print(infos[0])
             template = infos[0]
             count = len(infos)
             

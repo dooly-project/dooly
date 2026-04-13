@@ -273,7 +273,7 @@ class ModuleComparator:
                 sig_hash = self._hash_signature(signature)
                 sig_json = json.dumps(signature, sort_keys=True, default=str)
 
-                print(f"Model Name: {model_name}, Module Name: {module.module_name}, Hash: {sig_hash[:16]}...")
+                # print(f"Model Name: {model_name}, Module Name: {module.module_name}, Hash: {sig_hash[:16]}...")
 
                 # Always add to all_ops (for model_operations tracking)
                 all_ops[model_name].append((module, callable, sig_hash, sig_json))

@@ -39,8 +39,8 @@ class ModelInfo:
         )
         
         self.used_ops: List[ModuleInfo] = [op for op in self.all_ops if not op.is_collective_op]
+        self.collective_ops: List[ModuleInfo] = [op for op in self.all_ops if op.is_collective_op]
         self.to_profile: List[ModuleInfo] = self.used_ops
-        self.collective_ops: List[ModuleInfo] = [op for op in self.used_ops if op.is_collective_op]
         
         self.all_resolved_ops: List[Tuple[ModuleInfo, Callable, str, str]] = []  # All ops with signatures
         self.to_profile_resolved: List[Tuple[ModuleInfo, Callable]] = []

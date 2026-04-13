@@ -13,3 +13,4 @@ test_*
 *.trace.json
 *.pt.trace.json
 hierarchy_output.json
+/tests/
