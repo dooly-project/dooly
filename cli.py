@@ -198,7 +198,7 @@ def main():
         requests = iter(dooly_requests)
     elif args.sharegpt_path:
         print(f"Using ShareGPT dataset for request generation: {args.sharegpt_path}")
-        from .vllm_request_generator import generate_sharegpt_requests_from_instance, export_vllm_dataset_jsonl
+        from tools.vllm_request_generator import generate_sharegpt_requests_from_instance, export_vllm_dataset_jsonl
 
         dooly_requests, vllm_requests = generate_sharegpt_requests_from_instance(
             llm=simulator.llm,
@@ -217,7 +217,7 @@ def main():
         requests = iter(dooly_requests)
     elif args.synthetic:
         print("Using vLLM RandomDataset for request generation")
-        from .vllm_request_generator import generate_vllm_requests, export_vllm_dataset_jsonl
+        from tools.vllm_request_generator import generate_vllm_requests, export_vllm_dataset_jsonl
 
         dooly_requests, vllm_requests = generate_vllm_requests(
             model=args.model,

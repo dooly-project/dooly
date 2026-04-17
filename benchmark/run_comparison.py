@@ -144,7 +144,7 @@ def main():
 
         # Run Dooly batch predictor
         dooly_cmd = [
-            sys.executable, "-m", "simulator.batch_predictor",
+            sys.executable, "-m", "simulator.benchmark.batch_predictor",
             "--batch-config", config_file,
             "--cache-dir", CACHE_DIR,
             "--db-path", DB_PATH,
