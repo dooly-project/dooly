@@ -238,34 +238,38 @@ class OperationTimePredictor:
         batch_size: int = None,
         kv_cache_size: int = None,
         prefill_chunk_size: int = None,
-        size_bytes: int = None,
     ) -> float:
         """
         Simple prediction interface without creating Batch objects.
 
         Args:
             operation_name: Name of operation
-            num_tokens: Total number of tokens (for non-context ops)
+            num_tokens: Total number of tokens (for non-context ops and collective ops)
             batch_size: Batch size (for decode attention)
             kv_cache_size: KV cache size (for attention) - will be rounded to granularity
             prefill_chunk_size: Prefill chunk size (for prefill attention)
-            size_bytes: Tensor size in bytes (for collective communication ops)
 
         Returns:
             Predicted execution time in milliseconds
         """
+        
+        print(f"Predicting time for {operation_name} with num_tokens={num_tokens}, batch_size={batch_size}, kv_cache_size={kv_cache_size}, prefill_chunk_size={prefill_chunk_size}")
+        
         if operation_name not in self.predictions:
             raise ValueError(f"No model trained for operation: {operation_name}")
 
         # Check if this is a collective communication operation
         if operation_name.startswith(('all_reduce_', 'all_gather_', 'reduce_scatter_')):
-            if size_bytes is None:
-                raise ValueError(f"Need size_bytes for collective operation {operation_name}")
-            key = (size_bytes,)
+            # Collective operations now use num_tokens
+            if num_tokens is None:
+                # If size_bytes is provided but not num_tokens, this is an error
+                # The caller should provide num_tokens directly
+                raise ValueError(f"Need num_tokens for collective operation {operation_name}")
+            key = (num_tokens,)
             if key in self.predictions[operation_name]:
                 return self.predictions[operation_name][key]
             else:
-                raise KeyError(f"Prediction not available for {operation_name} with size_bytes={size_bytes}")
+                raise KeyError(f"Prediction not available for {operation_name} with num_tokens={num_tokens}")
 
         # Check if context operation
         # Remove _prefill, _decode, and signature hash to get base operation name

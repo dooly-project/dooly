@@ -24,7 +24,7 @@ def main():
                        help="GPU interconnect topology for collective operations (default: mew1)")
     # Paths ################################################
     parser.add_argument("--cache-dir", type=str,
-                       default="/home/jkim38/dooly/simulator/core/cache/llama-3.1-8b-FLASHINFER/csv_predictions",
+                       default="/home/jkim38/dooly/simulator/core/cache/llama-3.1-8b-FLASHINFER/",
                        help="Directory containing cached regression models")
     parser.add_argument("--db-path", type=str,
                        default="/home/jkim38/dooly/profiler/database/dooly_data.db",
@@ -184,6 +184,7 @@ def main():
         db_path=args.db_path,
         backend=args.backend,
         topology=args.topology,  # Pass topology for collective operations
+        tensor_parallel_size=args.tp,  # Set TP size for profiling and simulation
         cpu_overhead=args.cpu_overhead_ms,
     )
 

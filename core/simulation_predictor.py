@@ -8,7 +8,7 @@ This is a runtime-only component - it does NOT train models. Training must be
 done separately using simulator.estimator.
 """
 
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 import sqlite3
 import os
 import sys
@@ -231,6 +231,9 @@ class SimulationPredictor:
             else:
                 print(f"No collective operations found for {self.model_name} (topology={self.topology}, tp={self.tp_size})")
 
+            
+            # print(collectives)
+            # exit()
             return collectives
 
         except Exception as e:
@@ -293,64 +296,29 @@ class SimulationPredictor:
             return {}
 
     def _calculate_collective_size(self, op_name: str, dim_param: int, num_dims: int, batch) -> int:
-        """Calculate tensor size in bytes for collective operation using model-specific config.
-
-        Uses stored MODEL_CONFIG dimension and batch parameter (NUM_TOKS or NUM_REQS)
-        from the model_collective_configs table.
-
-        Args:
-            op_name: Operation name (all_reduce, all_gather, reduce_scatter)
-            dim_param: Dimension parameter from collective operation
-            num_dims: Number of tensor dimensions
-            batch: BatchConfig containing batch information
-
-        Returns:
-            Size in bytes
-        """
         # Look up configuration
         key = (op_name, dim_param, num_dims)
         config = self.collective_configs.get(key)
 
         # Use stored configuration
         batch_param = config['batch_param']
-        model_config_dim = config['model_config_dim']
 
         if batch_param == "NUM_TOKS":
             num_elements = batch.total_tokens
         elif batch_param == "NUM_REQS":
-            num_elements = len(batch.requests)  # Number of requests in batch
+            num_elements = batch.num_requests  # Number of requests in batch
         else:
-            raise ValueError(f"Unknown batch_param: {batch_param}")
-
-        size_bytes = num_elements * model_config_dim * self.dtype_bytes
-
-        if is_verbose():
-            print(f"  Collective size: {batch_param}({num_elements}) × MODEL_CONFIG({model_config_dim}) × {self.dtype_bytes} = {size_bytes} bytes")
-
-        return size_bytes
+            raise ValueError(f"Unknown batch parameter {batch_param} for collective config {key}")
+        
+        return num_elements
 
     def _estimate_collective_latency(
         self,
         op_name: str,
         dim_param: int,
         num_dims: int,
-        size_bytes: int
+        num_elements: int
     ) -> float:
-        """Estimate collective operation latency using regression models.
-
-        Uses trained regression models from cache to predict latency based on size_bytes.
-
-        Args:
-            op_name: Operation name (all_reduce, all_gather, reduce_scatter)
-            dim_param: Dimension parameter (-1, 0, 1, 2, or None)
-            num_dims: Number of tensor dimensions
-            size_bytes: Tensor size in bytes
-
-        Returns:
-            Estimated latency in milliseconds
-        """
-        # Build model key matching the training format
-        # Format: "{operation}_dim{dim_param}_ndims{num_dims}"
         dim_str = "None" if dim_param is None or (isinstance(dim_param, float) and np.isnan(dim_param)) else str(int(dim_param))
         model_key = f"{op_name}_dim{dim_str}_ndims{int(num_dims)}"
 
@@ -365,10 +333,10 @@ class SimulationPredictor:
                 print(f"  Warning: No model found for {model_key}")
                 return 0.0
 
-            # Use predict_simple with size_bytes feature
+            # Use predict_simple with num_tokens
             pred = self.latency_predictor.predict_simple(
                 model_key,
-                size_bytes=size_bytes
+                num_tokens=num_elements
             )
             return float(pred)
 
@@ -386,6 +354,7 @@ class SimulationPredictor:
             Estimated step latency in milliseconds
         """
         if self.latency_predictor is None or not self.model_operations:
+            print(f"[WARNING] Latency predictor or model operations not available, using fallback duration")
             return self.fallback_duration_ms
 
         # Debug: Show available models on first call
@@ -429,14 +398,14 @@ class SimulationPredictor:
                                 prefill_key in self.latency_predictor.predictions or
                                 decode_key in self.latency_predictor.predictions)
                     if not has_model:
-                        if is_verbose() and step_id < 3:
+                        if is_verbose():
                             print(f"[DEBUG Step {step_id}] Skipping {op_name}_{sig_short} - no prefill/decode models found")
                         continue
                 else:
                     # Standard check for non-Attention operations
                     # Check both models (for sklearn) and predictions (for CSV cache)
                     if model_key not in self.latency_predictor.models and model_key not in self.latency_predictor.predictions:
-                        if is_verbose() and step_id < 3:
+                        if is_verbose():
                             print(f"[DEBUG Step {step_id}] Skipping {model_key} - no model found")
                         continue
 
@@ -445,7 +414,7 @@ class SimulationPredictor:
                     op_latency = self._estimate_attention_latency(batch, sig_short, op_name, step_id)
                     contribution = op_latency * count
                     total_latency_ms += contribution
-                    # print(f"  [{op_name}_{sig_short}] op_latency={op_latency:.6f} ms × count={count} = {contribution:.6f} ms")
+                    print(f"  [{op_name}_{sig_short}] op_latency={op_latency:.6f} ms × count={count} = {contribution:.6f} ms")
                 else:
                     # Non-attention operations (linear, etc)
                     try:
@@ -456,31 +425,30 @@ class SimulationPredictor:
                         contribution = pred * count
                         total_latency_ms += contribution
 
-                        # DEBUG: Show predictions for decode steps
-                        if len(batch.decode_requests) > 0 and step_id >= 0:
-                            print(f"  [{model_key}] pred={pred:.6f} ms × count={count} = {contribution:.6f} ms (num_tokens={batch.total_tokens})")
+                    # DEBUG: Show predictions for decode steps
+                        print(f"  [{model_key}] pred={pred:.6f} ms × count={count} = {contribution:.6f} ms (num_tokens={batch.total_tokens})")
                     except Exception as e:
                         print(f"  [{model_key}] FAILED: {e}")
                         pass
-
+            
+            gpu_latency_ms = total_latency_ms
+            
             # Add collective communication overhead
             comm_latency_ms = 0.0
 
             if self.model_collectives:
                 for op_name, dim_param, num_dims, count in self.model_collectives:
                     # Calculate tensor size for this batch using model-specific config
-                    size_bytes = self._calculate_collective_size(op_name, dim_param, num_dims, batch)
+                    num_elements = self._calculate_collective_size(op_name, dim_param, num_dims, batch)
 
                     # Estimate latency for one occurrence
-                    op_latency = self._estimate_collective_latency(op_name, dim_param, num_dims, size_bytes)
+                    op_latency = self._estimate_collective_latency(op_name, dim_param, num_dims, num_elements)
 
                     # Multiply by count
                     contribution = op_latency * count
                     comm_latency_ms += contribution
 
-                    if is_verbose() and step_id == 0:
-                        print(f"  [Comm {op_name}] size={size_bytes/1e6:.2f}MB, "
-                              f"latency={op_latency:.3f}ms × {count} = {contribution:.3f}ms")
+                    print(f"  [Comm {op_name}] feature={num_elements}, latency={op_latency:.3f}ms × {count} = {contribution:.3f}ms")
 
             total_latency_ms += comm_latency_ms
 
@@ -494,6 +462,169 @@ class SimulationPredictor:
                 print(f"  (This is for {len(batch.decode_requests)} decode request(s) generating {batch.total_tokens} token(s))")
 
             return total_latency_ms
+
+        except Exception as e:
+            # Fallback to fixed duration on any error
+            print(f"Warning: Latency estimation failed: {e}, using fixed duration")
+            return self.fallback_duration_ms
+        
+    def estimate_step_latency_with_breakdown(self, sched_output, step_id: int = -1) -> Tuple[float, float, Dict[str, float], List[Dict]]:
+        """Estimate step latency with detailed operation breakdown for JSON output.
+
+        Returns:
+            Tuple of (gpu_latency_ms, comm_latency_ms, per_comm_latency_dict, operation_breakdown)
+        """
+        # Store original breakdown data
+        self._operation_breakdown = []
+
+        # Call the original function
+        gpu_latency_ms, comm_latency_ms, per_comm_latency_dict = self.estimate_step_latency_log(sched_output, step_id)
+
+        # Return with breakdown
+        return gpu_latency_ms, comm_latency_ms, per_comm_latency_dict, self._operation_breakdown
+
+
+    def estimate_step_latency_log(self, sched_output, step_id: int = -1) -> Tuple[float, float, Dict[str, float]]:
+        """Estimate step latency using regression models.
+
+        Args:
+            sched_output: SchedulerOutput from scheduler.schedule()
+            step_id: Current step ID for debug output
+        Returns:
+            Tuple of (gpu_latency_ms, comm_latency_ms, per_comm_latency_dict)
+        """
+        per_communication_latency = {
+            'all_reduce_latency_ms': 0.0,
+            'all_reduce_count': 0,
+            'per_all_reduce_latency_ms': 0.0,
+            'all_gather_latency_ms': 0.0,
+            'all_gather_count': 0,
+            'per_all_gather_latency_ms': 0.0,
+        }
+
+        # Initialize breakdown storage if not already done
+        if not hasattr(self, '_operation_breakdown'):
+            self._operation_breakdown = []
+
+        if self.latency_predictor is None or not self.model_operations:
+            print(f"[WARNING] Latency predictor or model operations not available, using fallback duration")
+            return self.fallback_duration_ms, 0.0, per_communication_latency
+
+        # Debug: Show available models on first call
+        if is_verbose() and step_id == 0:
+            print(f"[DEBUG] Total models loaded: {len(self.latency_predictor.models)}")
+            attention_models = sorted([k for k in self.latency_predictor.models.keys() if 'Attention' in k])
+            print(f"[DEBUG] Attention models available: {attention_models}")
+
+        try:
+            # Extract batch information
+            batch = BatchConfig(sched_output)
+            print(f"\n[Step {step_id}] Estimating latency for batch: total_tokens={batch.total_tokens}, {batch.batch_size} requests (prefill={len(batch.prefill_requests)}, decode={len(batch.decode_requests)})")
+
+            # DETECT MIXED BATCHES (prefill + decode together)
+            if len(batch.prefill_requests) > 0 and len(batch.decode_requests) > 0:
+                print(f"\n{'='*80}")
+                print(f"MIXED BATCH DETECTED at Step {step_id}!")
+                print(f"  Prefill requests: {len(batch.prefill_requests)}")
+                print(f"  Decode requests: {len(batch.decode_requests)}")
+                print(f"  This requires special handling for latency prediction!")
+                print(f"{'='*80}\n")
+
+            # If no tokens scheduled, return 0
+            if batch.total_tokens == 0:
+                return 0.0
+
+            total_latency_ms = 0.0
+
+            # Iterate through all operations for this model
+            for (op_name, sig_hash), count in self.model_operations.items():
+                sig_short = sig_hash[:8]
+                model_key = f"{op_name}_{sig_short}"
+
+                # For Attention operations, check for _prefill and _decode variants
+                if op_name == "Attention":
+                    prefill_key = f"{op_name}_prefill_{sig_short}"
+                    decode_key = f"{op_name}_decode_{sig_short}"
+                    # Check both models (for sklearn) and predictions (for CSV cache)
+                    has_model = (prefill_key in self.latency_predictor.models or
+                                decode_key in self.latency_predictor.models or
+                                prefill_key in self.latency_predictor.predictions or
+                                decode_key in self.latency_predictor.predictions)
+                    if not has_model:
+                        if is_verbose():
+                            print(f"[DEBUG Step {step_id}] Skipping {op_name}_{sig_short} - no prefill/decode models found")
+                        continue
+                else:
+                    # Standard check for non-Attention operations
+                    # Check both models (for sklearn) and predictions (for CSV cache)
+                    if model_key not in self.latency_predictor.models and model_key not in self.latency_predictor.predictions:
+                        if is_verbose():
+                            print(f"[DEBUG Step {step_id}] Skipping {model_key} - no model found")
+                        continue
+
+                # Predict latency based on operation type
+                if op_name == "Attention":
+                    op_latency = self._estimate_attention_latency(batch, sig_short, op_name, step_id)
+                    contribution = op_latency * count
+                    total_latency_ms += contribution
+                    print(f"  [{op_name}_{sig_short}] op_latency={op_latency:.6f} ms × count={count} = {contribution:.6f} ms")
+                else:
+                    # Non-attention operations (linear, etc)
+                    try:
+                        pred = self.latency_predictor.predict_simple(
+                            model_key,
+                            num_tokens=batch.total_tokens
+                        )
+                        contribution = pred * count
+                        total_latency_ms += contribution
+
+                    # DEBUG: Show predictions for decode steps
+                        print(f"  [{model_key}] pred={pred:.6f} ms × count={count} = {contribution:.6f} ms (num_tokens={batch.total_tokens})")
+                    except Exception as e:
+                        print(f"  [{model_key}] FAILED: {e}")
+                        pass
+            
+            gpu_latency_ms = total_latency_ms
+            
+            # Add collective communication overhead
+            comm_latency_ms = 0.0
+
+            if self.model_collectives:
+                for op_name, dim_param, num_dims, count in self.model_collectives:
+                    # Calculate tensor size for this batch using model-specific config
+                    num_elements = self._calculate_collective_size(op_name, dim_param, num_dims, batch)
+
+                    # Estimate latency for one occurrence
+                    op_latency = self._estimate_collective_latency(op_name, dim_param, num_dims, num_elements)
+
+                    # Multiply by count
+                    contribution = op_latency * count
+                    comm_latency_ms += contribution
+                    
+                    # Track detailed communication metrics
+                    if 'all_reduce' in op_name.lower():
+                        per_communication_latency['all_reduce_latency_ms'] += contribution
+                        per_communication_latency['all_reduce_count'] += count
+                        per_communication_latency['per_all_reduce_latency_ms'] = op_latency
+                    elif 'all_gather' in op_name.lower():
+                        per_communication_latency['all_gather_latency_ms'] += contribution
+                        per_communication_latency['all_gather_count'] += count
+                        per_communication_latency['per_all_gather_latency_ms'] = op_latency
+
+                    print(f"  [Comm {op_name}] feature={num_elements}, latency={op_latency:.3f}ms × {count} = {contribution:.3f}ms")
+
+            total_latency_ms += comm_latency_ms
+
+            if is_verbose() and comm_latency_ms > 0 and step_id == 0:
+                print(f"  Total comm overhead: {comm_latency_ms:.3f}ms")
+
+            # Return latency in milliseconds
+            # DEBUG: Show total for decode steps
+            if len(batch.decode_requests) > 0 and step_id >= 0:
+                print(f"\n[Step {step_id}] TOTAL PREDICTED LATENCY: {total_latency_ms:.6f} ms")
+                print(f"  (This is for {len(batch.decode_requests)} decode request(s) generating {batch.total_tokens} token(s))")
+
+            return gpu_latency_ms, comm_latency_ms, per_communication_latency
 
         except Exception as e:
             # Fallback to fixed duration on any error
@@ -554,8 +685,9 @@ class SimulationPredictor:
                     print(f"  [Attention Prefill] base={pred:.6f}ms, overhead={ATTENTION_PREFILL_BATCHING_OVERHEAD*100:.0f}%, final={pred_with_overhead:.6f}ms ({num_prefill_reqs} reqs)")
 
             except Exception as e:
-                    raise ValueError(f"    WARNING: Prefill prediction failed - agg_kv={agg_kv_cache_size}, "
+                    print(f"    WARNING: Prefill prediction failed - agg_kv={agg_kv_cache_size}, "
                           f"agg_chunk={int(round(agg_prefill_chunk_size))}, error: {e}")
+                    op_latency = 0.0
 
         # Decode phase - use decode batch size only
         if batch.decode_requests:
@@ -573,15 +705,15 @@ class SimulationPredictor:
             print(f"  decode_kv_values (first 5): {batch.decode_requests[:5]}")
             print(f"  avg_kv_cache: {int(avg_kv_cache)}")
 
-            if decode_batch_size > MAX_PROFILED_BATCH_SIZE:
-                print(f"\n{'='*80}")
-                print(f"ERROR: Decode batch_size={decode_batch_size} EXCEEDS profiled range!")
-                print(f"  Max profiled batch_size: {MAX_PROFILED_BATCH_SIZE}")
-                print(f"  Current batch_size: {decode_batch_size}")
-                print(f"  This will cause EXTRAPOLATION errors in regression model!")
-                print(f"{'='*80}\n")
-                import sys
-                sys.exit(1)
+            # if decode_batch_size > MAX_PROFILED_BATCH_SIZE:
+            #     print(f"\n{'='*80}")
+            #     print(f"ERROR: Decode batch_size={decode_batch_size} EXCEEDS profiled range!")
+            #     print(f"  Max profiled batch_size: {MAX_PROFILED_BATCH_SIZE}")
+            #     print(f"  Current batch_size: {decode_batch_size}")
+            #     print(f"  This will cause EXTRAPOLATION errors in regression model!")
+            #     print(f"{'='*80}\n")
+            #     import sys
+            #     sys.exit(1)
 
             if avg_kv_cache > MAX_PROFILED_KV_CACHE:
                 print(f"\n{'='*80}")
@@ -613,7 +745,7 @@ class SimulationPredictor:
                 print(f"  Final prediction: {pred_with_overhead:.6f} ms (for ONE layer)")
                 print(f"  Total for 32 layers: {pred_with_overhead * 32:.6f} ms")
             except Exception as e:
-                    raise ValueError(f"    WARNING: Decode prediction failed - batch={decode_batch_size}, "
+                    print(f"    WARNING: Decode prediction failed - batch={decode_batch_size}, "
                           f"avg_kv={int(avg_kv_cache)}, error: {e}")
         else:
             print(f"      [Attention] NO DECODE REQUESTS - prefill_reqs={len(batch.prefill_requests)}, "

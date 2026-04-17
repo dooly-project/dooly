@@ -15,6 +15,7 @@ import time
 import sqlite3
 from pathlib import Path
 from typing import List, Tuple, Dict
+import os 
 
 try:
     import torch
@@ -58,6 +59,98 @@ def load_operation_counts(db_path: str, model_name: str, backend: str) -> Dict[T
     conn.close()
     return operations
 
+def load_model_collectives(db_path, backend, model_name, topology, tp_size):
+    conn = sqlite3.connect(db_path)
+    query = """
+        SELECT co.operation_name, co.dim_param, co.num_dims, mc.count
+        FROM model_collectives mc
+        JOIN coll_ops co ON mc.collective_id = co.collective_id
+        JOIN profiled_models pm ON mc.model_id = pm.model_id
+        WHERE pm.model_name = ?
+            AND pm.backend = ?
+            AND co.topology = ?
+            AND co.tp_degree = ?
+    """
+
+    cursor = conn.execute(query, (model_name, backend, topology, tp_size))
+    collectives = cursor.fetchall()
+    conn.close()
+
+    if collectives:
+        print(f"Loaded {len(collectives)} collective operations (topology={topology}, tp={tp_size})")
+        for op_name, dim_param, num_dims, count in collectives:
+            print(f"  - {op_name} (dim={dim_param}, ndims={num_dims}) × {count}")
+    else:
+        print(f"No collective operations found for {model_name} (topology={topology}, tp={tp_size})")
+
+    print(collectives)
+    return collectives
+
+def estimate_comm_latency(
+    predictor: OperationTimePredictor,
+    configs,
+    model_collectives,
+    batch
+) -> float:
+    comm_latency_ms = 0.0
+    dtype_bytes = 2
+    
+    def calculate_collective_size(op_name, dim_param, num_dims, batch):
+        # Look up configuration
+        key = (op_name, dim_param, num_dims)
+        config = configs.get(key)
+
+        # Use stored configuration
+        batch_param = config['batch_param']
+        model_config_dim = config['model_config_dim']
+
+        if batch_param == "NUM_TOKS":
+            num_elements = batch['total_tokens']
+        elif batch_param == "NUM_REQS":
+            num_elements = batch['num_requests']  # Number of requests in batch
+        else:
+            raise ValueError(f"Unknown batch_param: {batch_param}")
+
+        size_bytes = num_elements * model_config_dim * dtype_bytes
+
+        return size_bytes
+    
+    def estimate_collective_latency(op_name, dim_param, num_dims, size_bytes):
+        dim_str = "None" if dim_param is None or (isinstance(dim_param, float) and np.isnan(dim_param)) else str(int(dim_param))
+        
+        if op_name == 'all_reduce':
+            num_dims = 1
+        model_key = f"{op_name}_dim{dim_str}_ndims{int(num_dims)}"
+
+        try:
+            # Check if model exists in either models or predictions (CSV cache)
+            if model_key not in predictor.models and model_key not in predictor.predictions:
+                print(f"  Warning: No model found for {model_key}")
+                return 0.0
+
+            # Use predict_simple with size_bytes feature
+            pred = predictor.predict_simple(
+                model_key,
+                size_bytes=size_bytes
+            )
+            return float(pred)
+
+        except Exception as e:
+            print(f"  Warning: Model prediction failed for {model_key}: {e}")
+            return 0.0
+    
+    for op_name, dim_param, num_dims, count in model_collectives:
+        # Calculate tensor size for this batch using model-specific config
+        size_bytes = calculate_collective_size(op_name, dim_param, num_dims, batch)
+
+        # Estimate latency for one occurrence
+        op_latency = estimate_collective_latency(op_name, dim_param, num_dims, size_bytes)
+
+        # Multiply by count
+        contribution = op_latency * count
+        comm_latency_ms += contribution
+    
+    return comm_latency_ms
 
 def estimate_batch_latency(
     predictor: OperationTimePredictor,
@@ -142,7 +235,7 @@ def estimate_batch_latency(
 
                     pred = predictor.predict_simple(
                         model_key,
-                        num_tokens=total_tokens
+                        num_tokens=total_tokens,
                     )
 
                     contribution = pred * count
@@ -168,24 +261,25 @@ def create_test_cases() -> List[Tuple[str, dict]]:
         (
             "Pure Prefill (single)",
             {
-                'total_tokens': 32,
+                'total_tokens': 256,
                 'has_prefill': True,
                 'has_decode': False,
                 'agg_kv_cache_prefill': 0,
-                'agg_prefill_chunk': 32,  # L2 norm = 128 for single request
+                'agg_prefill_chunk': 256,  # L2 norm = 128 for single request
+                'num_requests': 1
             }
         ),
         # Test 2: Pure prefill (multiple requests)
-        (
-            "Pure Prefill (multiple)",
-            {
-                'total_tokens': 32,  #  1024 + 1024 + 1024
-                'has_prefill': True,
-                'has_decode': False,
-                'agg_kv_cache_prefill': 0,
-                'agg_prefill_chunk': (8**2 + 8**2 + 8**2 + 8**2)**0.5,  # L2 norm
-            }
-        ),
+        # (
+        #     "Pure Prefill (multiple)",
+        #     {
+        #         'total_tokens': 32,  #  1024 + 1024 + 1024
+        #         'has_prefill': True,
+        #         'has_decode': False,
+        #         'agg_kv_cache_prefill': 0,
+        #         'agg_prefill_chunk': (8**2 + 8**2 + 8**2 + 8**2)**0.5,  # L2 norm
+        #     }
+        # ),
         # (
         #     "Pure Prefill (single)",
         #     {
@@ -230,81 +324,48 @@ def create_test_cases() -> List[Tuple[str, dict]]:
         # ),
     ]
 
-
-def measure_vllm_latency(llm, batch_config: dict, warmup: int = 3, iterations: int = 10) -> dict:
-    """
-    Measure actual vLLM latency for a batch configuration.
-
-    Args:
-        llm: vLLM LLM instance
-        batch_config: Batch configuration dict
-        warmup: Number of warmup iterations
-        iterations: Number of measurement iterations
+def load_configs(db_path, model_name, backend, tp_size, topology) -> Dict[Tuple, Dict]:
+    """Load collective operation configurations for this model.
 
     Returns:
-        Dictionary with timing statistics
+        Dict mapping (operation_name, dim_param, num_dims) -> config dict
+        where config dict contains 'batch_param' and 'model_config_dim'
     """
-    # Create prompts based on batch config
-    prompts = []
-    max_tokens_per_prompt = []
+    conn = sqlite3.connect(db_path)
+    query = """
+        SELECT co.operation_name, co.dim_param, co.num_dims,
+                mcc.batch_param, mcc.model_config_dim
+        FROM model_collective_configs mcc
+        JOIN coll_ops co ON mcc.collective_id = co.collective_id
+        JOIN profiled_models pm ON mcc.model_id = pm.model_id
+        WHERE pm.model_name = ?
+            AND pm.backend = ?
+            AND pm.tp_degree = ?
+            AND co.topology = ?
+    """
 
-    # For prefill requests
-    if batch_config.get('has_prefill', False):
-        # Extract prefill chunk size - for simplicity, use sqrt of L2 norm
-        agg_chunk = batch_config.get('agg_prefill_chunk', 128)
-        # Approximate individual sizes - for simplicity, use uniform
-        num_prefill = 1  # We'll create one prefill prompt with aggregate size
-        prompt_len = int(agg_chunk)
-        prompts.append(" ".join(["token"] * prompt_len))
-        max_tokens_per_prompt.append(1 if batch_config.get('has_decode', False) else 0)
+    cursor = conn.execute(query, (model_name, backend, tp_size, topology))
+    configs = {}
+    for row in cursor:
+        op_name, dim_param, num_dims, batch_param, model_config_dim = row
+        key = (op_name, dim_param, num_dims)
+        configs[key] = {
+            'batch_param': batch_param,
+            'model_config_dim': model_config_dim
+        }
+    conn.close()
 
-    # For decode requests
-    if batch_config.get('has_decode', False):
-        decode_batch = batch_config.get('decode_batch_size', 1)
-        avg_kv = batch_config.get('avg_kv_cache_decode', 512)
+    if configs:
+        print(f"Loaded {len(configs)} collective operation configs")
+        for key, config in configs.items():
+            op_name, dim_param, num_dims = key
+            print(f"  - {op_name} (dim={dim_param}, ndims={num_dims}): "
+                    f"{config['batch_param']} × {config['model_config_dim']}")
+    else:
+        print(f"No collective configs found for {model_name} (tp={tp_size}, topology={topology})")
 
-        # Create decode prompts (already prefilled, just generating 1 token)
-        for _ in range(decode_batch):
-            prompts.append(" ".join(["token"] * avg_kv))
-            max_tokens_per_prompt.append(1)
+    return configs
 
-    # Use max across all prompts for simplicity
-    max_tokens = max(max_tokens_per_prompt) if max_tokens_per_prompt else 1
-
-    # Sampling params
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        max_tokens=max_tokens,
-        ignore_eos=True,
-    )
-
-    # Warmup
-    for _ in range(warmup):
-        llm.generate(prompts, sampling_params, use_tqdm=False)
-
-    # Measure
-    latencies = []
-    if TORCH_AVAILABLE:
-        torch.cuda.synchronize()
-
-    for _ in range(iterations):
-        start = time.perf_counter()
-        llm.generate(prompts, sampling_params, use_tqdm=False)
-        if TORCH_AVAILABLE:
-            torch.cuda.synchronize()
-        end = time.perf_counter()
-
-        latency_ms = (end - start) * 1000
-        latencies.append(latency_ms)
-
-    return {
-        'mean_ms': sum(latencies) / len(latencies),
-        'min_ms': min(latencies),
-        'max_ms': max(latencies),
-        'median_ms': sorted(latencies)[len(latencies) // 2],
-        'std_ms': (sum((x - sum(latencies)/len(latencies))**2 for x in latencies) / len(latencies))**0.5,
-        'all_latencies': latencies,
-    }
 
 
 def main():
@@ -314,14 +375,19 @@ def main():
     parser = argparse.ArgumentParser(description="Test DoolySim predictions vs vLLM")
     parser.add_argument('--with-vllm', action='store_true', help='Measure actual vLLM latencies')
     parser.add_argument('--warmup', type=int, default=3, help='Number of warmup iterations')
+    parser.add_argument('--tp', type=int, default=1, help='Tensor parallel size for vLLM')
     parser.add_argument('--iterations', type=int, default=10, help='Number of measurement iterations')
     args = parser.parse_args()
 
     # Configuration
-    MODEL = "meta-llama/Llama-3.1-8B"
-    CACHE_DIR = "/home/jkim38/dooly/cache/tp1/meta-llama/Llama-3.1-8B/csv_predictions/"
+    MODEL = "meta-llama/Llama-3.1-70B"
+    CACHE_DIR = "/home/jkim38/dooly/cache/tp4/meta-llama/Llama-3.1-70B/"
     DB_PATH = "/home/jkim38/dooly/profiler/database/dooly_data_new_new.db"
     BACKEND = "FLASHINFER"
+    TOPOLOGY = "mew1"
+    TP = args.tp
+    
+    model_collectives=None
 
     print("=" * 80)
     print("DIRECT PREDICTION TEST (NO SCHEDULER)")
@@ -341,7 +407,10 @@ def main():
     # Step 2: Load operation counts
     print("Step 2: Loading operation counts from database...")
     operation_counts = load_operation_counts(DB_PATH, MODEL, BACKEND)
-    print(f"        Loaded {len(operation_counts)} operation counts")
+    model_collectives = load_model_collectives(DB_PATH, BACKEND, MODEL, TOPOLOGY, TP)
+    config = load_configs(DB_PATH, MODEL, BACKEND, TP, TOPOLOGY)
+
+    print(f"        Loaded {len(operation_counts) + len(model_collectives)} operation counts")
     print()
 
     # Show operation counts
@@ -368,24 +437,6 @@ def main():
     print("        Predictor ready")
     print()
 
-    # Step 4: Optionally initialize vLLM
-    llm = None
-    if args.with_vllm:
-        if not VLLM_AVAILABLE:
-            print("ERROR: vLLM not available but --with-vllm was specified")
-            return
-
-        print("Step 4: Initializing vLLM engine...")
-        llm = LLM(
-            model=MODEL,
-            gpu_memory_utilization=0.9,
-            max_num_seqs=256,
-            max_model_len=4096,
-            enforce_eager=True,  # Disable CUDA graphs for accurate timing
-        )
-        print("        vLLM engine ready")
-        print()
-
     # Step 5: Run test cases
     print("=" * 80)
     print("RUNNING TEST CASES")
@@ -406,38 +457,21 @@ def main():
             batch_config=batch_config,
             verbose=False  # Set to True for detailed output
         )
+        
+        if model_collectives:
+            dooly_latency += estimate_comm_latency(
+                predictor=predictor,
+                configs=config,
+                model_collectives=model_collectives,
+                batch=batch_config
+            )
 
         print(f"  DoolySim prediction: {dooly_latency:.3f} ms")
-
-        # vLLM measurement
-        vllm_stats = None
-        if llm is not None:
-            print(f"  Measuring vLLM (warmup={args.warmup}, iterations={args.iterations})...")
-            try:
-                vllm_stats = measure_vllm_latency(
-                    llm=llm,
-                    batch_config=batch_config,
-                    warmup=args.warmup,
-                    iterations=args.iterations
-                )
-                print(f"  vLLM actual:         {vllm_stats['mean_ms']:.3f} ± {vllm_stats['std_ms']:.3f} ms")
-                print(f"                       (min: {vllm_stats['min_ms']:.3f}, max: {vllm_stats['max_ms']:.3f})")
-
-                # Calculate error
-                error_pct = abs(dooly_latency - vllm_stats['mean_ms']) / vllm_stats['mean_ms'] * 100
-                print(f"  Error:               {error_pct:.1f}%")
-
-            except Exception as e:
-                print(f"  vLLM measurement failed: {e}")
-
-        print("-" * 80)
 
         results.append({
             'test_name': test_name,
             'tokens': batch_config['total_tokens'],
             'dooly_ms': dooly_latency,
-            'vllm_ms': vllm_stats['mean_ms'] if vllm_stats else None,
-            'error_pct': abs(dooly_latency - vllm_stats['mean_ms']) / vllm_stats['mean_ms'] * 100 if vllm_stats else None,
         })
 
     # Summary
@@ -446,24 +480,10 @@ def main():
     print("SUMMARY")
     print("=" * 80)
 
-    if llm is not None:
-        print(f"{'Test Name':<35} {'Tokens':>8} {'DoolySim':>12} {'vLLM':>12} {'Error':>10}")
-        print("-" * 80)
-        for r in results:
-            vllm_str = f"{r['vllm_ms']:.3f}" if r['vllm_ms'] is not None else "N/A"
-            error_str = f"{r['error_pct']:.1f}%" if r['error_pct'] is not None else "N/A"
-            print(f"{r['test_name']:<35} {r['tokens']:>8} {r['dooly_ms']:>12.3f} {vllm_str:>12} {error_str:>10}")
-
-        # Calculate average error
-        errors = [r['error_pct'] for r in results if r['error_pct'] is not None]
-        if errors:
-            print("-" * 80)
-            print(f"{'Average Error:':<35} {sum(errors)/len(errors):>10.1f}%")
-    else:
-        print(f"{'Test Name':<35} {'Tokens':>8} {'DoolySim (ms)':>15}")
-        print("-" * 80)
-        for r in results:
-            print(f"{r['test_name']:<35} {r['tokens']:>8} {r['dooly_ms']:>15.3f}")
+    print(f"{'Test Name':<35} {'Tokens':>8} {'DoolySim (ms)':>15}")
+    print("-" * 80)
+    for r in results:
+        print(f"{r['test_name']:<35} {r['tokens']:>8} {r['dooly_ms']:>15.3f}")
 
     print("=" * 80)
 

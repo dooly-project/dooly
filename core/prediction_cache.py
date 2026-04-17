@@ -206,21 +206,16 @@ def generate_prediction_cache_from_estimator(
         # Infer feature names from operation type
         sample_key = next(iter(predictions.keys()))
 
-        # Check for collective operations first (they have integer keys, not tuples)
+        # Check for collective operations first
         if operation_name.startswith(('all_reduce_', 'all_gather_', 'reduce_scatter_')):
-            # Collective communication operations use size_bytes
-            feature_names = ['size_bytes']
+            # Collective communication operations now use num_tokens
+            feature_names = ['num_tokens']
         elif '_prefill' in operation_name:
             feature_names = ['kv_cache_size', 'prefill_chunk_size_squared']
         elif '_decode' in operation_name:
             feature_names = ['batch_size', 'kv_cache_size']
         else:
-            # For other operations, infer from key structure
-            num_features = len(sample_key) if isinstance(sample_key, tuple) else 1
-            if num_features == 1:
-                feature_names = ['num_tokens']
-            else:
-                feature_names = [f'feature_{i}' for i in range(num_features)]
+            feature_names = ['num_tokens']
 
         # Save to cache
         cache.save_predictions(operation_name, predictions, feature_names)

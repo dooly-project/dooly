@@ -21,6 +21,24 @@ def convert_to_request_func_output(vllm_output, start_time: float) -> RequestFun
     """Convert vLLM RequestOutput to RequestFuncOutput format for calculate_metrics."""
     metrics = vllm_output.metrics
 
+    # Handle dummy load format where metrics might be None
+    if metrics is None:
+        # Return dummy output
+        num_output_tokens = len(vllm_output.outputs[0].token_ids) if vllm_output.outputs else 1
+        return RequestFuncOutput(
+            generated_text=vllm_output.outputs[0].text if vllm_output.outputs else "",
+            success=True,
+            latency=0.02,  # 20ms dummy latency
+            output_tokens=num_output_tokens,
+            ttft=0.01,  # 10ms dummy TTFT
+            itl=[0.005] * num_output_tokens,  # 5ms dummy ITL
+            tpot=0.0,
+            prompt_len=len(vllm_output.prompt_token_ids),
+            error="",
+            start_time=start_time,
+            input_audio_duration=0.0,
+        )
+
     # Calculate ITLs from metrics
     itls = []
     if metrics.num_generation_tokens > 1:
@@ -46,232 +64,6 @@ def convert_to_request_func_output(vllm_output, start_time: float) -> RequestFun
         start_time=start_time,
         input_audio_duration=0.0,
     )
-
-
-def stream_requests(
-    llm: LLM,
-    stream_config: Dict,
-    warmup: int = 3,
-    iterations: int = 10,
-    profile_dir: str = './vllm_profiles'
-) -> Dict:
-    prompt_lens = stream_config['prompt_lens']
-    num_prefills = len(prompt_lens)
-    output_lens = stream_config['output_lens']
-
-    # Create prompts using explicit token IDs to ensure exact length
-    # This guarantees we get exactly the desired token count
-    prompt_token_ids_list = []
-    for target_len in prompt_lens:
-        # Create token IDs from 1 to target_len (avoiding special tokens like 0)
-        token_ids = list(range(1, target_len + 1))
-        prompt_token_ids_list.append(token_ids)
-
-    print(f"  Created {len(prompt_token_ids_list)} prompts with exact token counts:")
-    for i, (target_len, token_ids, out_len) in enumerate(zip(prompt_lens, prompt_token_ids_list, output_lens)):
-        print(f"    Prompt {i+1}: {len(token_ids)} tokens (target: {target_len}), output_len: {out_len}")
-
-    # Use max output_len for generation
-    max_output_len = max(output_lens)
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        max_tokens=max_output_len,
-        ignore_eos=True,
-    )
-    print(f"  Using max_tokens={max_output_len}")
-
-    # Warmup
-    print(f"  Warming up ({warmup} iterations)...")
-    for i in range(warmup):
-        from vllm.inputs import TokensPrompt
-        prompts = [TokensPrompt(prompt_token_ids=token_ids) for token_ids in prompt_token_ids_list]
-        llm.generate(prompts, sampling_params=sampling_params)
-        torch.cuda.synchronize()
-
-    # Measure with profiling
-    print(f"  Profiling prefill + decode phases...")
-    latencies = []
-
-    # Start profiling BEFORE the first generate call
-    torch.cuda.synchronize()
-    llm.start_profile()
-
-    # Run iterations
-    per_request_ttfts = []  # Track TTFT for each request
-    per_request_itls = []   # Track ITL for each request
-    all_request_func_outputs = []  # For calculate_metrics compatibility
-
-    benchmark_start_time = time.perf_counter()
-    first_request_arrival_time = None  # Track the first arrival time to make times relative
-
-    for i in range(prompt_lens):
-        from vllm.inputs import TokensPrompt
-        prompts = [TokensPrompt(prompt_token_ids=token_ids) for token_ids in prompt_token_ids_list]
-
-        start = time.perf_counter()
-        outputs = llm.generate(prompts, sampling_params=sampling_params)
-        torch.cuda.synchronize()
-        end = time.perf_counter()
-
-        latency_ms = (end - start) * 1000
-        latencies.append(latency_ms)
-
-        # Extract per-request metrics from vLLM
-        print(f"    Per-request metrics:")
-
-        for j, output in enumerate(outputs):
-            # Track first arrival time to make all times relative
-            if first_request_arrival_time is None:
-                first_request_arrival_time = output.metrics.arrival_time
-
-            # Verify actual token count
-            actual_prompt_len = len(output.prompt_token_ids)
-            print(f"      Request {j+1}: {actual_prompt_len} tokens")
-            print(f"         num_generation_tokens: {output.metrics.num_generation_tokens}")
-            print(f"         arrival_time: {output.metrics.arrival_time:.3f} s")
-            print(f"         queued_ts: {output.metrics.queued_ts:.3f} s", end="")
-            print(f"         scheduled_ts: {output.metrics.scheduled_ts:.3f} s")
-            print(f"         first_token_ts: {output.metrics.first_token_ts:.3f} s")
-            print(f"         last_token_ts: {output.metrics.last_token_ts:.3f} s")
-            print(f"         first_token_latency: {output.metrics.first_token_latency * 1000.0} ms")
-            print(f"         inter-token latency: {(output.metrics.last_token_ts - output.metrics.first_token_ts) / output.metrics.num_generation_tokens * 1000.0} ms")
-
-            per_request_ttfts.append(output.metrics.first_token_latency)
-            per_request_itls.append(((output.metrics.last_token_ts - output.metrics.first_token_ts) / output.metrics.num_generation_tokens))
-
-            # Convert to RequestFuncOutput for calculate_metrics (use relative time)
-            relative_start_time = output.metrics.arrival_time - first_request_arrival_time
-            request_func_output = convert_to_request_func_output(output, relative_start_time)
-            all_request_func_outputs.append(request_func_output)
-
-    benchmark_end_time = time.perf_counter()
-    benchmark_duration_s = benchmark_end_time - benchmark_start_time
-
-    llm.stop_profile()
-
-    # Create SampleRequest objects for calculate_metrics
-    sample_requests = [
-        SampleRequest(
-            prompt="",  # We use token IDs directly
-            prompt_len=len(token_ids),
-            expected_output_len=output_lens[idx] if idx < len(output_lens) else 1,
-        )
-        for idx, token_ids in enumerate(prompt_token_ids_list)
-    ]
-
-    # Use vLLM's calculate_metrics to get standardized metrics
-    print(f"  Calculating standardized metrics...")
-
-    # Debug: Print some sample data
-    if all_request_func_outputs:
-        print(f"  Debug: Total outputs: {len(all_request_func_outputs)}")
-        print(f"  Debug: First output - start_time: {all_request_func_outputs[0].start_time:.6f}s, latency: {all_request_func_outputs[0].latency:.6f}s")
-        print(f"  Debug: Last output - start_time: {all_request_func_outputs[-1].start_time:.6f}s, latency: {all_request_func_outputs[-1].latency:.6f}s")
-        print(f"  Debug: Benchmark duration: {benchmark_duration_s:.6f}s")
-
-    bench_metrics, actual_output_lens = calculate_metrics(
-        input_requests=sample_requests * iterations,  # Repeat for each iteration
-        outputs=all_request_func_outputs,
-        dur_s=benchmark_duration_s,
-        tokenizer=None,  # We don't need tokenizer for token counting
-        selected_percentiles=[50.0, 95.0, 99.0],
-        goodput_config_dict={},
-    )
-
-    # Find the generated trace file
-    trace_files = sorted(Path(profile_dir).glob("rank*.pt.trace.json"))
-    gpu_times = {}
-    trace_file_path = None
-    if trace_files:
-        latest_trace = trace_files[-1]
-        print(f"  ✓ Trace saved to: {latest_trace}")
-        trace_file_path = str(latest_trace)
-
-        # Parse trace to extract gpu_user_annotation times
-        gpu_times = extract_gpu_times_from_trace(trace_file_path)
-
-    result = {
-        'latencies': latencies,
-        'stats': {
-            'mean': np.mean(latencies),
-            'std': np.std(latencies),
-            'median': np.median(latencies),
-            'min': np.min(latencies),
-            'max': np.max(latencies),
-            'p95': np.percentile(latencies, 95),
-            'p99': np.percentile(latencies, 99),
-        },
-        'trace_file': trace_file_path,
-        'gpu_times': gpu_times,
-        'num_prefills': num_prefills,
-        'prompt_lens': prompt_lens,
-        'output_lens': output_lens,
-
-        'per_request_itl': {
-            'mean': np.mean(per_request_itls) * 1000.0,
-            'std': np.std(per_request_itls) * 1000.0,
-            'median': np.median(per_request_itls) * 1000.0,
-            'min': np.min(per_request_itls) * 1000.0,
-            'max': np.max(per_request_itls) * 1000.0,
-            'p95': np.percentile(per_request_itls, 95) * 1000.0,
-            'p99': np.percentile(per_request_itls, 99) * 1000.0,
-        },
-        'per_request_ttft': {
-            'mean': np.mean(per_request_ttfts) * 1000.0,
-            'std': np.std(per_request_ttfts) * 1000.0,
-            'median': np.median(per_request_ttfts) * 1000.0,
-            'min': np.min(per_request_ttfts) * 1000.0,
-            'max': np.max(per_request_ttfts) * 1000.0,
-            'p95': np.percentile(per_request_ttfts, 95) * 1000.0,
-            'p99': np.percentile(per_request_ttfts, 99) * 1000.0,
-        },
-
-        # Store vLLM benchmark data for later JSON generation
-        # Don't store the dataclass objects directly - extract fields instead
-        'vllm_benchmark_data': {
-            'metrics': {
-                'completed': bench_metrics.completed,
-                'failed': bench_metrics.failed,
-                'total_input': bench_metrics.total_input,
-                'total_output': bench_metrics.total_output,
-                'request_throughput': bench_metrics.request_throughput,
-                'request_goodput': bench_metrics.request_goodput,
-                'output_throughput': bench_metrics.output_throughput,
-                'total_token_throughput': bench_metrics.total_token_throughput,
-                'mean_ttft_ms': bench_metrics.mean_ttft_ms,
-                'median_ttft_ms': bench_metrics.median_ttft_ms,
-                'std_ttft_ms': bench_metrics.std_ttft_ms,
-                'percentiles_ttft_ms': bench_metrics.percentiles_ttft_ms,
-                'mean_tpot_ms': bench_metrics.mean_tpot_ms,
-                'median_tpot_ms': bench_metrics.median_tpot_ms,
-                'std_tpot_ms': bench_metrics.std_tpot_ms,
-                'percentiles_tpot_ms': bench_metrics.percentiles_tpot_ms,
-                'mean_itl_ms': bench_metrics.mean_itl_ms,
-                'median_itl_ms': bench_metrics.median_itl_ms,
-                'std_itl_ms': bench_metrics.std_itl_ms,
-                'percentiles_itl_ms': bench_metrics.percentiles_itl_ms,
-                'mean_e2el_ms': bench_metrics.mean_e2el_ms,
-                'median_e2el_ms': bench_metrics.median_e2el_ms,
-                'std_e2el_ms': bench_metrics.std_e2el_ms,
-                'percentiles_e2el_ms': bench_metrics.percentiles_e2el_ms,
-                'max_output_tokens_per_s': bench_metrics.max_output_tokens_per_s,
-                'max_concurrent_requests': bench_metrics.max_concurrent_requests,
-                'rtfx': bench_metrics.rtfx,
-            },
-            'outputs': {
-                'ttfts': [output.ttft for output in all_request_func_outputs],
-                'itls': [output.itl for output in all_request_func_outputs],
-                'start_times': [output.start_time for output in all_request_func_outputs],
-                'generated_texts': [output.generated_text for output in all_request_func_outputs],
-                'errors': [output.error for output in all_request_func_outputs],
-                'prompt_lens': [output.prompt_len for output in all_request_func_outputs],
-                'output_tokens': [output.output_tokens for output in all_request_func_outputs],
-            }
-        },
-    }
-    return result
-
-
 
 def measure_batch_request(
     llm: LLM,
@@ -345,6 +137,19 @@ def measure_batch_request(
         print(f"    Per-request metrics:")
 
         for j, output in enumerate(outputs):
+            # Check if metrics are available
+            if output.metrics is None:
+                print(f"      Request {j+1}: No metrics available (using dummy load)")
+                # Create dummy metrics for testing with dummy load
+                per_request_ttfts.append(0.01)  # 10ms dummy TTFT
+                per_request_itls.append(0.005)  # 5ms dummy ITL
+                # Still convert to RequestFuncOutput for compatibility
+                if first_request_arrival_time is None:
+                    first_request_arrival_time = 0.0
+                request_func_output = convert_to_request_func_output(output, 0.0)
+                all_request_func_outputs.append(request_func_output)
+                continue
+
             # Track first arrival time to make all times relative
             if first_request_arrival_time is None:
                 first_request_arrival_time = output.metrics.arrival_time
@@ -384,24 +189,12 @@ def measure_batch_request(
         for idx, token_ids in enumerate(prompt_token_ids_list)
     ]
 
-    # Use vLLM's calculate_metrics to get standardized metrics
-    print(f"  Calculating standardized metrics...")
-
     # Debug: Print some sample data
     if all_request_func_outputs:
         print(f"  Debug: Total outputs: {len(all_request_func_outputs)}")
         print(f"  Debug: First output - start_time: {all_request_func_outputs[0].start_time:.6f}s, latency: {all_request_func_outputs[0].latency:.6f}s")
         print(f"  Debug: Last output - start_time: {all_request_func_outputs[-1].start_time:.6f}s, latency: {all_request_func_outputs[-1].latency:.6f}s")
         print(f"  Debug: Benchmark duration: {benchmark_duration_s:.6f}s")
-
-    bench_metrics, actual_output_lens = calculate_metrics(
-        input_requests=sample_requests * iterations,  # Repeat for each iteration
-        outputs=all_request_func_outputs,
-        dur_s=benchmark_duration_s,
-        tokenizer=None,  # We don't need tokenizer for token counting
-        selected_percentiles=[50.0, 95.0, 99.0],
-        goodput_config_dict={},
-    )
 
     # Find the generated trace file
     trace_files = sorted(Path(profile_dir).glob("rank*.pt.trace.json"))
@@ -415,197 +208,603 @@ def measure_batch_request(
         # Parse trace to extract gpu_user_annotation times
         gpu_times = extract_gpu_times_from_trace(trace_file_path)
 
+    # Use GPU timing data from execute_model_stats
+    execute_model_stats = gpu_times.get('execute_model_details', [])
+
+    if execute_model_stats:
+        # Use the timing data from exec_stats
+        gpu_latency = np.median([stat['computation_kernel_time_ms'] for stat in execute_model_stats])
+        comm_latency = np.median([stat['communication_kernel_time_ms'] for stat in execute_model_stats])
+        all_reduce_latency = np.median([stat['communication']['all_reduce']['total_ms'] for stat in execute_model_stats])
+        all_reduce_count = np.median([stat['communication']['all_reduce']['count'] for stat in execute_model_stats])
+        per_all_reduce_latency = np.median([stat['communication']['all_reduce']['median_ms'] for stat in execute_model_stats])
+        all_gather_latency = np.median([stat['communication']['all_gather']['total_ms'] for stat in execute_model_stats])
+        all_gather_count = np.median([stat['communication']['all_gather']['count'] for stat in execute_model_stats])
+        per_all_gather_latency = np.median([stat['communication']['all_gather']['median_ms'] for stat in execute_model_stats]) 
+        total_latency = gpu_latency + comm_latency
+    else:
+        # Fallback to end-to-end measurement
+        total_latency = np.mean(latencies)
+        gpu_latency = total_latency
+        comm_latency = 0.0
+        all_reduce_latency = 0.0
+        all_reduce_count = 0
+        per_all_reduce_latency = 0.0
+        all_gather_latency = 0.0
+        all_gather_count = 0
+        per_all_gather_latency = 0.0
+
+    # Return results matching batch_predictor.py format
     result = {
-        'latencies': latencies,
-        'stats': {
-            'mean': np.mean(latencies),
-            'std': np.std(latencies),
-            'median': np.median(latencies),
-            'min': np.min(latencies),
-            'max': np.max(latencies),
-            'p95': np.percentile(latencies, 95),
-            'p99': np.percentile(latencies, 99),
-        },
-        'trace_file': trace_file_path,
-        'gpu_times': gpu_times,
-        'num_prefills': num_prefills,
-        'prompt_lens': prompt_lens,
-        'output_lens': output_lens,
-
-        'per_request_itl': {
-            'mean': np.mean(per_request_itls) * 1000.0,
-            'std': np.std(per_request_itls) * 1000.0,
-            'median': np.median(per_request_itls) * 1000.0,
-            'min': np.min(per_request_itls) * 1000.0,
-            'max': np.max(per_request_itls) * 1000.0,
-            'p95': np.percentile(per_request_itls, 95) * 1000.0,
-            'p99': np.percentile(per_request_itls, 99) * 1000.0,
-        },
-        'per_request_ttft': {
-            'mean': np.mean(per_request_ttfts) * 1000.0,
-            'std': np.std(per_request_ttfts) * 1000.0,
-            'median': np.median(per_request_ttfts) * 1000.0,
-            'min': np.min(per_request_ttfts) * 1000.0,
-            'max': np.max(per_request_ttfts) * 1000.0,
-            'p95': np.percentile(per_request_ttfts, 95) * 1000.0,
-            'p99': np.percentile(per_request_ttfts, 99) * 1000.0,
-        },
-
-        # Store vLLM benchmark data for later JSON generation
-        # Don't store the dataclass objects directly - extract fields instead
-        'vllm_benchmark_data': {
-            'metrics': {
-                'completed': bench_metrics.completed,
-                'failed': bench_metrics.failed,
-                'total_input': bench_metrics.total_input,
-                'total_output': bench_metrics.total_output,
-                'request_throughput': bench_metrics.request_throughput,
-                'request_goodput': bench_metrics.request_goodput,
-                'output_throughput': bench_metrics.output_throughput,
-                'total_token_throughput': bench_metrics.total_token_throughput,
-                'mean_ttft_ms': bench_metrics.mean_ttft_ms,
-                'median_ttft_ms': bench_metrics.median_ttft_ms,
-                'std_ttft_ms': bench_metrics.std_ttft_ms,
-                'percentiles_ttft_ms': bench_metrics.percentiles_ttft_ms,
-                'mean_tpot_ms': bench_metrics.mean_tpot_ms,
-                'median_tpot_ms': bench_metrics.median_tpot_ms,
-                'std_tpot_ms': bench_metrics.std_tpot_ms,
-                'percentiles_tpot_ms': bench_metrics.percentiles_tpot_ms,
-                'mean_itl_ms': bench_metrics.mean_itl_ms,
-                'median_itl_ms': bench_metrics.median_itl_ms,
-                'std_itl_ms': bench_metrics.std_itl_ms,
-                'percentiles_itl_ms': bench_metrics.percentiles_itl_ms,
-                'mean_e2el_ms': bench_metrics.mean_e2el_ms,
-                'median_e2el_ms': bench_metrics.median_e2el_ms,
-                'std_e2el_ms': bench_metrics.std_e2el_ms,
-                'percentiles_e2el_ms': bench_metrics.percentiles_e2el_ms,
-                'max_output_tokens_per_s': bench_metrics.max_output_tokens_per_s,
-                'max_concurrent_requests': bench_metrics.max_concurrent_requests,
-                'rtfx': bench_metrics.rtfx,
-            },
-            'outputs': {
-                'ttfts': [output.ttft for output in all_request_func_outputs],
-                'itls': [output.itl for output in all_request_func_outputs],
-                'start_times': [output.start_time for output in all_request_func_outputs],
-                'generated_texts': [output.generated_text for output in all_request_func_outputs],
-                'errors': [output.error for output in all_request_func_outputs],
-                'prompt_lens': [output.prompt_len for output in all_request_func_outputs],
-                'output_tokens': [output.output_tokens for output in all_request_func_outputs],
-            }
-        },
+        'total_latency_ms': total_latency,
+        'gpu_latency_ms': gpu_latency,
+        'comm_latency_ms': comm_latency,
+        'all_reduce_latency_ms': all_reduce_latency,
+        'all_reduce_count': all_reduce_count,
+        'per_all_reduce_latency_ms': per_all_reduce_latency,
+        'all_gather_latency_ms': all_gather_latency,
+        'all_gather_count': all_gather_count,
+        'per_all_gather_latency_ms': per_all_gather_latency,
+        'batch_size': num_prefills,
+        'total_tokens': sum(prompt_lens),
+        'num_prefill_requests': num_prefills,
+        'num_decode_requests': 0,
     }
+
+    if result['total_tokens'] > 0:
+        result['ms_per_token'] = total_latency / result['total_tokens']
+
+    # Add detailed trace analysis including module-to-kernel mappings
+    if gpu_times:
+        result['trace_analysis'] = gpu_times
+
     return result
 
 
-def extract_gpu_times_from_trace(trace_path: str) -> Dict:
+def extract_module_id(module_name: str) -> int:
+    """Extract module ID from names like 'nn.Module: RMSNorm_132'"""
+    try:
+        if 'nn.Module:' in module_name:
+            module_part = module_name.split('nn.Module:')[1].strip()
+            if '_' in module_part:
+                _, module_id_str = module_part.rsplit('_', 1)
+                return int(module_id_str)
+    except:
+        pass
+    return 0
 
+def extract_module_type(module_name: str) -> str:
+    """Extract module type from names like 'nn.Module: RMSNorm_132' or 'COMMUNICATION: AllReduce_0 (Layer 5)'"""
+    try:
+        if 'COMMUNICATION:' in module_name:
+            # Extract communication type like "AllReduce_0" or "AllGather_1"
+            if 'AllReduce' in module_name:
+                if '_0' in module_name:
+                    return 'AllReduce_0'
+                elif '_1' in module_name:
+                    return 'AllReduce_1'
+                else:
+                    return 'AllReduce'
+            elif 'AllGather' in module_name:
+                if '_0' in module_name:
+                    return 'AllGather_0'
+                elif '_1' in module_name:
+                    return 'AllGather_1'
+                else:
+                    return 'AllGather'
+            else:
+                return 'Communication'
+        elif 'nn.Module:' in module_name:
+            module_part = module_name.split('nn.Module:')[1].strip()
+            if '_' in module_part:
+                module_type, _ = module_part.rsplit('_', 1)
+                return module_type
+    except:
+        pass
+    return 'Unknown'
+
+def analyze_module_to_kernel_from_trace(trace_path: str) -> Dict:
+    """Analyze module-to-kernel mapping from PyTorch trace."""
+
+    with open(trace_path, 'r') as f:
+        trace = json.load(f)
+
+    # Collect events by type
+    modules = []
+    cpu_operations = []
+    kernel_events = []
+    external_id_to_kernel = {}
+
+    for event in trace.get('traceEvents', []):
+        cat = event.get('cat', '')
+        name = event.get('name', '')
+        ts = event.get('ts', 0)
+        dur = event.get('dur', 0)
+        external_id = event.get('args', {}).get('External id')
+
+        if cat == 'python_function':
+            if 'nn.Module' in name:
+                modules.append({
+                    'name': name,
+                    'cat': cat,
+                    'ts': ts,
+                    'dur': dur,
+                    'end_ts': ts + dur,
+                    'external_id': external_id,
+                    'leaf_module': True,
+                    'is_layer': 'DecoderLayer_' in name,
+                    'layer_num': -1
+                })
+
+        elif cat == 'cpu_op':
+            cpu_operations.append({
+                'name': name,
+                'cat': cat,
+                'ts': ts,
+                'dur': dur,
+                'end_ts': ts + dur,
+                'external_id': external_id
+            })
+        elif cat == 'kernel':
+            kernel_event = {
+                'name': name,
+                'cat': cat,
+                'ts': ts,
+                'dur': dur,
+                'end_ts': ts + dur,
+                'external_id': external_id
+            }
+            kernel_events.append(kernel_event)
+
+            if external_id is not None:
+                if external_id not in external_id_to_kernel:
+                    external_id_to_kernel[external_id] = []
+                external_id_to_kernel[external_id].append(kernel_event)
+
+    # First pass: Assign layer numbers to all modules based on their parent DecoderLayer
+    for module in modules:
+        if 'DecoderLayer_' in module['name']:
+            # Extract layer number from DecoderLayer
+            layer_num = int(module['name'].split('DecoderLayer_')[-1].split('/')[0])
+            module_start = module['ts']
+            module_end = module['end_ts']
+
+            # Mark all child modules with this layer number
+            for child_module in modules:
+                if (child_module['ts'] >= module_start and
+                    child_module['end_ts'] <= module_end and
+                    child_module['name'] != module['name']):
+                    child_module['layer_num'] = layer_num
+
+    # Second pass: Find leaf modules
+    leaf_modules = []
+    for module in modules:
+        module_start = module['ts']
+        module_end = module['end_ts']
+
+        for child_module in modules:
+            if (child_module['ts'] >= module_start and
+                child_module['end_ts'] <= module_end and
+                child_module['name'] != module['name']):
+                module['leaf_module'] = False
+                break
+
+        if module['leaf_module']:
+            leaf_modules.append(module)
+
+    # Extract module-to-kernel mappings with communication isolation
+    module_to_kernel = {}
+    comm_counts_per_layer = {}
+
+    for leaf_module in leaf_modules:
+        for cpu_op in cpu_operations:
+            if cpu_op['ts'] >= leaf_module['ts'] and cpu_op['end_ts'] <= leaf_module['end_ts']:
+                if cpu_op['external_id'] is not None:
+                    kernels = external_id_to_kernel.get(cpu_op['external_id'])
+                    if kernels:
+                        # Check if this is a communication operation
+                        cpu_op_lower = cpu_op['name'].lower()
+                        is_communication = any(comm_op in cpu_op_lower for comm_op in ['all_reduce', 'allreduce', 'all_gather', 'allgather'])
+
+                        if is_communication:
+                            # Determine communication type
+                            if 'all_reduce' in cpu_op_lower or 'allreduce' in cpu_op_lower:
+                                comm_type = 'AllReduce'
+                            elif 'all_gather' in cpu_op_lower or 'allgather' in cpu_op_lower:
+                                comm_type = 'AllGather'
+                            else:
+                                comm_type = 'Unknown'
+
+                            # Track occurrence count for this communication type in this layer
+                            layer_comm_key = (leaf_module['layer_num'], comm_type)
+                            if layer_comm_key not in comm_counts_per_layer:
+                                comm_counts_per_layer[layer_comm_key] = 0
+
+                            # Create unique communication module name with occurrence count
+                            occurrence = comm_counts_per_layer[layer_comm_key]
+                            comm_module_name = f"COMMUNICATION: {comm_type}_{occurrence} (Layer {leaf_module['layer_num']})"
+                            comm_counts_per_layer[layer_comm_key] += 1
+
+                            if comm_module_name not in module_to_kernel:
+                                module_to_kernel[comm_module_name] = []
+
+                            # Handle all kernels for communication
+                            for kernel in kernels:
+                                module_to_kernel[comm_module_name].append({
+                                    'layer_num': leaf_module['layer_num'],
+                                    'cpu_op': cpu_op['name'],
+                                    'kernel': kernel['name'],
+                                    'kernel_dur_us': kernel['dur']
+                                })
+                        else:
+                            # Regular computation module
+                            if leaf_module['name'] not in module_to_kernel:
+                                module_to_kernel[leaf_module['name']] = []
+
+                            # Handle all kernels with the same External_id
+                            for kernel in kernels:
+                                module_to_kernel[leaf_module['name']].append({
+                                    'layer_num': leaf_module['layer_num'],
+                                    'cpu_op': cpu_op['name'],
+                                    'kernel': kernel['name'],
+                                    'kernel_dur_us': kernel['dur']
+                                })
+
+    # Calculate total latencies per module
+    module_total_latencies = {}
+    for module, ops in module_to_kernel.items():
+        total_latency_us = sum(op['kernel_dur_us'] for op in ops)
+        kernel_count = len(ops)
+
+        module_total_latencies[module] = {
+            'layer_num': ops[0]['layer_num'] if ops else -1,
+            'total_latency_us': total_latency_us,
+            'kernel_count': kernel_count,
+        }
+
+    return module_total_latencies
+
+def compute_median_latencies_by_position(module_total_latencies: Dict) -> Dict:
+    """Group modules by their execution order position within each layer and compute median latency."""
+
+    # Group modules by layer first (including layer -1)
+    layers = {}
+    non_layer_modules = []
+    for module_name, data in module_total_latencies.items():
+        layer_num = data['layer_num']
+        if layer_num == -1:  # Non-layer modules (embeddings, logits, etc.)
+            non_layer_modules.append((module_name, data))
+        else:
+            if layer_num not in layers:
+                layers[layer_num] = []
+            layers[layer_num].append((module_name, data))
+
+    # Sort modules within each layer by module_id to get execution order
+    for layer_num in layers:
+        layers[layer_num].sort(key=lambda x: extract_module_id(x[0]))
+
+    # Group by position across all layers
+    position_groups = {}
+    for layer_num, modules_in_layer in layers.items():
+        # Track occurrence count for each module type within this layer
+        module_type_counts = {}
+
+        for position, (module_name, data) in enumerate(modules_in_layer):
+            module_type = extract_module_type(module_name)
+
+            # Count occurrence of this module type in this layer
+            if module_type not in module_type_counts:
+                module_type_counts[module_type] = 0
+            occurrence = module_type_counts[module_type]
+            module_type_counts[module_type] += 1
+
+            # Create position key based on module type and occurrence order
+            position_key = f"{module_type}_occurrence_{occurrence}"
+
+            if position_key not in position_groups:
+                position_groups[position_key] = []
+
+            position_groups[position_key].append(data['total_latency_us'])
+
+    # Compute median for each position
+    result = {}
+    for position_key, latencies in position_groups.items():
+        result[position_key] = {
+            'median_latency_us': np.median(latencies),
+            'median_latency_ms': np.median(latencies) / 1000.0,
+            'mean_latency_us': np.mean(latencies),
+            'num_layers': len(latencies),
+        }
+
+    # Add non-layer modules (layer -1) as individual entries
+    for module_name, data in non_layer_modules:
+        module_type = extract_module_type(module_name)
+        position_key = f"{module_type}_non_layer"
+        result[position_key] = {
+            'median_latency_us': data['total_latency_us'],
+            'median_latency_ms': data['total_latency_us'] / 1000.0,
+            'mean_latency_us': data['total_latency_us'],
+            'num_layers': 1,
+        }
+
+    return result
+
+def print_module_analysis_summary(module_analysis: Dict):
+    """Print a formatted summary of the module analysis results."""
+    if not module_analysis or 'module_position_analysis' not in module_analysis:
+        print("  No module analysis data available")
+        return
+
+    position_analysis = module_analysis['module_position_analysis']
+
+    if not position_analysis:
+        print("  No module position analysis found")
+        return
+
+    print("\n  📊 Module-to-Kernel Analysis:")
+    print("  " + "="*60)
+
+    # Keep original order, separate communication, computation, and non-layer modules
+    communication_ops = []
+    computation_ops = []
+    non_layer_ops = []
+
+    for pos, data in position_analysis.items():
+        if 'AllReduce' in pos or 'AllGather' in pos:
+            communication_ops.append((pos, data))
+        elif '_non_layer' in pos:
+            non_layer_ops.append((pos, data))
+        else:
+            computation_ops.append((pos, data))
+
+    # Print communication operations
+    if communication_ops:
+        print("\n  🔄 Communication Operations:")
+        for pos, data in communication_ops:
+            median_ms = data['median_latency_ms']
+            num_layers = data['num_layers']
+            print(f"    {pos:<35} {median_ms:>7.3f} ms  ({num_layers} layers)")
+
+    # Print computation operations
+    if computation_ops:
+        print("\n  ⚡ Computation Operations:")
+        for pos, data in computation_ops:
+            median_ms = data['median_latency_ms']
+            num_layers = data['num_layers']
+            print(f"    {pos:<35} {median_ms:>7.3f} ms  ({num_layers} layers)")
+
+    # Print non-layer operations
+    if non_layer_ops:
+        print("\n  🎯 Non-Layer Operations (embeddings, logits, etc.):")
+        for pos, data in non_layer_ops:
+            median_ms = data['median_latency_ms']
+            print(f"    {pos:<35} {median_ms:>7.3f} ms")
+
+    # Calculate totals
+    total_comm_time = sum(data['median_latency_ms'] for _, data in communication_ops)
+    total_comp_time = sum(data['median_latency_ms'] for _, data in computation_ops)
+    total_non_layer_time = sum(data['median_latency_ms'] for _, data in non_layer_ops)
+    total_time = total_comm_time + total_comp_time + total_non_layer_time
+
+    print("\n  📈 Summary:")
+    print(f"    Communication time: {total_comm_time:>7.3f} ms ({total_comm_time/total_time*100:.1f}%)")
+    print(f"    Computation time:   {total_comp_time:>7.3f} ms ({total_comp_time/total_time*100:.1f}%)")
+    if total_non_layer_time > 0:
+        print(f"    Non-layer time:     {total_non_layer_time:>7.3f} ms ({total_non_layer_time/total_time*100:.1f}%)")
+    print(f"    Total time:         {total_time:>7.3f} ms")
+    print("  " + "="*60)
+
+def extract_gpu_times_from_trace(trace_path: str) -> Dict:
+    return analyze_execute_model_from_trace(trace_path)
+
+def analyze_execute_model_from_trace(trace_path: str) -> Dict:
+    """Analyze execute_model events and communication operations within them.
+
+    Returns detailed statistics about kernel execution and communication patterns
+    within execute_model calls for comparison with Dooly simulator.
+    """
     try:
         with open(trace_path, 'r') as f:
             trace = json.load(f)
 
-        gpu_times = {
-            'prefill': [],
-            'decode': [],
-        }
+        # Build maps of events
+        kernel_events_by_ts = {}
+        kernel_name_to_dur = {}
+        execute_model_events = []
+        execute_context_events = []
+        comm_kernel_events = []
 
-        import re
         for event in trace.get('traceEvents', []):
-            if event.get('cat') == 'gpu_user_annotation':
-                name = event.get('name', '')
+            cat = event.get('cat', '')
+            name = event.get('name', '')
+            ts = event.get('ts', 0)
+
+            if cat == 'kernel':
+                if ts not in kernel_events_by_ts:
+                    kernel_events_by_ts[ts] = []
+                    
+                kernel_name_to_dur[name] = event.get('dur', 0)
+                kernel_events_by_ts[ts].append(event)
+                
+                if 'all_gather' in name.lower() or 'allgather' in name.lower() or 'all_reduce' in name.lower() or 'allreduce' in name.lower():
+                    comm_kernel_events.append({
+                        'name': name,
+                        'ts': ts,
+                        'dur': event.get('dur', 0),
+                        'type': 'all_gather' if 'all_gather' in name.lower() or 'allgather' in name.lower() else 'all_reduce'
+                    })
+                    
+            elif cat == 'gpu_user_annotation':
                 if 'execute_context' in name:
-                    dur_ms = event.get('dur', 0) / 1000
+                    execute_context_events.append({
+                        'name': name,
+                        'ts': ts,
+                        'dur': event.get('dur', 0),
+                        'type': cat
+                    })
+                    
+                    
+        # Analyze each execute_model event
+        execute_model_stats = []
+        
+        for i, exec_model in enumerate(execute_context_events):
+            start_ts = exec_model['ts']
+            end_ts = start_ts + exec_model['dur']
 
-                    # Full pattern: execute_context_<prefill_batch>(<prefill_tokens>)_generation_<decode_batch>(<decode_tokens>)
-                    match = re.search(r'execute_context_(\d+)\((\d+)\)_generation_(\d+)\((\d+)\)', name)
-                    if match:
-                        prefill_batch = int(match.group(1))
-                        prefill_tokens = int(match.group(2))
-                        decode_batch = int(match.group(3))
-                        decode_tokens = int(match.group(4))
+            # Find all kernels within this execute_model
+            kernels_within = []
+            comm_kernels = {'all_gather': [], 'all_reduce': [], 'others': []}
 
-                        # Categorize based on what work is being done
-                        if prefill_tokens > 0:
-                            # This is prefill work (may also have some decode)
-                            gpu_times['prefill'].append(dur_ms)
-                        elif decode_tokens > 0:
-                            # Pure decode work
-                            gpu_times['decode'].append(dur_ms)
+            for ts in kernel_events_by_ts:
+                if start_ts <= ts <= end_ts:
+                    for kernel in kernel_events_by_ts[ts]:
+                        kernel_name = kernel.get('name', '').lower()
+                        kernel_dur_us = kernel.get('dur', 0)
 
-        # Calculate stats
-        result = {}
-        if gpu_times['prefill']:
-            result['prefill'] = {
-                'mean': np.mean(gpu_times['prefill']),
-                'median': np.median(gpu_times['prefill']),
-                'min': np.min(gpu_times['prefill']),
-                'max': np.max(gpu_times['prefill']),
-                'count': len(gpu_times['prefill']),
-                'values': gpu_times['prefill'],
+                        kernels_within.append({
+                            'name': kernel.get('name', ''),
+                            'dur_us': kernel_dur_us
+                        })
+
+                        # Check if it's a communication kernel
+                        if 'nccl' in kernel_name:
+                            if 'allgather' in kernel_name:
+                                comm_kernels['all_gather'].append(kernel_dur_us)
+                            elif 'allreduce' in kernel_name:
+                                comm_kernels['all_reduce'].append(kernel_dur_us)
+                        elif 'cross_device_reduce' in kernel_name:
+                            comm_kernels['all_reduce'].append(kernel_dur_us)
+                            
+            exec_model['kernels_within'] = kernels_within
+            exec_model['comm_kernels'] = comm_kernels
+
+        execute_context_events.sort(key=lambda x: x['ts'])  # Ensure execute_model events are in chronological order
+        for i, exec_model in enumerate(execute_context_events):
+            start_ts = exec_model['ts']
+            end_ts = start_ts + exec_model['dur']
+            comm_kernels = exec_model.get('comm_kernels', {'all_gather': [], 'all_reduce': []})
+            kernels_within = exec_model.get('kernels_within', [])
+            
+            for comm_kernel in comm_kernel_events:
+                if comm_kernel['ts'] >= end_ts and comm_kernel['ts'] < execute_context_events[i+1]['ts'] if i+1 < len(execute_context_events) else True:
+                    if 'all_gather' in comm_kernel['name'].lower() or 'allgather' in comm_kernel['name'].lower():
+                        comm_kernels['all_gather'].append(comm_kernel['dur'])
+                        comm_kernel_events.remove(comm_kernel)  # Remove to avoid double counting
+ 
+
+            # Calculate statistics
+            total_kernel_time_us = sum(k['dur_us'] for k in kernels_within)
+            total_comm_kernel_time_us = (sum(comm_kernels['all_gather']) +
+                                        sum(comm_kernels['all_reduce']))
+
+            exec_stats = {
+                'duration_ms': exec_model['dur'] / 1000,
+                'total_kernel_time_ms': total_kernel_time_us / 1000,
+                'computation_kernel_time_ms': (total_kernel_time_us - total_comm_kernel_time_us) / 1000,
+                'communication_kernel_time_ms': total_comm_kernel_time_us / 1000,
+                'kernel_count': len(kernels_within),
+                'communication': {
+                    'all_gather': {
+                        'count': len(comm_kernels['all_gather']),
+                        'total_ms': sum(comm_kernels['all_gather']) / 1000,
+                        'median_ms': np.median(comm_kernels['all_gather']) / 1000 if comm_kernels['all_gather'] else 0,
+                    },
+                    'all_reduce': {
+                        'count': len(comm_kernels['all_reduce']),
+                        'total_ms': sum(comm_kernels['all_reduce']) / 1000,
+                        'median_ms': np.median(comm_kernels['all_reduce']) / 1000 if comm_kernels['all_reduce'] else 0,
+                    },
+                    'comm_kernel_ratio': total_comm_kernel_time_us / total_kernel_time_us if total_kernel_time_us > 0 else 0,
+                }
             }
-        if gpu_times['decode']:
-            result['decode'] = {
-                'mean': np.mean(gpu_times['decode']),
-                'median': np.median(gpu_times['decode']),
-                'min': np.min(gpu_times['decode']),
-                'max': np.max(gpu_times['decode']),
-                'count': len(gpu_times['decode']),
-                'values': gpu_times['decode'],
-            }
+
+            execute_model_stats.append(exec_stats)
+
+        # Add module-to-kernel analysis
+        try:
+            module_total_latencies = analyze_module_to_kernel_from_trace(trace_path)
+            module_position_analysis = compute_median_latencies_by_position(module_total_latencies)
+        except Exception as e:
+            print(f"  ⚠ Warning: Module analysis failed: {e}")
+            module_total_latencies = {}
+            module_position_analysis = {}
+
+        # Calculate aggregate statistics
+        result = {
+            'execute_model_count': len(execute_model_stats),
+            'execute_model_details': execute_model_stats,
+            'module_latency': module_position_analysis
+        }
 
         return result
 
     except Exception as e:
-        print(f"  ⚠ Error parsing trace: {e}")
+        print(f"  ⚠ Error analyzing execute_model: {e}")
+        import traceback
+        traceback.print_exc()
         return {}
 
 
-def create_test_cases() -> List[Tuple[str, Dict]]:
-    """Create test configurations matching DoolySim tests."""
+def load_batch_config_from_json(json_path: str) -> Tuple[str, Dict]:
+    """Load batch configuration from JSON file compatible with batch_predictor.py.
 
-    return [
-        ("Single Prefill 32", {
-            'prompt_lens': [32],
-            'output_lens': [1],
-            'description': 'Single 8-token prefill + 1 decode'
-        }),
+    Args:
+        json_path: Path to JSON configuration file
 
-        ("Batch of 4 Prefill 32", {
-            'prompt_lens': [8, 8, 8, 8],
-            'output_lens': [1, 1, 1, 1],
-            'description': 'Multiple 8-token prefill + 1 decode'
-        }),
+    Returns:
+        Tuple of (test_name, config_dict) compatible with measure_batch_request
+    """
+    with open(json_path, 'r') as f:
+        data = json.load(f)
 
-        # ("Single Prefill 3072", {
-        #     'prompt_lens': [3072],
-        #     'output_lens': [1],
-        #     'description': 'Single 3072-token prefill + 1 decode'
-        # }),
+    # Extract prompt lengths and output lengths from the JSON format
+    prompt_lens = []
+    output_lens = []
+    
+    
+    # Process prefill requests
+    if 'prefill_requests' in data:
+        for req in data['prefill_requests']:
+            tokens = req.get('tokens', req.get('num_tokens', 0))
+            # For prefill requests, we'll generate a small number of tokens
+            # This simulates the prefill -> first decode token transition
+            prompt_lens.append(tokens)
+            output_lens.append(1)  # Default to 1 token output for prefill
 
-        # ("Single Prefill 512", {
-        #     'prompt_lens': [512],
-        #     'output_lens': [1],
-        #     'description': 'Single 512-token prefill + 1 decode'
-        # }),
+    # Process decode requests
+    # For decode requests in the JSON, we interpret them as requests that have
+    # already completed prefill and need to generate additional tokens
+    if 'decode_requests' in data:
+        for req in data['decode_requests']:
+            if isinstance(req, dict):
+                kv_cache = req.get('kv_cache', req.get('kv_cache_size', 0))
+            else:
+                kv_cache = int(req)
+            # For decode requests, the "prompt" is the KV cache size
+            # and we generate a configurable number of output tokens
+            prompt_lens.append(kv_cache)
+            # Use a default output length or from config
+            output_lens.append(data.get('default_output_len', 32))
 
-        # ("Batch Prefill", {
-        #     'prompt_lens': [128, 256, 512],
-        #     'output_lens': [1, 1, 1],
-        #     'description': '3 prefill requests'
-        # }),
+    # Create test name from description or filename
+    test_name = data.get('description', Path(json_path).stem)
 
-        # ("Single Prefill Short", {
-        #     'prompt_lens': [32],
-        #     'output_lens': [1],
-        #     'description': 'Single request with 32 output tokens'
-        # }),
+    # Build config in the format expected by measure_batch_request
+    config = {
+        'prompt_lens': prompt_lens,
+        'output_lens': output_lens,
+        'description': f"Loaded from {json_path}: {len(prompt_lens)} requests",
+    }
 
-        # ("Batch Decode", {
-        #     'prompt_lens': [256, 512, 768, 1024],
-        #     'output_lens': [32, 32, 32, 32],
-        #     'description': '4 decode requests (32 token each)'
-        # }),
-    ]
+    # Add metadata if present
+    if 'model' in data:
+        config['model'] = data['model']
+    if 'backend' in data:
+        config['backend'] = data['backend']
+    if 'tensor_parallel_size' in data:
+        config['tensor_parallel_size'] = data['tensor_parallel_size']
 
+    return test_name, config
 
 def main():
     """Main measurement entry point."""
@@ -616,251 +815,103 @@ def main():
                        help='Model to benchmark')
     parser.add_argument('--warmup', type=int, default=3,
                        help='Number of warmup iterations')
-    parser.add_argument('--iterations', type=int, default=10,
+    parser.add_argument('--iterations', type=int, default=1,
                        help='Number of measurement iterations')
     parser.add_argument('--output', type=str, default='vllm_measurements.json',
                        help='Output JSON file')
     parser.add_argument('--gpu-memory', type=float, default=0.9,
                        help='GPU memory utilization')
+    parser.add_argument('--batch-config', type=str,
+                       help='Load batch configuration from JSON file (compatible with batch_predictor.py)')
+    parser.add_argument('--tensor-parallel-size', type=int, default=2,
+                       help='Tensor parallel size')
+    parser.add_argument('--attention-backend', type=str, default='FLASHINFER',
+                       help='Attention backend (FLASHINFER or FLASH_ATTN)')
+    parser.add_argument('--max-model-len', type=int, default=8192,
+                       help='Maximum model sequence length')
+    parser.add_argument('--max-num-seqs', type=int, default=32,
+                       help='Maximum number of sequences')
+    parser.add_argument('--out-dir', type=str, default='./result/')
     args = parser.parse_args()
 
     print("=" * 80)
     print("DIRECT VLLM LATENCY MEASUREMENT")
     print("=" * 80)
-    print(f"Model:       {args.model}")
-    print(f"Warmup:      {args.warmup}")
-    print(f"Iterations:  {args.iterations}")
-    print(f"Output:      {args.output}")
+    print(f"Model:               {args.model}")
+    print(f"Warmup:              {args.warmup}")
+    print(f"Iterations:          {args.iterations}")
+    print(f"Output:              {args.output}")
+    print(f"Tensor Parallel:     {args.tensor_parallel_size}")
+    print(f"Attention Backend:   {args.attention_backend}")
+    print(f"Max Model Len:       {args.max_model_len}")
+    if args.batch_config:
+        print(f"Batch Config File:   {args.batch_config}")
     print("=" * 80)
     print()
 
     # Initialize vLLM
     print("Initializing vLLM (this may take a minute)...")
+    test_name, config = load_batch_config_from_json(args.batch_config)
+
+    # Load original config data for JSON output
+    with open(args.batch_config, 'r') as f:
+        original_config = json.load(f)
+
+    model = config.get('model', args.model)
+    backend = config.get('backend', args.attention_backend)
+    tp = config.get('tensor_parallel_size', args.tensor_parallel_size)
+
     llm = LLM(
-        model=args.model,
-        gpu_memory_utilization=0.9,
-        max_num_seqs=32,
-        max_model_len=8192,
-        max_num_batched_tokens=8192,
+        model=model,
+        dtype="bfloat16",  # Ensure consistent dtype with Dooly
+        attention_backend=backend,
+        tensor_parallel_size=tp,
+        gpu_memory_utilization=args.gpu_memory,
+        max_num_seqs=args.max_num_seqs,
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_model_len,
         load_format="dummy",
+        enforce_eager=True,
         enable_prefix_caching=False,
-        disable_log_stats=False,
-        enforce_eager=False,  # Disable CUDA graphs for accurate timing
-        attention_backend="FLASHINFER",
         profiler_config={
             'profiler': 'torch',
             'torch_profiler_dir': './vllm_profiles',
             'torch_profiler_use_gzip': False,
             'torch_profiler_with_stack': True,
+            'torch_profiler_record_shapes': True,
         },
     )
-    print("✓ vLLM initialized\n")
 
-    # Run tests
-    test_cases = create_test_cases()
-    all_results = []
+    result = measure_batch_request(
+        llm=llm,
+        batch_config=config,
+        warmup=args.warmup,
+        iterations=args.iterations,
+        profile_dir='./vllm_profiles'
+    )
 
-    for test_name, config in test_cases:
-        print("=" * 80)
-        print(f"TEST: {test_name}")
-        print("=" * 80)
-        print(f"Config: {config['description']}")
-        print(f"Prompts: {config['prompt_lens']}")
-        print(f"Outputs: {config['output_lens']}")
-        print()
+    # Create output directory if it doesn't exist
+    import os
+    os.makedirs(args.out_dir, exist_ok=True)
 
-        print(f"Measuring... (warmup={args.warmup}, iterations={args.iterations})")
-        result = measure_batch_request(
-            llm=llm,
-            batch_config=config,
-            warmup=args.warmup,
-            iterations=args.iterations,
-            profile_dir='./vllm_profiles'
-        )
-
-        stats = result['per_request_ttft']
-        print(f"\n TTFT (vLLM Official Timed Metrics):")
-        print(f"  Mean:   {stats['mean']:.3f} ± {stats['std']:.3f} ms")
-        print(f"  Median: {stats['median']:.3f} ms")
-        print(f"  Min:    {stats['min']:.3f} ms")
-        print(f"  Max:    {stats['max']:.3f} ms")
-        print(f"  P95:    {stats['p95']:.3f} ms")
-        print(f"  P99:    {stats['p99']:.3f} ms")
-        
-        stats = result['per_request_itl']
-        print(f"\n ITL (Inter-Token Latency):")
-        print(f"  Mean:   {stats['mean']:.3f} ± {stats['std']:.3f} ms")
-        print(f"  Median: {stats['median']:.3f} ms")
-        print(f"  Min:    {stats['min']:.3f} ms")
-        print(f"  Max:    {stats['max']:.3f} ms")
-        print(f"  P95:    {stats['p95']:.3f} ms")
-        print(f"  P99:    {stats['p99']:.3f} ms")
-        
-        # Display GPU times from trace
-        if result.get('gpu_times'):
-            num_prefills = result.get('num_prefills')
-            gpu_times = result['gpu_times']
-            print(f"\nGPU execution time (from trace gpu_user_annotation):")
-            if 'prefill' in gpu_times:
-                prefill = gpu_times['prefill']
-                print(f"  Number of GPU forward passes detected: {prefill['count']}")
-                print(f"  Individual GPU times: {[f'{t:.3f}ms' for t in prefill['values']]}")
-                print(f"  Prefill mean:   {prefill['mean']:.3f} ms")
-                print(f"  Prefill median: {prefill['median']:.3f} ms")
-                print(f"  Prefill range:  {prefill['min']:.3f} - {prefill['max']:.3f} ms")
-                if prefill['count'] > 1:
-                    print(f"  ⚠ Note: Multiple batches detected - requests were NOT all batched together!")
-            if 'decode' in gpu_times:
-                decode = gpu_times['decode']
-                print(f"  Decode mean:    {decode['mean']:.3f} ms ({decode['count']} samples)")
-
-            # Calculate overhead
-            if 'prefill' in gpu_times:
-                gpu_mean = gpu_times['prefill']['mean'] * result['num_prefills']
-                wall_clock_mean = stats['mean']
-                overhead_ms = wall_clock_mean - gpu_mean
-                overhead_pct = (overhead_ms / gpu_mean) * 100
-                print(f"\nOverhead analysis:")
-                print(f"  GPU time:      {gpu_mean:.3f} ms (what your profiler captures)")
-                print(f"  Wall-clock:    {wall_clock_mean:.3f} ms (what client measures)")
-                print(f"  Overhead:      {overhead_ms:.3f} ms ({overhead_pct:+.1f}%)")
-                print(f"  Calibration:   multiply GPU predictions by {wall_clock_mean/gpu_mean:.3f}x")
-
-        print()
-
-        all_results.append({
-            'test_name': test_name,
-            **result
-        })
-
-    # Save results
-    print("=" * 80)
-    print("SAVING RESULTS")
-    print("=" * 80)
-
+    # Create JSON output in the same format as batch_predictor.py
     output_data = {
-        'model': args.model,
-        'config': {
-            'warmup': args.warmup,
-            'iterations': args.iterations,
-            'gpu_memory_utilization': args.gpu_memory,
+        'model': model,
+        'backend': backend,
+        'tensor_parallel_size': tp,
+        'topology': 'mew1',  # Default topology
+        'batch_config': {
+            'prefill_requests': original_config.get('prefill_requests', []),
+            'decode_requests': original_config.get('decode_requests', []),
         },
-        'results': all_results,
+        'results': result
     }
 
-    with open(args.output, 'w') as f:
+    output_file = os.path.join(args.out_dir, args.output)
+    with open(output_file, 'w') as f:
         json.dump(output_data, f, indent=2)
 
-    print(f"✓ Results saved to {args.output}")
-
-    # Also save in vllm_raw.json compatible format for each test
-    from datetime import datetime
-    date_str = datetime.now().strftime("%Y%m%d-%H%M%S")
-
-    for result in all_results:
-        test_name = result['test_name'].replace(' ', '_').lower()
-        compatible_filename = args.output.replace('.json', f'_{test_name}_vllm_compatible.json')
-
-        if 'vllm_benchmark_data' not in result:
-            print(f"  ⚠ Skipping {test_name}: no vLLM benchmark data available")
-            continue
-
-        bench_data = result['vllm_benchmark_data']
-        metrics = bench_data['metrics']
-        outputs = bench_data['outputs']
-
-        # Create vllm_raw.json compatible format
-        vllm_compatible_data = {
-            'date': date_str,
-            'endpoint_type': 'vllm',
-            'backend': 'vllm',
-            'label': result['test_name'],
-            'model_id': args.model,
-            'tokenizer_id': args.model,
-            'num_prompts': result.get('num_prefills', 1),
-            'request_rate': 'inf',
-            'burstiness': 1.0,
-            'max_concurrency': None,
-            'duration': result.get('stats', {}).get('mean', 0) / 1000.0,
-            'completed': metrics['completed'],
-            'failed': metrics['failed'],
-            'total_input_tokens': metrics['total_input'],
-            'total_output_tokens': metrics['total_output'],
-            'request_throughput': metrics['request_throughput'],
-            'request_goodput': metrics['request_goodput'],
-            'output_throughput': metrics['output_throughput'],
-            'total_token_throughput': metrics['total_token_throughput'],
-            'input_lens': result.get('prompt_lens', []),
-            'output_lens': outputs['output_tokens'],
-            'ttfts': outputs['ttfts'],
-            'itls': outputs['itls'],
-            'start_times': outputs['start_times'],
-            'generated_texts': outputs['generated_texts'],
-            'errors': outputs['errors'],
-            'max_output_tokens_per_s': metrics['max_output_tokens_per_s'],
-            'max_concurrent_requests': metrics['max_concurrent_requests'],
-            'rtfx': metrics['rtfx'],
-            'mean_ttft_ms': metrics['mean_ttft_ms'],
-            'median_ttft_ms': metrics['median_ttft_ms'],
-            'std_ttft_ms': metrics['std_ttft_ms'],
-            'p99_ttft_ms': dict(metrics['percentiles_ttft_ms']).get(99.0, 0.0),
-            'mean_tpot_ms': metrics['mean_tpot_ms'],
-            'median_tpot_ms': metrics['median_tpot_ms'],
-            'std_tpot_ms': metrics['std_tpot_ms'],
-            'p99_tpot_ms': dict(metrics['percentiles_tpot_ms']).get(99.0, 0.0),
-            'mean_itl_ms': metrics['mean_itl_ms'],
-            'median_itl_ms': metrics['median_itl_ms'],
-            'std_itl_ms': metrics['std_itl_ms'],
-            'p99_itl_ms': dict(metrics['percentiles_itl_ms']).get(99.0, 0.0),
-        }
-
-        with open(compatible_filename, 'w') as f:
-            json.dump(vllm_compatible_data, f, indent=2)
-
-        print(f"✓ vLLM-compatible format saved to {compatible_filename}")
-
-    print()
-
-    # Print summary table
-    print("=" * 80)
-    print("SUMMARY")
-    print("=" * 80)
-    print(f"{'Test Name':<25} {'Mean (ms)':>12} {'Std (ms)':>12} {'Median (ms)':>12} {'GPU Prefill Mean':>20} {'GPU Prefill Median':>20}")
-    print("-" * 80)
-
-    print("TTFT (Time to First Token):")
-
-    
-    
-    for result in all_results:
-        stats = result['per_request_ttft']
-        num_prefills = result.get('num_prefills')
-        gpu_times = result['gpu_times']
-   
-        print(f"{result['test_name']:<25} "
-              f"{stats['mean'] :>12.3f} "
-            #   f"{stats['mean'] - 10:>12.3f} "
-              f"{stats['std']:>12.3f} "
-              f"{stats['median']:>12.3f} "
-            #   f"{stats['median'] - 10:>12.3f} "
-              f"{gpu_times['prefill']['mean']:>12.3f} ms (GPU) "
-              f"{gpu_times['prefill']['median']:>12.3f} ms (GPU)")
-
-    print("ITL (Inter-Token Latency):")
-    for result in all_results:
-        gpu_times = result['gpu_times']
-        stats = result['per_request_itl']
-        gpu_decode_str = ""
-        if 'decode' in gpu_times:
-            gpu_decode_str = f"{gpu_times['decode']['mean']:>12.3f} ms (GPU) {gpu_times['decode']['median']:>12.3f} ms (GPU)"
-        print(f"{result['test_name']:<25} "
-              f"{stats['mean']:>12.3f} "
-              f"{stats['std']:>12.3f} "
-              f"{stats['median']:>12.3f} "
-              f"{gpu_decode_str}"
-        )
-    print("=" * 80)
-
+    print(f"Results saved to {output_file}")
 
 if __name__ == "__main__":
     main()

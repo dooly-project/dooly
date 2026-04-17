@@ -291,6 +291,7 @@ class DoolySim:
                     step_id=step_id,
                     sim_time_ms=sim_time_ms,
                     elapsed_time_ms=self.step_duration_ms,
+                    processed_reqs=engine_outputs.keys(),
                     num_scheduled_new=len(sched_output.scheduled_new_reqs),
                     num_scheduled_cached=sched_output.scheduled_cached_reqs.num_reqs,
                     total_tokens_scheduled=sched_output.total_num_scheduled_tokens,

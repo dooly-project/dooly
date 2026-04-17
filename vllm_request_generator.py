@@ -58,9 +58,12 @@ def generate_vllm_requests_from_instance(
     print(f"Generated {len(vllm_requests)} requests")
 
     # Generate arrival times using Poisson process
-    rng = np.random.default_rng(seed)
-    inter_arrival_times = rng.exponential(scale=1.0 / arrival_rate, size=num_requests)
-    arrival_times = np.cumsum(inter_arrival_times)
+    if arrival_rate > 0:
+        rng = np.random.default_rng(seed)
+        inter_arrival_times = rng.exponential(scale=1.0 / arrival_rate, size=num_requests)
+        arrival_times = np.cumsum(inter_arrival_times)
+    elif arrival_rate == 0:
+        arrival_times = np.zeros(num_requests)
 
     # Convert to DoolySim format
     dooly_requests = []
@@ -92,6 +95,8 @@ def generate_sharegpt_requests_from_instance(
     num_requests: int,
     arrival_rate: float,
     sharegpt_path: str,
+    min_input_len: int | None = None,
+    max_input_len: int | None = None,
     custom_output_len: int | None = None,
     seed: int = 42,
 ) -> Tuple[List[Request], List[SampleRequest]]:
@@ -121,17 +126,24 @@ def generate_sharegpt_requests_from_instance(
     vllm_requests = dataset.sample(
         tokenizer=tokenizer,
         num_requests=num_requests,
+        min_input_len=min_input_len,
+        max_input_len=max_input_len,
         output_len=custom_output_len,
         request_id_prefix="req_",
     )
 
+    print(vllm_requests)
+
     print(f"Sampled {len(vllm_requests)} requests from ShareGPT")
 
     # Generate arrival times using Poisson process
-    rng = np.random.default_rng(seed)
-    inter_arrival_times = rng.exponential(scale=1.0 / arrival_rate, size=len(vllm_requests))
-    arrival_times = np.cumsum(inter_arrival_times)
-
+    if arrival_rate > 0.0:
+        rng = np.random.default_rng(seed)
+        inter_arrival_times = rng.exponential(scale=1.0 / arrival_rate, size=len(vllm_requests))
+        arrival_times = np.cumsum(inter_arrival_times)
+    else:
+        arrival_times = np.zeros(len(vllm_requests)) 
+        
     # Convert to DoolySim format
     dooly_requests = []
     for i, vllm_req in enumerate(vllm_requests):
@@ -260,15 +272,20 @@ def export_vllm_dataset_jsonl(
 
 if __name__ == "__main__":
     # Test the generator
-    dooly_reqs, vllm_reqs = generate_vllm_requests(
-        model="meta-llama/Llama-3.1-8B",
-        num_requests=10,
-        arrival_rate=5.0,
-        input_len=1024,
-        output_len=128,
-        range_ratio=0.5,
-        seed=42,
-    )
+    # dooly_reqs, vllm_reqs = generate_vllm_requests(
+    #     model="meta-llama/Llama-3.1-8B",
+    #     num_requests=10,
+    #     arrival_rate=5.0,
+    #     input_len=1024,
+    #     output_len=128,
+    #     range_ratio=0.5,
+    #     seed=42,
+    # )
+
+
+    llm = LLM(model="meta-llama/Llama-3.1-8B", load_format="dummy", enforce_eager=True)
+
+    dooly_reqs, vllm_reqs = generate_sharegpt_requests_from_instance(llm, 100, 1.0, "/home/jkim38/dooly/dataset/ShareGPT_V3_unfiltered_cleaned_split.json", 1024, 2048)
 
     print("\nSample DoolySim request:")
     print(f"  ID: {dooly_reqs[0].request_id}")

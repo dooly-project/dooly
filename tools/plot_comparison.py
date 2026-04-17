@@ -38,11 +38,13 @@ def extract_metric(data: dict, metric: str) -> List[float]:
         # Convert to ms if needed
         if values and values[0] < 1:  # Likely in seconds
             values = [v * 1000 for v in values]
-        return values
+        return values[5:] # Skip first 5 tokens to avoid startup overhead 
 
     elif metric == 'itl':
         # ITLs are list of lists (one list per request)
         itls = data.get('itls', [])
+        # Get the first 5
+        itls = itls[5:]
         # Flatten all ITLs into single list
         all_itls = []
         for itl_list in itls:
@@ -241,24 +243,43 @@ def calculate_stats(dooly_file, vllm_file):
         summary_values[metric] = {}
         for model in ['dooly', 'vllm']:
             if model == 'dooly':
-                source = dooly_values            
+                source = dooly_values
             else:
                 source = vllm_values
-                
+
             if metric in ['ttft', 'itl']:
                 summary_values[metric][model] = {}
-                summary_values[metric][model]['p50'] = np.percentile(source[metric], 50)
-                summary_values[metric][model]['p95'] = np.percentile(source[metric], 95)
-                summary_values[metric][model]['p99'] = np.percentile(source[metric], 99)
+                # Check if the metric has any data before calculating percentiles
+                if source[metric] and len(source[metric]) > 0:
+                    summary_values[metric][model]['p50'] = np.percentile(source[metric], 50)
+                    summary_values[metric][model]['p95'] = np.percentile(source[metric], 95)
+                    summary_values[metric][model]['p99'] = np.percentile(source[metric], 99)
+                else:
+                    # Handle empty data case
+                    summary_values[metric][model]['p50'] = 0
+                    summary_values[metric][model]['p95'] = 0
+                    summary_values[metric][model]['p99'] = 0
             else:
                 summary_values[metric][model] = source[metric]
-        
+
         if metric in ['ttft', 'itl']:
-            summary_values[metric]['p50_perc_diff'] = (summary_values[metric]['dooly']['p50'] - summary_values[metric]['vllm']['p50'])/summary_values[metric]['vllm']['p50'] * 100
-            summary_values[metric]['p95_perc_diff'] = (summary_values[metric]['dooly']['p95'] - summary_values[metric]['vllm']['p95'])/summary_values[metric]['vllm']['p95'] * 100
-            summary_values[metric]['p99_perc_diff'] = (summary_values[metric]['dooly']['p99'] - summary_values[metric]['vllm']['p99'])/summary_values[metric]['vllm']['p99'] * 100
+            # Only calculate percentage differences if both models have data
+            if (summary_values[metric]['vllm']['p50'] > 0 and
+                summary_values[metric]['dooly']['p50'] > 0):
+                summary_values[metric]['p50_perc_diff'] = (summary_values[metric]['dooly']['p50'] - summary_values[metric]['vllm']['p50'])/summary_values[metric]['vllm']['p50'] * 100
+                summary_values[metric]['p95_perc_diff'] = (summary_values[metric]['dooly']['p95'] - summary_values[metric]['vllm']['p95'])/summary_values[metric]['vllm']['p95'] * 100
+                summary_values[metric]['p99_perc_diff'] = (summary_values[metric]['dooly']['p99'] - summary_values[metric]['vllm']['p99'])/summary_values[metric]['vllm']['p99'] * 100
+            else:
+                # Set to 0 if no data to compare
+                summary_values[metric]['p50_perc_diff'] = 0
+                summary_values[metric]['p95_perc_diff'] = 0
+                summary_values[metric]['p99_perc_diff'] = 0
         else:
-            summary_values[metric]['perc_diff'] = (summary_values[metric]['dooly'] - summary_values[metric]['vllm'])/summary_values[metric]['vllm'] * 100
+            # Handle division by zero for other metrics
+            if summary_values[metric]['vllm'] > 0:
+                summary_values[metric]['perc_diff'] = (summary_values[metric]['dooly'] - summary_values[metric]['vllm'])/summary_values[metric]['vllm'] * 100
+            else:
+                summary_values[metric]['perc_diff'] = 0
     return summary_values
 
 def plot_stats(stats: dict, output_dir: str = "."):

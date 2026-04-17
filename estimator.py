@@ -94,42 +94,67 @@ class SimplifiedExecutionTimeEstimator:
         """Load data from the results database."""
         conn = sqlite3.connect(self.config.db_path)
 
-        # Build query with optional filtering
-        # Note: Explicitly list r columns to avoid duplicate signature_hash
-        query = """
-            SELECT
-                r.id, r.mean_latency_ms, r.median_latency_ms, r.max_latency_ms,
-                r.min_latency_ms, r.std_latency_ms, r.num_tokens, r.num_requests,
-                r.is_context, r.is_prefill, r.kv_cache_size, r.prefill_chunk_size,
-                r.num_tensor_parallel_workers, r.input_shapes, r.created_at,
-                s.operation_name, s.signature_hash,
-                pm.model_name, pm.backend
-            FROM results r
-            JOIN signatures s ON r.signature_hash = s.signature_hash
-            JOIN model_operations mo ON s.operation_id = mo.operation_id
+        # First, get the list of operation signatures that should be trained for this model
+        model_ops_query = """
+            SELECT DISTINCT s.operation_name, s.signature_hash
+            FROM model_operations mo
+            JOIN signatures s ON s.operation_id = mo.operation_id
             JOIN profiled_models pm ON mo.model_id = pm.model_id
         """
 
-        where_conditions = []
-        params = []
+        model_where_conditions = []
+        model_params = []
 
         if self.config.model_name:
-            where_conditions.append("pm.model_name = ?")
-            params.append(self.config.model_name)
+            model_where_conditions.append("pm.model_name = ?")
+            model_params.append(self.config.model_name)
 
         if self.config.backend:
-            where_conditions.append("pm.backend = ?")
-            params.append(self.config.backend)
+            model_where_conditions.append("pm.backend = ?")
+            model_params.append(self.config.backend)
 
         if self.config.tp_size is not None:
-            where_conditions.append("pm.tp_degree = ?")
-            params.append(self.config.tp_size)
+            model_where_conditions.append("pm.tp_degree = ?")
+            model_params.append(self.config.tp_size)
 
-        if where_conditions:
-            query += " WHERE " + " AND ".join(where_conditions)
+        if model_where_conditions:
+            model_ops_query += " WHERE " + " AND ".join(model_where_conditions)
 
-        # Load results data with filtering
-        self.results_df = pd.read_sql_query(query, conn, params=params)
+        model_operations = pd.read_sql_query(model_ops_query, conn, params=model_params)
+        signature_list = model_operations['signature_hash'].tolist()
+        operation_counts = model_operations['operation_name'].value_counts()
+
+        print(f"Found {len(signature_list)} operation signatures for model:")
+        for op, count in operation_counts.items():
+            print(f"  {op}: {count} signatures")
+
+        # Now load ALL profiling data for these signatures (regardless of model/backend/tp)
+        # This gives us maximum training data for each operation signature
+        if not signature_list:
+            print("No operation signatures found for the specified model configuration")
+            self.results_df = pd.DataFrame()
+        else:
+            query = """
+                SELECT
+                    r.id, r.mean_latency_ms, r.median_latency_ms, r.max_latency_ms,
+                    r.min_latency_ms, r.std_latency_ms, r.num_tokens, r.num_requests,
+                    r.is_context, r.is_prefill, r.kv_cache_size, r.prefill_chunk_size,
+                    r.num_tensor_parallel_workers, r.input_shapes, r.created_at,
+                    s.operation_name, s.signature_hash,
+                    pm.model_name, pm.backend
+                FROM results r
+                JOIN signatures s ON r.signature_hash = s.signature_hash
+                JOIN model_operations mo ON s.operation_id = mo.operation_id
+                JOIN profiled_models pm ON mo.model_id = pm.model_id
+                WHERE s.signature_hash IN ({})
+            """.format(','.join('?' * len(signature_list)))
+
+            # Load results data for these signatures from ALL models/backends/tp
+            self.results_df = pd.read_sql_query(query, conn, params=signature_list)
+
+            print(f"Loaded training data:")
+            for (op, sig), group_df in self.results_df.groupby(['operation_name', 'signature_hash']):
+                print(f"  {op} ({sig[:8]}): {len(group_df)} samples")
 
         # Load collective communication data if enabled
         if self.config.train_comm_models:
@@ -174,24 +199,64 @@ class SimplifiedExecutionTimeEstimator:
                 return
 
             # Build query with optional filtering
-            query = "SELECT * FROM coll_op_results WHERE 1=1"
+            # Join with model_collective_configs to get model_config_dim for num_tokens calculation
+            query = """
+                SELECT DISTINCT cor.*,
+                       mcc.model_config_dim,
+                       mcc.batch_param
+                FROM coll_op_results cor
+                LEFT JOIN coll_ops co ON (
+                    cor.operation = co.operation_name
+                    AND cor.topology = co.topology
+                    AND cor.tp_size = co.tp_degree
+                    AND (cor.dim_param = co.dim_param OR (cor.dim_param IS NULL AND co.dim_param IS NULL))
+                    AND cor.num_dims = co.num_dims
+                )
+                LEFT JOIN model_collective_configs mcc ON co.collective_id = mcc.collective_id
+                WHERE 1=1
+            """
             params = []
 
             if self.config.tp_size is not None:
-                query += " AND tp_size = ?"
+                query += " AND cor.tp_size = ?"
                 params.append(self.config.tp_size)
 
             if self.config.topology is not None:
-                query += " AND topology = ?"
+                query += " AND cor.topology = ?"
                 params.append(self.config.topology)
 
             if self.config.collective_backend is not None:
-                query += " AND backend = ?"
+                query += " AND cor.backend = ?"
                 params.append(self.config.collective_backend)
 
             self.comm_df = pd.read_sql_query(query, conn, params=params)
 
             if len(self.comm_df) > 0:
+                # Calculate num_tokens from size_bytes and model_config_dim
+                # Map dtype to bytes
+                dtype_to_bytes = {
+                    'float32': 4,
+                    'float16': 2,
+                    'bfloat16': 2,
+                    'int64': 8,
+                    'int32': 4,
+                    'int8': 1,
+                }
+
+                def calculate_num_tokens(row):
+                    if pd.isna(row.get('model_config_dim')) or row.get('model_config_dim', 0) == 0:
+                        # Fallback: use a default model dimension if not found
+                        # This might happen for operations not in model_collective_configs
+                        model_config_dim = 4096  # Default for Llama models
+                    else:
+                        model_config_dim = row['model_config_dim']
+
+                    dtype_bytes = dtype_to_bytes.get(row.get('dtype', 'bfloat16'), 2)  # Default to 2 bytes
+                    num_tokens = row['size_bytes'] / (model_config_dim * dtype_bytes)
+                    return int(num_tokens)
+
+                self.comm_df['num_tokens'] = self.comm_df.apply(calculate_num_tokens, axis=1)
+
                 # New schema uses dim_param and num_dims
                 # Check for legacy columns and handle accordingly
                 if 'num_dims' not in self.comm_df.columns:
@@ -350,53 +415,52 @@ class SimplifiedExecutionTimeEstimator:
                 self._train_comm_models()
             else:
                 print("Warning: train_comm_only is set but train_comm_models is False")
-            print(f"\n=== Training Complete: {len(self.models)} models trained ===")
-            return
+                return
+        else:
+            print("\n=== Training or Loading Models for All Operation Signatures ===")
 
-        print("\n=== Training or Loading Models for All Operation Signatures ===")
+            # Note: operation_groups now returns (operation_name, signature_hash), group_df
+            for (operation_name, sig_hash), group_df in self.operation_groups:
+                # Create a unique model name that includes signature hash (first 8 chars)
+                sig_short = sig_hash[:8]
+                model_key = f"{operation_name}_{sig_short}"
 
-        # Note: operation_groups now returns (operation_name, signature_hash), group_df
-        for (operation_name, sig_hash), group_df in self.operation_groups:
-            # Create a unique model name that includes signature hash (first 8 chars)
-            sig_short = sig_hash[:8]
-            model_key = f"{operation_name}_{sig_short}"
+                print(f"\nProcessing: {operation_name} (sig: {sig_short}, {len(group_df)} samples)")
 
-            print(f"\nProcessing: {operation_name} (sig: {sig_short}, {len(group_df)} samples)")
+                # Check if this is a context operation
+                is_context = group_df['is_context'].iloc[0] if 'is_context' in group_df else False
 
-            # Check if this is a context operation
-            is_context = group_df['is_context'].iloc[0] if 'is_context' in group_df else False
+                # Special handling for context operations - split prefill and decode
+                if is_context and 'is_prefill' in group_df.columns:
+                    # Get unique values of is_prefill
+                    prefill_values = group_df['is_prefill'].unique()
 
-            # Special handling for context operations - split prefill and decode
-            if is_context and 'is_prefill' in group_df.columns:
-                # Get unique values of is_prefill
-                prefill_values = group_df['is_prefill'].unique()
+                    if len(prefill_values) > 1:
+                        # We have both prefill and decode data
+                        prefill_df = group_df[group_df['is_prefill'] == 1.0].copy()
+                        decode_df = group_df[group_df['is_prefill'] == 0.0].copy()
 
-                if len(prefill_values) > 1:
-                    # We have both prefill and decode data
-                    prefill_df = group_df[group_df['is_prefill'] == 1.0].copy()
-                    decode_df = group_df[group_df['is_prefill'] == 0.0].copy()
+                        # Train separate models with signature hash included
+                        if len(prefill_df) >= 5:
+                            prefill_model_name = f"{operation_name}_prefill_{sig_short}"
+                            self._train_operation_model(prefill_model_name, prefill_df)
+                            # Mark as context operation
+                            self.operation_is_context[prefill_model_name] = True
 
-                    # Train separate models with signature hash included
-                    if len(prefill_df) >= 5:
-                        prefill_model_name = f"{operation_name}_prefill_{sig_short}"
-                        self._train_operation_model(prefill_model_name, prefill_df)
-                        # Mark as context operation
-                        self.operation_is_context[prefill_model_name] = True
+                        if len(decode_df) >= 5:
+                            decode_model_name = f"{operation_name}_decode_{sig_short}"
+                            self._train_operation_model(decode_model_name, decode_df)
+                            # Mark as context operation
+                            self.operation_is_context[decode_model_name] = True
 
-                    if len(decode_df) >= 5:
-                        decode_model_name = f"{operation_name}_decode_{sig_short}"
-                        self._train_operation_model(decode_model_name, decode_df)
-                        # Mark as context operation
-                        self.operation_is_context[decode_model_name] = True
+                        continue  # Skip the unified model
 
-                    continue  # Skip the unified model
+                # Train unified model for this operation signature
+                self._train_operation_model(model_key, group_df)
 
-            # Train unified model for this operation signature
-            self._train_operation_model(model_key, group_df)
-
-        # Train collective communication models if enabled
-        if self.config.train_comm_models:
-            self._train_comm_models()
+            # Train collective communication models if enabled
+            if self.config.train_comm_models:
+                self._train_comm_models()
 
         print(f"\n=== Training Complete: {len(self.models)} models trained ===")
 
@@ -453,6 +517,7 @@ class SimplifiedExecutionTimeEstimator:
             return None
 
         cache_file = os.path.join(self.config.cache_dir, f"{model_name}_{model_hash}.pkl")
+        print(cache_file)
 
         if not os.path.exists(cache_file):
             return None
@@ -519,9 +584,8 @@ class SimplifiedExecutionTimeEstimator:
             print(f"\nProcessing: {model_key} ({len(op_df)} samples)")
 
             # Determine feature based on operation type
-            # For now, use size_bytes as feature (we'll update this to use num_tokens/num_requests)
-            # TODO: Back-calculate num_tokens or num_requests from size_bytes
-            feature_cols = ['size_bytes']
+            # Use num_tokens as the feature instead of size_bytes
+            feature_cols = ['num_tokens']
             target_col = 'latency_ms'
 
             # Store metadata about what this operation uses
@@ -578,43 +642,40 @@ class SimplifiedExecutionTimeEstimator:
         operation_name: str,
         model: BaseEstimator,
         feature_cols: List[str],
-        dim_param: int,
+        dim_param: Optional[int],
         num_dims: int
     ):
         """
         Generate predictions for collective communication operations.
 
-        Uses features: size_bytes
+        Uses features: num_tokens
         Predictions are indexed by (size_bytes,) for lookup.
         """
-        # Calculate max size_bytes from max_tokens
-        # For float16: size_bytes = num_tokens * embedding_dim * 2
-        max_size_bytes = self.config.prediction_max_tokens * self.config.embedding_dim * 2
+        # Generate num_tokens range for prediction
+        min_tokens = 1
+        max_tokens = self.config.prediction_max_tokens
 
-        # Generate size_bytes range with exponential spacing
-        min_size = 1024  # 1KB minimum
-        num_size_points = 100  # Denser grid for better interpolation
+        # Create a range of num_tokens values with increment of 1
+        tokens_range = np.arange(min_tokens, max_tokens + 1, 1)
 
-        size_bytes_range = np.unique(
-            np.geomspace(min_size, max_size_bytes, num_size_points, dtype=int)
-        )
-
-        # Create prediction inputs
-        predictions_list = [{'size_bytes': size_bytes} for size_bytes in size_bytes_range]
+        # Create prediction inputs using num_tokens
+        predictions_list = [{'num_tokens': num_tokens} for num_tokens in tokens_range]
 
         # Create DataFrame and generate predictions
         X = pd.DataFrame(predictions_list)
         predictions = model.predict(X[feature_cols])
 
-        # Store predictions with size_bytes as key
+        # Store predictions with num_tokens as key
         pred_dict = {}
+
         for idx, row in X.iterrows():
-            key = int(row['size_bytes'])
-            pred_dict[key] = predictions[idx]
+            num_tokens = int(row['num_tokens'])
+            # Store by num_tokens directly
+            pred_dict[num_tokens] = predictions[idx]
 
         self.predictions[operation_name] = pred_dict
         print(f"    Generated {len(pred_dict)} predictions for {operation_name}")
-        print(f"      Size range: {min_size/1024:.1f}KB to {max_size_bytes/1024/1024:.1f}MB")
+        print(f"      Token range: {min_tokens} to {max_tokens} tokens")
 
     def _train_operation_model(self, operation_name: str, df: pd.DataFrame):
         """Train a model for a specific operation."""
@@ -914,135 +975,17 @@ class SimplifiedExecutionTimeEstimator:
 
         return pd.DataFrame(stats)
 
-    def get_predictor(
-        self,
-        kv_cache_granularity: int = 64,
-        attention_prefill_batching_overhead_fraction: float = 0.0,
-        attention_decode_batching_overhead_fraction: float = 0.0,
-    ):
-        """
-        Get an OperationTimePredictor instance using Vidur-style prediction.
-
-        Args:
-            kv_cache_granularity: Granularity for rounding KV cache sizes (default: 64)
-            attention_prefill_batching_overhead_fraction: Overhead when batching prefill (default: 0.0)
-            attention_decode_batching_overhead_fraction: Overhead when batching decode (default: 0.0)
-
-        Returns:
-            OperationTimePredictor instance
-        """
-        try:
-            from simulator.operation_time_predictor import OperationTimePredictor
-        except ImportError:
-            from operation_time_predictor import OperationTimePredictor
-
-        return OperationTimePredictor(
-            models=self.models,
-            predictions=self.predictions,
-            operation_is_context=self.operation_is_context,
-            kv_cache_granularity=kv_cache_granularity,
-            attention_prefill_batching_overhead_fraction=attention_prefill_batching_overhead_fraction,
-            attention_decode_batching_overhead_fraction=attention_decode_batching_overhead_fraction,
-        )
-
-    def validate_predictions(self, num_samples: int = 10):
-        """
-        Validate predictions against actual profiled data.
-
-        Args:
-            num_samples: Number of random samples to test per operation
-
-        Prints comparison of predicted vs actual latencies.
-        """
-        print("\n=== Prediction Validation ===")
-
-        for (operation_name, sig_hash), group_df in self.operation_groups:
-            sig_short = sig_hash[:8]
-            model_key = f"{operation_name}_{sig_short}"
-
-            # Check if we have a model for this operation signature
-            model_names = []
-            if model_key in self.models:
-                model_names.append(model_key)
-            if f"{operation_name}_prefill" in self.models:
-                model_names.append(f"{operation_name}_prefill")
-            if f"{operation_name}_decode" in self.models:
-                model_names.append(f"{operation_name}_decode")
-
-            if not model_names:
-                continue
-
-            print(f"\n{operation_name} (sig: {sig_short}):")
-
-            # For split operations (prefill/decode), test each separately
-            for model_name in model_names:
-                if '_prefill' in model_name:
-                    test_df = group_df[group_df['is_prefill'] == 1.0].copy()
-                elif '_decode' in model_name:
-                    test_df = group_df[group_df['is_prefill'] == 0.0].copy()
-                else:
-                    test_df = group_df.copy()
-
-                if len(test_df) == 0:
-                    continue
-
-                # Sample random rows
-                sample_size = min(num_samples, len(test_df))
-                samples = test_df.sample(n=sample_size, random_state=42)
-
-                # Get feature columns
-                feature_cols = self._get_feature_columns(samples)
-                if not feature_cols:
-                    continue
-
-                # Prepare features
-                X = samples[feature_cols].copy()
-                y_actual = samples['median_latency_ms'].values
-
-                # Get predictions
-                model = self.models[model_name]
-                y_pred = model.predict(X)
-
-                # Calculate errors
-                errors = np.abs((y_actual - y_pred) / y_actual) * 100
-                mape = np.mean(errors)
-
-                print(f"  {model_name}:")
-                print(f"    Tested {sample_size} samples, MAPE: {mape:.2f}%")
-                print(f"    Mean actual: {np.mean(y_actual):.4f} ms, Mean predicted: {np.mean(y_pred):.4f} ms")
-
-                # Show a few examples
-                for i in range(min(3, sample_size)):
-                    features_str = ", ".join([f"{col}={X.iloc[i][col]:.0f}" for col in feature_cols])
-                    print(f"      [{features_str}] → Actual: {y_actual[i]:.4f} ms, Predicted: {y_pred[i]:.4f} ms, Error: {errors[i]:.1f}%")
-
-
 def main(model_name=None, backend=None, db_path=None, cache_dir=None,
          max_tokens=16384, max_batch_size=32,
          train_comm=False, train_comm_only=False, tp_size=None, embedding_dim=4096,
          topology="DGX", collective_backend="NCCL"):
-    """
-    Train regression models and generate CSV prediction cache.
-
-    Args:
-        model_name: Optional model name to filter (e.g., "meta-llama/Llama-3.1-8B")
-        backend: Optional backend to filter (e.g., "FLASHINFER" or "FLASH_ATTN")
-        db_path: Optional database path (defaults to dooly_data.db)
-        cache_dir: Optional cache directory for models and CSV predictions
-        train_comm: Whether to train collective communication models
-        train_comm_only: Train ONLY comm models, skip operation models
-        tp_size: Tensor parallel size filter for comm data
-        embedding_dim: Model embedding dimension (for max size_bytes calculation)
-        topology: Network topology for collective operations (e.g., "DGX")
-        collective_backend: Collective communication backend (e.g., "NCCL")
-    """
 
     # Initialize estimator with optional filtering
     config = EstimatorConfig(
         cache_dir=cache_dir if cache_dir else "/home/jkim38/dooly/simulator/model_cache_v2",
         model_name=model_name,
         backend=backend,
-        db_path=db_path if db_path else "/home/jkim38/dooly/profiler/database/dooly_data.db",
+        db_path=db_path if db_path else "/home/jkim38/dooly/profiler/database/dooly.db",
         no_cache=False,
         train_comm_models=train_comm or train_comm_only,  # Enable if either flag is set
         train_comm_only=train_comm_only,
@@ -1071,110 +1014,6 @@ def main(model_name=None, backend=None, db_path=None, cache_dir=None,
     stats = estimator.get_operation_stats()
     print(stats.to_string())
 
-    # Validate predictions
-    estimator.validate_predictions(num_samples=5)
-
-    # Example predictions using OperationTimePredictor
-    print("\n=== Example Predictions (using OperationTimePredictor) ===")
-
-    # Get predictor instance
-    predictor = estimator.get_predictor(
-        kv_cache_granularity=64,
-        attention_prefill_batching_overhead_fraction=0.0,
-        attention_decode_batching_overhead_fraction=0.0,
-    )
-
-    # Try some simple predictions
-    comm_ops = [op for op in estimator.models.keys() if op in ['all_reduce', 'all_gather', 'reduce_scatter']]
-    regular_ops = [op for op in estimator.models.keys() if op not in comm_ops][:3]  # Limit to 3
-
-    for op_name in regular_ops:
-        print(f"\nOperation: {op_name}")
-
-        try:
-            if '_prefill' in op_name:
-                # Prefill example
-                pred = predictor.predict_simple(
-                    op_name,
-                    kv_cache_size=512,
-                    prefill_chunk_size=128
-                )
-                print(f"  Prefill (kv=512, chunk=128): {pred:.4f} ms")
-
-            elif '_decode' in op_name:
-                # Decode example
-                pred = predictor.predict_simple(
-                    op_name,
-                    batch_size=8,
-                    kv_cache_size=1024
-                )
-                print(f"  Decode (batch=8, kv=1024): {pred:.4f} ms")
-
-            else:
-                # Regular operation
-                pred = predictor.predict_simple(op_name, num_tokens=256)
-                print(f"  With 256 tokens: {pred:.4f} ms")
-
-        except Exception as e:
-            print(f"  Could not predict: {e}")
-
-    # Test collective communication operations with proper parameters
-    if comm_ops:
-        print("\n=== Collective Communication Predictions ===")
-        for op_name in comm_ops:
-            print(f"\nOperation: {op_name}")
-            try:
-                # Test with num_tokens (will be converted to size_bytes)
-                pred = estimator.predict(op_name, num_tokens=256)
-                print(f"  With 256 tokens (2MB): {pred:.4f} ms")
-
-                # Test with explicit size_bytes
-                pred = estimator.predict(op_name, size_bytes=1048576, ndim=1)
-                print(f"  With 1MB (1D tensor): {pred:.4f} ms")
-
-            except Exception as e:
-                print(f"  Could not predict: {e}")
-
-    # Demonstrate batch-aware prediction (Vidur-style)
-    print("\n=== Batch-aware Predictions (Vidur-style) ===")
-    try:
-        from operation_time_predictor import Batch, Request
-
-        # Create a sample batch with decode requests
-        batch = Batch(
-            requests=[
-                Request(num_processed_tokens=512, is_prefill_complete=True),
-                Request(num_processed_tokens=1024, is_prefill_complete=True),
-            ],
-            num_tokens=[1, 1],
-            size=2
-        )
-
-        # Find a decode attention operation
-        decode_ops = [op for op in estimator.models.keys() if '_decode' in op]
-        if decode_ops:
-            op_name = decode_ops[0]
-            pred = predictor.predict(op_name, batch)
-            print(f"{op_name} with batch (2 decode requests, avg kv=768): {pred:.4f} ms")
-
-        # Create a sample batch with prefill request
-        batch_prefill = Batch(
-            requests=[
-                Request(num_processed_tokens=0, is_prefill_complete=False),
-            ],
-            num_tokens=[128],
-            size=1
-        )
-
-        prefill_ops = [op for op in estimator.models.keys() if '_prefill' in op]
-        if prefill_ops:
-            op_name = prefill_ops[0]
-            pred = predictor.predict(op_name, batch_prefill)
-            print(f"{op_name} with batch (1 prefill request, chunk=128): {pred:.4f} ms")
-
-    except Exception as e:
-        print(f"Could not demonstrate batch-aware prediction: {e}")
-
     return estimator
 
 
@@ -1186,7 +1025,7 @@ if __name__ == "__main__":
                        help="Model name to filter (e.g., 'meta-llama/Llama-3.1-8B')")
     parser.add_argument("--backend", type=str, default=None,
                        help="Backend to filter (e.g., 'FLASHINFER' or 'FLASH_ATTN')")
-    parser.add_argument("--db-path", type=str, default="/home/jkim38/dooly/profiler/database/results.db", help="Path to SQLite database for results")
+    parser.add_argument("--db-path", type=str, default="/home/jkim38/dooly/profiler/database/dooly.db", help="Path to SQLite database for results")
     parser.add_argument("--cache-dir", type=str, default="/home/jkim38/dooly/simulator/cache", help="Directory for caching trained models")
     parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--max-token-count", type=int, default=16384)
@@ -1194,7 +1033,7 @@ if __name__ == "__main__":
     parser.add_argument("--train-comm-only", action="store_true", help="Train ONLY comm models, skip operation models")
     parser.add_argument("--tp-size", type=int, default=None, help="Filter comm data by tensor parallel size")
     parser.add_argument("--embedding-dim", type=int, default=4096, help="Model embedding dimension (for max size_bytes calculation)")
-    parser.add_argument("--topology", type=str, default="DGX", help="Filter comm data by topology (e.g., 'DGX', 'NVLINK')")
+    parser.add_argument("--topology", type=str, default="mew1", help="Filter comm data by topology (e.g., 'DGX', 'NVLINK')")
     parser.add_argument("--collective-backend", type=str, default="NCCL", help="Collective communication backend (e.g., 'NCCL')")
 
     args = parser.parse_args()

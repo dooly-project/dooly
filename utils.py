@@ -100,6 +100,9 @@ class SimulationStep:
     finished_req_ids: List[str]
     preempted_req_ids: List[str]
 
+    # processed requests
+    processed_reqs: List[str]
+
     # Request states
     waiting_count: int
     running_count: int
@@ -278,7 +281,12 @@ class SimulationResult:
         total_output_tokens = sum(t.actual_output_len for t in traces)
 
         import numpy as np
-            
+        
+        
+        all_ttfts = [t.ttft_ms for t in traces if t.ttft_ms is not None]
+        all_itls = [itl for t in traces if t.mean_inter_token_latency_ms is not None for itl in t.inter_token_latencies_ms] 
+        
+         
         # Build result dict matching vLLM format
         result = {
             "endpoint_type": "dooly_sim",
@@ -293,14 +301,14 @@ class SimulationResult:
             # "completed": completed,
             # "failed": len(traces) - completed,
             "mean_ttft_ms": sum(t.ttft_ms for t in traces if t.ttft_ms is not None) / completed if completed > 0 else 0,
-            "median_ttft_ms": np.median([t.ttft_ms for t in traces if t.ttft_ms is not None]) if completed > 0 else 0,
-            "p95_ttft_ms": np.percentile([t.ttft_ms for t in traces if t.ttft_ms is not None], 95) if completed > 0 else 0,
-            "p99_ttft_ms": np.percentile([t.ttft_ms for t in traces if t.ttft_ms is not None], 99) if completed > 0 else 0,
+            "median_ttft_ms": np.median(all_ttfts) if completed > 0 else 0,
+            "p95_ttft_ms": np.percentile(all_ttfts, 95) if completed > 0 else 0,
+            "p99_ttft_ms": np.percentile(all_ttfts, 99) if completed > 0 else 0,
             "mean_itl_ms": sum(t.mean_inter_token_latency_ms for t in traces if t.mean_inter_token_latency_ms is not None) / completed if completed > 0 else 0,
-            "median_itl_ms": np.median([itl for t in traces if t.mean_inter_token_latency_ms is not None for itl in t.inter_token_latencies_ms]) if completed > 0 else 0,
-            "p95_itl_ms": np.percentile([itl for t in traces if t.mean_inter_token_latency_ms is not None for itl in t.inter_token_latencies_ms], 95) if completed > 0 else 0,
-            "p99_itl_ms": np.percentile([itl for t in traces if t.mean_inter_token_latency_ms is not None for itl in t.inter_token_latencies_ms], 99) if completed > 0 else 0,
-            
+            "median_itl_ms": np.median(all_itls) if all_itls else 0,
+            "p95_itl_ms": np.percentile(all_itls, 95) if all_itls else 0,
+            "p99_itl_ms": np.percentile(all_itls, 99) if all_itls else 0,
+
             # Per-request arrays
             "ttfts": [t.ttft_ms / 1000.0 if t.ttft_ms is not None else 0 for t in traces],  # Convert to seconds
             "itls": [[itl / 1000.0 for itl in t.inter_token_latencies_ms] for t in traces],  # Convert to seconds

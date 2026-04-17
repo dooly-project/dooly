@@ -17,11 +17,12 @@ class BatchConfig():
         self.decode_requests: List[int] = []
         self.batch_size = 0
         self.total_tokens = sched_out.total_num_scheduled_tokens
-        
         # initialize variables
         self.extract_new_reqs()
         self.extract_processed_reqs()
         self.compute_batch_size()
+        # Calculate num_requests AFTER extracting the requests
+        self.num_requests = len(self.prefill_requests) + len(self.decode_requests)
     
     def __repr__(self):
         return (f"BatchConfig(batch_size={self.batch_size}, "

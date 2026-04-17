@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
-Modified version of measure_vllm_streaming.py that doesn't rely on metrics.
-Tracks timing manually when disable_log_stats=True.
+Measure vLLM performance with streaming requests (arrival times).
+
+This script uses vLLM's LLMEngine directly to add requests over time,
+mimicking the online serving behavior that dooly_sim.py simulates.
+
+This provides a fair baseline comparison where both systems:
+1. Use the same request stream (from RandomDataset)
+2. Feed requests at the same arrival times
+3. Use the same vLLM scheduler logic
+4. Use scheduler.schedule() output for metrics (matches Dooly's approach)
 """
 
 import os
@@ -10,20 +18,24 @@ import time
 import json
 import argparse
 from pathlib import Path
-from typing import List
+from typing import List, Dict
 from tqdm import tqdm
 import torch
+# Kineto profiling imports for CPU/GPU timing separation
+from torch.profiler import profile, ProfilerActivity, record_function
 
 try:
-    from vllm import LLM
-    from vllm import SamplingParams
+    from vllm import LLM 
+    from vllm import EngineArgs, LLMEngine, SamplingParams
+    from vllm.benchmarks.serve import calculate_metrics, BenchmarkMetrics
     from vllm.benchmarks.datasets import SampleRequest
     from vllm.benchmarks.lib.endpoint_request_func import RequestFuncOutput
 except ImportError:
     print("ERROR: vLLM not available. Install with: pip install vllm")
     sys.exit(1)
 
-os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+import os
+os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"  
 
 # Add simulator to path for request generation
 simulator_dir = Path(__file__).parent.parent
@@ -33,10 +45,10 @@ if str(simulator_dir) not in sys.path:
 from vllm_request_generator import generate_vllm_requests_from_instance, generate_sharegpt_requests_from_instance
 
 
-def run_streaming_benchmark_no_stats(
+def run_streaming_benchmark(
     llm: LLM,
     requests: List[tuple],  # (request_id, prompt_token_ids, max_tokens, arrival_time)
-    warmup: int = 5,
+    warmup: int = 0,
     verbose: bool = False,
 ) -> tuple[List[RequestFuncOutput], float, dict]:
 
@@ -44,18 +56,20 @@ def run_streaming_benchmark_no_stats(
     outputs = []
     completed_requests = {}
 
-    # Manual timing tracking (since metrics won't be available)
-    request_arrival_times = {}  # req_id -> arrival_time (relative to start)
-    request_first_token_times = {}  # req_id -> time when first token generated
-    request_completion_times = {}  # req_id -> completion time
-    request_token_counts = {}  # req_id -> number of tokens generated
-    request_prompt_lens = {}  # req_id -> prompt length
+    # Track batch information for each request
+    request_batch_info = {}  # req_id -> {"ttft_batch_size": N, "ttft_step": M, "first_token_generated": False}
 
     # Track batch composition per step
-    step_batches = []
+    step_batches = []  # List of {"step": N, "batch_size": M, "req_ids": [...]}
 
-    # Track per-request step data for ITL calculation
+    # **NEW: Track step-by-step token generation for per-token ITL calculation (like Dooly)**
     request_step_data = {}  # req_id -> [{"step_duration": float, "tokens_generated": int}, ...]
+
+    # CPU/GPU timing data collection disabled - using timestamp instrumentation instead
+    cpu_gpu_timing_data = []
+
+    # Track first arrival time to normalize all times (like measure_vllm_direct.py does on line 142)
+    first_request_arrival_time = None
 
     # Sort by arrival time
     requests = sorted(requests, key=lambda x: x[3])
@@ -63,7 +77,6 @@ def run_streaming_benchmark_no_stats(
     if verbose:
         print(f"\n{'='*80}")
         print(f"Starting streaming benchmark with {len(requests)} requests")
-        print(f"log_stats disabled - using manual timing")
         print(f"{'='*80}\n")
 
     # warm up
@@ -75,45 +88,56 @@ def run_streaming_benchmark_no_stats(
 
     print(f"Warming up ({warmup} iterations)...")
     for _ in range(warmup):
+        # Pass token IDs as TextTokensPrompt objects
         from vllm.inputs import TokensPrompt
         prompts = [TokensPrompt(prompt_token_ids=token_ids) for _, token_ids, _, _ in requests]
         llm.generate(prompts, sampling_params=warmup_sampling_params)
         torch.cuda.synchronize()
 
     print(f"Warm up done. Running real runs.")
+    # tqdm
     pbar = tqdm(total=len(requests), desc="Processing requests")
     start_time = time.perf_counter()
 
+    # Record wall-clock time at benchmark start (for converting our relative times to wall-clock)
+    benchmark_start_time = time.monotonic()
+
+    # Map request_id to its arrival_time from requests list (relative to benchmark start)
+    request_arrival_times = {}
+
+    # Track time base offset (wall-clock - engine_time), set from first completed request
+    time_base_offset = None
+
     request_idx = 0
     step_count = 0
-
-    # Track which requests have generated their first token
-    requests_with_first_token = set()
-
     while request_idx < len(requests) or engine.has_unfinished_requests():
+        # Calculate elapsed wall-clock time since benchmark start
+        # This ensures requests are fed at the same absolute rate regardless of execution speed
         elapsed_time = time.perf_counter() - start_time
 
-        # Add any requests that have arrived
+        # Add any requests that have arrived based on wall-clock time
         while request_idx < len(requests):
             request_id, prompt_token_ids, max_tokens, arrival_time = requests[request_idx]
 
             if arrival_time <= elapsed_time:
+                # Create sampling params
                 sampling_params = SamplingParams(
                     temperature=0.0,
                     max_tokens=max_tokens,
                     ignore_eos=True,
                 )
+                print(f"req_id: {request_id} - max_tokens: {max_tokens}")
 
+                # Add request to engine
                 engine.add_request(
                     request_id=request_id,
                     prompt=prompt_token_ids,
                     params=sampling_params,
+                    arrival_time=benchmark_start_time+arrival_time
                 )
 
-                # Manual timing tracking
-                request_arrival_times[request_id] = elapsed_time
-                request_prompt_lens[request_id] = len(prompt_token_ids)
-                request_token_counts[request_id] = 0
+                # Store the arrival_time from our requests list
+                request_arrival_times[request_id] = arrival_time
 
                 if verbose:
                     print(f"[t={elapsed_time:.3f}s] Added request {request_id} "
@@ -124,174 +148,347 @@ def run_streaming_benchmark_no_stats(
                 break
 
         # Step the engine if there are requests to process
-        if engine.has_unfinished_requests():
-            # Access the scheduler through the proper path
-            if hasattr(engine, 'engine_core'):
-                if hasattr(engine.engine_core, 'engine_core'):
-                    scheduler = engine.engine_core.engine_core.scheduler
-                else:
-                    scheduler = engine.engine_core.scheduler
-            else:
-                # Fallback for different vLLM versions
-                scheduler = engine.scheduler
+        # if engine.has_unfinished_requests():
+        # Get scheduler to collect info
+        scheduler = engine.engine_core.engine_core.scheduler  # Get first scheduler (for TP=1)
 
-            # Capture scheduling info
-            original_schedule = scheduler.schedule
-            captured_sched_output = None
+        # Store original schedule method to intercept the scheduling output
+        original_schedule = scheduler.schedule
+        captured_sched_output = None
 
-            def capture_schedule():
-                nonlocal captured_sched_output
-                captured_sched_output = original_schedule()
-                return captured_sched_output
+        def capture_schedule():
+            nonlocal captured_sched_output
+            captured_sched_output = original_schedule()
+            return captured_sched_output
 
-            scheduler.schedule = capture_schedule
+        # Temporarily replace schedule method to capture output
+        scheduler.schedule = capture_schedule
 
-            # Time the step
-            torch.cuda.synchronize()
-            step_start = time.perf_counter()
-            request_outputs = engine.step()
-            torch.cuda.synchronize()
-            step_end = time.perf_counter()
-            step_duration = step_end - step_start
-            current_time = time.perf_counter() - start_time
+        # Original timing code (commented out for CPU/GPU split timing)
+        torch.cuda.synchronize()
+        step_start = time.perf_counter()
 
-            scheduler.schedule = original_schedule
+        # Debug: Check request scheduling behavior
+        print(f"\n[DEBUG] Step {step_count} - before engine.step()")
+        print(f"  Scheduler state: running={len(scheduler.running)}, waiting={len(scheduler.waiting)}")
 
-            # Extract scheduling metrics
-            scheduled_req_ids = []
-            total_tokens_scheduled = 0
+        request_outputs = engine.step()
 
-            if captured_sched_output:
-                num_scheduled_new = len(captured_sched_output.scheduled_new_reqs)
-                total_tokens_scheduled = captured_sched_output.total_num_scheduled_tokens
-                scheduled_req_ids = list(captured_sched_output.num_scheduled_tokens.keys())
+        torch.cuda.synchronize()  # Synchronize after to ensure this step's work is complete
+        step_end = time.perf_counter()
+        step_duration = step_end - step_start
 
-                # Track first token generation for new requests
-                for req_id_with_hash in scheduled_req_ids:
-                    req_id = req_id_with_hash.split('-')[0]  # Remove hash suffix
+        # Debug: Show what was actually scheduled and executed in this step
+        if captured_sched_output:
+            print(f"[DEBUG] Step {step_count} - after engine.step()")
+            print(f"  Scheduled new reqs: {len(captured_sched_output.scheduled_new_reqs)}")
+            print(f"  Scheduled cached reqs: {captured_sched_output.scheduled_cached_reqs.num_reqs}")
+            print(f"  Total tokens scheduled: {captured_sched_output.total_num_scheduled_tokens}")
 
-                    # Check if this is the first time this request generated tokens
-                    if req_id not in requests_with_first_token:
-                        if req_id in request_arrival_times:  # Ensure it's our request
-                            request_first_token_times[req_id] = current_time
-                            requests_with_first_token.add(req_id)
+            # Show request outputs
+            print(f"  Request outputs returned: {len(request_outputs)}")
+            for i, output in enumerate(request_outputs[:2]):
+                print(f"    output[{i}]: id={output.request_id[:15]}, finished={output.finished}")
+                if hasattr(output, 'outputs') and output.outputs:
+                    print(f"      tokens_generated={len(output.outputs[0].token_ids)}")
 
-                    # Track step data for ITL calculation
+        print(f"  Step duration: {step_duration*1000:.2f}ms")
+
+        # More debug for first step
+        if step_count == 0:
+            print(f"[DEBUG] First step completed:")
+            print(f"  Duration: {step_duration*1000:.2f}ms")
+            print(f"  Outputs returned: {len(request_outputs)}")
+            if request_outputs and hasattr(request_outputs[0], 'finished'):
+                print(f"  First output finished: {request_outputs[0].finished}")
+
+        current_time = time.perf_counter() - start_time
+        print(f"[t={current_time:.3f}s] Step {step_count} completed in {step_duration*1000:.2f}ms")
+
+        # # NEW: CPU/GPU split timing with Kineto profiling
+        # # Measure wall-clock time for total duration
+        # wall_start = time.perf_counter()
+
+        # # Create CUDA events for precise GPU timing
+        # gpu_start = torch.cuda.Event(enable_timing=True)
+        # gpu_end = torch.cuda.Event(enable_timing=True)
+
+        # # Record GPU start time
+        # gpu_start.record()
+
+        # # Execute the step
+        # request_outputs = engine.step()
+
+        # # Record GPU end time
+        # gpu_end.record()
+
+        # # Synchronize to ensure GPU work completes
+        # torch.cuda.synchronize()
+
+        # wall_end = time.perf_counter()
+
+        # # Calculate timings
+        # wall_time_ms = (wall_end - wall_start) * 1000
+        # gpu_time_ms = gpu_start.elapsed_time(gpu_end)
+        # cpu_overhead_ms = wall_time_ms - gpu_time_ms
+
+        # # Use wall time as step_duration for compatibility
+        # step_duration = wall_end - wall_start
+
+        # Restore original schedule method
+        scheduler.schedule = original_schedule
+
+        # Extract scheduling metrics from captured scheduler output (matching Dooly's approach)
+        if captured_sched_output:
+            num_scheduled_new = len(captured_sched_output.scheduled_new_reqs)
+            num_scheduled_cached = captured_sched_output.scheduled_cached_reqs.num_reqs
+            total_tokens_scheduled = captured_sched_output.total_num_scheduled_tokens
+            scheduled_req_ids = list(captured_sched_output.num_scheduled_tokens.keys())
+            current_batch_size = len(scheduled_req_ids)
+            preempted_req_ids = list(captured_sched_output.preempted_req_ids) if captured_sched_output.preempted_req_ids else []
+        else:
+            # Fallback to old method if capture failed
+            running_reqs = {req.request_id for req in scheduler.running}
+            new_reqs = [req.request_id for req in scheduler.running if req.num_computed_tokens == 0]
+            cached_reqs = [req.request_id for req in scheduler.running if req.num_computed_tokens > 0]
+
+            num_scheduled_new = len(new_reqs)
+            num_scheduled_cached = len(cached_reqs)
+            total_tokens_scheduled = sum(req.num_computed_tokens for req in scheduler.running)
+            scheduled_req_ids = list(running_reqs)
+            current_batch_size = len(scheduled_req_ids)
+            preempted_req_ids = []
+
+        # Get KV cache info
+        kv_cache_manager = scheduler.kv_cache_manager
+        free_blocks = kv_cache_manager.block_pool.get_num_free_blocks()
+
+        step_count += 1
+
+        # Get finished/preempted from request_outputs (will populate below)
+        finished_this_step = []
+
+        # Record batch composition for this step (detailed)
+        # IMPORTANT: Using scheduler.schedule() output for fair comparison with Dooly
+        step_batches.append({
+            "step_id": step_count,  # Match Dooly's field name
+            "sim_time_ms": elapsed_time * 1000.0,  # Convert to milliseconds
+            "elapsed_time_ms": step_duration * 1000.0,  # **Add actual step duration**
+            "batch_size": current_batch_size,
+            "scheduled_req_ids": sorted(scheduled_req_ids),
+            "num_scheduled_new": num_scheduled_new,
+            "num_scheduled_cached": num_scheduled_cached,
+            "total_tokens_scheduled": total_tokens_scheduled,
+            "free_blocks": free_blocks,
+            "waiting_count": len(scheduler.waiting),
+            "running_count": len(scheduler.running),
+            "finished_req_ids": finished_this_step,  # Will update after processing outputs
+            "preempted_req_ids": preempted_req_ids,
+        })
+
+        # CPU/GPU timing collection disabled - using timestamp instrumentation instead
+        # cpu_gpu_timing_data.append({
+        #     "step": step_count,
+        #     "wall_time_ms": wall_time_ms,
+        #     "gpu_time_ms": gpu_time_ms,
+        #     "cpu_overhead_ms": cpu_overhead_ms,
+        #     "batch_size": current_batch_size,
+        #     "is_prefill": num_scheduled_new > 0,
+        #     "num_scheduled_new": num_scheduled_new,
+        #     "num_scheduled_cached": num_scheduled_cached,
+        # })
+
+        if verbose:
+            # Original logging
+            print(f"[Step {step_count}] SCHED: reqs={sorted(scheduled_req_ids)}, "
+                    f"tokens={total_tokens_scheduled}, "
+                    f"new={num_scheduled_new}, cached={num_scheduled_cached}")
+            # CPU/GPU timing logging disabled - using timestamp instrumentation instead
+            # if step_count % 10 == 0 or num_scheduled_new > 0:
+            #     print(f"[Step {step_count}] TIMING: wall={wall_time_ms:.2f}ms, "
+            #           f"gpu={gpu_time_ms:.2f}ms, cpu_overhead={cpu_overhead_ms:.2f}ms "
+            #           f"({'prefill' if num_scheduled_new > 0 else 'decode'})")
+
+        # **NEW: Record step data for per-token ITL calculation (matching Dooly's approach)**
+        if captured_sched_output and captured_sched_output.num_scheduled_tokens:
+            # Build a map of request_id to request object for phase detection
+            req_phase_map = {}
+            for req in scheduler.running:
+                # Get the base request ID without hash suffix
+                base_req_id = req.request_id.split('-')[0]
+                # Check if request is in decode phase
+                # A request is in decode if it has processed all its prompt tokens
+                is_in_decode = req.num_computed_tokens >= len(req.prompt_token_ids)
+                req_phase_map[base_req_id] = is_in_decode
+
+            for req_id_with_hash, tokens_this_step in captured_sched_output.num_scheduled_tokens.items():
+                if tokens_this_step > 0:  # Only record if tokens were actually processed
+                    # Strip hash suffix to match completion request_id format
+                    req_id = req_id_with_hash.split('-')[0]  # 'req_0-9e7c4253' -> 'req_0'
+
                     if req_id not in request_step_data:
                         request_step_data[req_id] = []
 
-                    # Determine if this is prefill or decode
-                    is_prefill = False
-                    for new_req in captured_sched_output.scheduled_new_reqs:
-                        if new_req.req_id == req_id_with_hash:
-                            is_prefill = True
-                            break
+                    # Check if THIS specific request is in decode phase
+                    is_this_req_decode = req_phase_map.get(req_id, False)
+
+                    # For decode: record 1 token per step for ITL
+                    # For prefill: 0 tokens (prefill doesn't generate output tokens for ITL)
+                    output_tokens_generated = 1 if is_this_req_decode else 0
 
                     request_step_data[req_id].append({
-                        "step_duration": step_duration,
-                        "tokens_generated": 1 if not is_prefill else 0,  # Only decode generates tokens
-                        "is_prefill": is_prefill
+                        "step_duration": step_duration,  # Actual wall-clock step duration in seconds
+                        "tokens_generated": output_tokens_generated,  # Only count decode tokens for ITL
+                        "step_id": step_count,
+                        "is_prefill": not is_this_req_decode
                     })
 
-            step_count += 1
+        # Process outputs
+        for request_output in request_outputs:
+            # if verbose:
+            #     print(f"Step: {step_count}, request id: {request_output.request_id}, finished: {request_output.finished}")
 
-            # Record batch composition
-            step_batches.append({
-                "step_id": step_count,
-                "sim_time_ms": elapsed_time * 1000.0,
-                "elapsed_time_ms": step_duration * 1000.0,
-                "batch_size": len(scheduled_req_ids) if captured_sched_output else 0,
-                "total_tokens_scheduled": total_tokens_scheduled if captured_sched_output else 0,
-            })
+            if request_output.finished:
+                # Track finished requests for this step
+                finished_this_step.append(request_output.request_id)
+                # Request completed
+                req_id = request_output.request_id
+                
+                # Skip first request for debugging (can be outlier due to initialization)
+                # if req_id == "req_0":
+                #     continue  
 
-            if verbose and step_count % 10 == 0:
-                print(f"[Step {step_count}] time={current_time:.3f}s, "
-                      f"duration={step_duration*1000:.2f}ms, "
-                      f"tokens={total_tokens_scheduled if captured_sched_output else 0}")
+                # Get metrics from request_output
+                metrics = request_output.metrics
 
-            # Process outputs
-            for request_output in request_outputs:
-                if request_output.finished:
-                    req_id = request_output.request_id
+                # **NEW: Calculate per-token ITLs using step duration data (matching Dooly's approach)**
+                itls = []
 
-                    # Manual timing and token counting
-                    request_completion_times[req_id] = current_time
+                # Debug: Confirm this code path is reached
+                if len(outputs) < 5:
+                    print(f"\n[DEBUG] Processing request {req_id} for ITL calculation")
+                if req_id in request_step_data:
+                    # Reconstruct ITL array from step-by-step data
+                    for step_data in request_step_data[req_id]:
+                        step_duration_sec = step_data["step_duration"]
+                        tokens_in_step = step_data["tokens_generated"]
 
-                    # Count actual generated tokens
-                    if hasattr(request_output, 'outputs') and request_output.outputs:
-                        request_token_counts[req_id] = len(request_output.outputs[0].token_ids)
-                    else:
-                        # Default to expected output length if outputs not available
-                        request_token_counts[req_id] = 1
+                        # Each token in this step gets the same ITL (the step duration)
+                        # This matches Dooly's logic exactly
+                        for _ in range(tokens_in_step):
+                            itls.append(step_duration_sec)
 
-                    # Calculate metrics manually
-                    arrival_time = request_arrival_times.get(req_id, 0)
-                    first_token_time = request_first_token_times.get(req_id, current_time)
+                    # Debug output for first few requests
+                    if len(outputs) < 3:
+                        print(f"\n[DEBUG] {req_id} - Using STEP-BASED ITL calculation")
+                        print(f"  Steps recorded: {len(request_step_data[req_id])}")
+                        decode_steps = [s for s in request_step_data[req_id] if not s.get('is_prefill', False)]
+                        prefill_steps = [s for s in request_step_data[req_id] if s.get('is_prefill', False)]
+                        print(f"  Decode steps: {len(decode_steps)}, Prefill steps: {len(prefill_steps)}")
+                        print(f"  Total output tokens from decode steps: {len(itls)}")
+                        if decode_steps:
+                            step_durations = [s["step_duration"]*1000 for s in decode_steps[:3]]
+                            print(f"  Sample decode step durations: {step_durations}ms")
 
-                    ttft = first_token_time - arrival_time
-                    e2e_latency = current_time - arrival_time
+                # Fallback to original method if step data not available
+                elif metrics.num_generation_tokens > 1:
+                    avg_itl = ((metrics.last_token_ts - metrics.first_token_ts) / metrics.num_generation_tokens)
+                    itls = [avg_itl] * metrics.num_generation_tokens
 
-                    # Calculate ITLs from step data
-                    itls = []
+                    # Debug output for first few requests
+                    if len(outputs) < 3:
+                        print(f"\n[DEBUG] {req_id} - Using FALLBACK averaged ITL calculation")
+                        print(f"  req_id in request_step_data: {req_id in request_step_data}")
+                        print(f"  request_step_data keys: {list(request_step_data.keys())[:5]}")
+                        print(f"  avg_itl: {avg_itl*1000:.3f}ms")
+
+                # Debug: Show ITL calculation method for first few requests
+                if len(outputs) < 3 and verbose:
                     if req_id in request_step_data:
-                        for step_data in request_step_data[req_id]:
-                            tokens_in_step = step_data["tokens_generated"]
-                            for _ in range(tokens_in_step):
-                                itls.append(step_data["step_duration"])
+                        print(f"\n[DEBUG] {req_id} ITL calculation using step data:")
+                        print(f"  Total tokens generated: {len(itls)}")
+                        print(f"  Number of steps: {len(request_step_data[req_id])}")
+                        print(f"  Sample ITL values (first 5): {[f'{itl*1000:.2f}ms' for itl in itls[:5]]}")
+                        # Check for outliers
+                        max_itl = max(itls) if itls else 0
+                        if max_itl > 0.05:  # >50ms
+                            print(f"  *** Found outlier ITL: {max_itl*1000:.2f}ms ***")
+                    else:
+                        print(f"\n[DEBUG] {req_id} using fallback averaged ITL")
 
-                    # If no ITLs calculated, use average
-                    if not itls and request_token_counts[req_id] > 1:
-                        exit()
-                        avg_itl = (e2e_latency - ttft) / (request_token_counts[req_id] - 1)
-                        itls = [avg_itl] * (request_token_counts[req_id] - 1)
+                # Use arrival_time from our requests list (ground truth)
+                relative_start_time = request_arrival_times[req_id]
+                
+                # Set time base offset from first completed request
+                # Offset = wall_clock_time - engine_time (constant for all requests)
+                if time_base_offset is None:
+                    time_base_offset = metrics.arrival_time - metrics.queued_ts
 
-                    output = RequestFuncOutput(
-                        generated_text=request_output.outputs[0].text if hasattr(request_output, 'outputs') and request_output.outputs else "",
-                        success=True,
-                        latency=e2e_latency,
-                        output_tokens=request_token_counts[req_id],
-                        ttft=ttft,
-                        itl=itls,
-                        tpot=0.0,
-                        prompt_len=request_prompt_lens[req_id],
-                        error="",
-                        start_time=arrival_time,
-                        input_audio_duration=0.0,
-                    )
+                # For THIS request, convert its actual arrival time (from vLLM metrics) to engine time
+                # metrics.arrival_time = wall-clock when add_request() was called for THIS request
+                # engine_time_arrival = metrics.arrival_time - time_base_offset
+                engine_time_arrival = metrics.arrival_time
 
-                    outputs.append(output)
-                    completed_requests[req_id] = output
+                # TTFT = time from when THIS request was added to first token (includes queue + prefill)
+                ttft_with_queue = metrics.first_token_ts - engine_time_arrival
+                # ttft_with_queue = metrics.first_token_ts - metrics.queued_ts
+                
+                # E2E latency = time from when THIS request was added to last token
+                e2e_latency = metrics.last_token_ts - engine_time_arrival
 
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'TTFT': f'{ttft*1000:.1f}ms',
-                        'tokens': request_token_counts[req_id],
-                        'steps': step_count
-                    })
+                output = RequestFuncOutput(
+                    generated_text=request_output.outputs[0].text if request_output.outputs else "",
+                    success=True,
+                    latency=e2e_latency,  # E2E latency from arrival to completion
+                    output_tokens=metrics.num_generation_tokens,
+                    ttft=ttft_with_queue,  # Include queue time for fair comparison
+                    itl=itls,
+                    tpot=0.0,  # Will be calculated by calculate_metrics
+                    prompt_len=len(request_output.prompt_token_ids),
+                    error="",
+                    start_time=relative_start_time,  # Use relative time, not absolute
+                    input_audio_duration=0.0,
+                )
 
-                    if verbose:
-                        print(f"[t={current_time:.3f}s] Request {req_id} completed "
-                              f"(latency={e2e_latency*1000:.1f}ms, "
-                              f"ttft={ttft*1000:.1f}ms, "
-                              f"tokens={request_token_counts[req_id]})")
+                outputs.append(output)
+                completed_requests[req_id] = output
 
+                # Update progress bar
+                pbar.update(1)
+                pbar.set_postfix({
+                    'TTFT': f'{output.ttft*1000:.1f}ms',
+                    'tokens': output.output_tokens,
+                    'steps': step_count
+                })
+
+                if verbose:
+                    current_time = time.perf_counter() - start_time
+                    itl_str = f"itl={output.itl[0]*1000:.1f}ms" if output.itl else "itl=N/A"
+                    print(f"[t={current_time:.3f}s] Request {req_id} completed "
+                            f"(latency={output.latency*1000:.1f}ms, "
+                            f"ttft={output.ttft*1000:.1f}ms, "
+                            f"{itl_str}, "
+                            f"tokens={output.output_tokens})")
+
+    # Close progress bar
     pbar.close()
+
     end_time = time.perf_counter()
     duration = end_time - start_time
 
-    return outputs, duration, {"batch_composition": step_batches}
-
+    return outputs, duration, step_batches
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Measure vLLM performance with streaming requests (log_stats disabled)"
+        description="Measure vLLM performance with streaming requests"
     )
 
     # Model configuration
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B",
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-70B",
                        help="Model name")
     parser.add_argument("--backend", type=str, default="FLASHINFER",
                        help="Attention backend (FLASHINFER or FLASH_ATTN)")
+    parser.add_argument("--tp", type=int, default=4)
 
     # Request generation
     parser.add_argument("--load-dataset", type=str,
@@ -304,6 +501,10 @@ def main():
                        help="Request arrival rate (req/s)")
     parser.add_argument("--input-len", type=int, default=1024,
                        help="Mean input length")
+    parser.add_argument("--min-input-len", type=int, default=None,
+                       help="Min input length")
+    parser.add_argument("--max-input-len", type=int, default=None,
+                       help="Max input length")
     parser.add_argument("--output-len", type=int, default=None,
                        help="Mean output length")
     parser.add_argument("--range-ratio", type=float, default=0.0,
@@ -324,7 +525,7 @@ def main():
                        help="Enable chunked prefill")
 
     # Output options
-    parser.add_argument("--output", type=str, default="vllm_streaming_no_stats.json",
+    parser.add_argument("--output", type=str, default="vllm_streaming.json",
                        help="Output JSON file")
     parser.add_argument("--export-requests", type=str,
                        help="Export request dataset to JSONL")
@@ -332,8 +533,6 @@ def main():
                        help="Export batch composition to separate JSON file")
     parser.add_argument("--verbose", action="store_true",
                        help="Verbose output")
-    parser.add_argument("--warmup", type=int, default=3,
-                       help="Number of warmup iterations")
 
     args = parser.parse_args()
 
@@ -347,11 +546,11 @@ def main():
             args.export_requests = f"./dataset/{dataset_name}.jsonl"
 
         # Auto-set output files if they're still defaults
-        if args.output == "vllm_streaming_no_stats.json":
-            args.output = f"./comparison/vllm_no_stats_{dataset_name}.json"
+        if args.output == "vllm_streaming.json":
+            args.output = f"./comparison/vllm_{dataset_name}.json"
 
         if not args.batch_composition_output:
-            args.batch_composition_output = f"./comparison/vllm_batch_no_stats_{dataset_name}.json"
+            args.batch_composition_output = f"./comparison/vllm_batch_{dataset_name}.json"
 
     elif not args.export_requests and not args.load_dataset:
         # Synthetic dataset: syn-{rate}rps-uniform-{input_len}-{output_len}
@@ -361,25 +560,36 @@ def main():
         args.export_requests = f"./dataset/{dataset_name}.jsonl"
 
         # Auto-set output files if they're still defaults
-        if args.output == "vllm_streaming_no_stats.json":
-            args.output = f"./comparison/vllm_no_stats_{dataset_name}.json"
+        if args.output == "vllm_streaming.json":
+            args.output = f"./comparison/vllm_{dataset_name}.json"
 
         if not args.batch_composition_output:
-            args.batch_composition_output = f"./comparison/vllm_batch_no_stats_{dataset_name}.json"
+            args.batch_composition_output = f"./comparison/vllm_batch_{dataset_name}.json"
 
     elif args.load_dataset and args.load_dataset.endswith('.jsonl'):
         # Extract dataset name from load-dataset path
         dataset_name = Path(args.load_dataset).stem
 
         # Auto-set output files if they're still defaults
-        if args.output == "vllm_streaming_no_stats.json":
-            args.output = f"./comparison/vllm_no_stats_{dataset_name}.json"
+        if args.output == "vllm_streaming.json":
+            args.output = f"./comparison/vllm_{dataset_name}.json"
 
         if not args.batch_composition_output:
-            args.batch_composition_output = f"./comparison/vllm_batch_no_stats_{dataset_name}.json"
+            args.batch_composition_output = f"./comparison/vllm_batch_{dataset_name}.json"
+
+    elif args.export_requests and args.export_requests.endswith('.jsonl'):
+        # Extract dataset name from export-requests path
+        dataset_name = Path(args.export_requests).stem
+
+        # Auto-set output files if they're still defaults
+        if args.output == "vllm_streaming.json":
+            args.output = f"./comparison/vllm_{dataset_name}.json"
+
+        if not args.batch_composition_output:
+            args.batch_composition_output = f"./comparison/vllm_batch_{dataset_name}.json"
 
     print("=" * 80)
-    print("vLLM STREAMING BENCHMARK (log_stats disabled)")
+    print("vLLM STREAMING BENCHMARK (Arrival Time Simulation)")
     print("=" * 80)
     print(f"Model:              {args.model}")
     print(f"Backend:            {args.backend}")
@@ -391,24 +601,22 @@ def main():
     print(f"Max seqs:           {args.max_num_seqs}")
     print(f"Max batched tokens: {args.max_num_batched_tokens}")
     print(f"Chunked prefill:    {args.enable_chunked_prefill}")
-    print(f"Log stats:          DISABLED")
     print("=" * 80)
     print()
-
-    # Create LLM instance with log_stats disabled
+    
     llm = LLM(
-        model=args.model,
-        attention_backend=args.backend,
-        max_model_len=args.max_model_len,
-        max_num_seqs=args.max_num_seqs,
-        max_num_batched_tokens=args.max_num_batched_tokens,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        enable_prefix_caching=False,
-        enforce_eager=False,
-        load_format="dummy",
-        disable_log_stats=True,  # Disable logging
-        tensor_parallel_size=1
-    )
+            model=args.model,
+            attention_backend=args.backend,
+            max_model_len=args.max_model_len,
+            max_num_seqs=args.max_num_seqs,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enable_prefix_caching=False,
+            enforce_eager=False,
+            load_format="dummy",
+            disable_log_stats=False,
+            tensor_parallel_size=args.tp
+        )
 
     # Load or generate requests
     if args.load_dataset:
@@ -444,160 +652,226 @@ def main():
     elif args.use_sharegpt:
         # Generate from ShareGPT dataset
         print(f"Generating requests from ShareGPT: {args.use_sharegpt}")
-        result = generate_sharegpt_requests_from_instance(
+        dooly_requests, vllm_requests = generate_sharegpt_requests_from_instance(
             llm=llm,
             num_requests=args.num_requests,
-            custom_output_len=args.output_len,
             arrival_rate=args.arrival_rate,
             sharegpt_path=args.use_sharegpt,
+            min_input_len=args.min_input_len,
+            max_input_len=args.max_input_len,
+            custom_output_len=args.output_len,
             seed=args.seed,
         )
 
-        # Handle both tuple return (dooly_requests, vllm_requests) and list return
-        if isinstance(result, tuple):
-            dooly_requests, _ = result  # Ignore vllm_requests
-        else:
-            dooly_requests = result
+        # Export requests if requested
+        if args.export_requests:
+            from vllm_request_generator import export_vllm_dataset_jsonl
+            arrival_times = [r.arrival_time for r in dooly_requests]
+            export_vllm_dataset_jsonl(vllm_requests, arrival_times, args.export_requests)
+
+        # Convert to format for streaming benchmark
+        requests = [
+            (req.request_id, req.prompt_token_ids, req.max_tokens, req.arrival_time)
+            for req in dooly_requests
+        ]
+
+        sample_requests = [
+            SampleRequest(
+                prompt=vllm_req.prompt,
+                prompt_len=vllm_req.prompt_len,
+                expected_output_len=vllm_req.expected_output_len,
+            )
+            for vllm_req in vllm_requests
+        ]
+        
+        print(f"[REQUESTS] Req_id: {requests[-1][0]} - output len: {requests[-1][2]}")
+        print(f"[VLLM_REQUESTS] Req_id: {vllm_requests[-1].request_id} - output len: {vllm_requests[-1].expected_output_len}")
+        # exit(0)
+    else:
+        # Generate requests using RandomDataset (same as dooly_sim)
+        print("Generating requests with vLLM RandomDataset...")
+        dooly_requests, vllm_requests = generate_vllm_requests_from_instance(
+            llm=llm,
+            num_requests=args.num_requests,
+            arrival_rate=args.arrival_rate,
+            input_len=args.input_len,
+            output_len=args.output_len,
+            range_ratio=args.range_ratio,
+            seed=args.seed,
+        )
 
         # Export requests if requested
         if args.export_requests:
-            print(f"Exporting requests to: {args.export_requests}")
-            Path(args.export_requests).parent.mkdir(parents=True, exist_ok=True)
-            with open(args.export_requests, 'w') as f:
-                for req in dooly_requests:
-                    json.dump(req, f)
-                    f.write('\n')
+            from vllm_request_generator import export_vllm_dataset_jsonl
+            arrival_times = [r.arrival_time for r in dooly_requests]
+            export_vllm_dataset_jsonl(vllm_requests, arrival_times, args.export_requests)
 
-        # Convert to request tuples for streaming benchmark
-        tokenizer = llm.get_tokenizer()
-        requests = []
-        sample_requests = []
+        # Convert to format for streaming benchmark
+        requests = [
+            (req.request_id, req.prompt_token_ids, req.max_tokens, req.arrival_time)
+            for req in dooly_requests
+        ]
 
-        for req in dooly_requests:
-            token_ids = tokenizer.encode(req['prompt'])
-            requests.append((
-                req['request_id'],
-                token_ids,
-                req['output_len'],
-                req['arrival_time'],
-            ))
-            sample_requests.append(SampleRequest(
-                prompt=req['prompt'],
-                prompt_len=req['prompt_len'],
-                expected_output_len=req['output_len'],
-            ))
-    else:
-        # Generate synthetic requests
-        print(f"Generating {args.num_requests} synthetic requests...")
-        requests = generate_vllm_requests_from_instance(
-            llm, args.num_requests, args.arrival_rate,
-            args.input_len, args.output_len, args.range_ratio
-        )
-        sample_requests = None
+        sample_requests = [
+            SampleRequest(
+                prompt=vllm_req.prompt,
+                prompt_len=vllm_req.prompt_len,
+                expected_output_len=vllm_req.expected_output_len,
+            )
+            for vllm_req in vllm_requests
+        ]
+    
 
-    # Run benchmark
-    print(f"\nRunning benchmark with {len(requests)} requests...")
-    outputs, duration, extra_data = run_streaming_benchmark_no_stats(
-        llm, requests, warmup=args.warmup, verbose=args.verbose
+    print(f"\n✓ Ready with {len(requests)} requests")
+    print(f"  First arrival: {requests[0][3]:.3f}s")
+    print(f"  Last arrival:  {requests[-1][3]:.3f}s")
+    print()
+
+    # Run streaming benchmark
+    print("Running streaming benchmark...")
+    outputs, duration, step_batches = run_streaming_benchmark(
+        llm=llm,
+        warmup=0,
+        requests=requests,
+        verbose=args.verbose,
     )
 
+    # Sort outputs by start_time to match input_requests order
+    # CRITICAL: calculate_metrics assumes outputs[i] corresponds to input_requests[i]
+    # But outputs list is in completion order! Must sort by arrival time (start_time)
     outputs_sorted = sorted(outputs, key=lambda x: x.start_time)
+
+    # **PRESERVE our step-based ITL data before calculate_metrics() potentially overwrites it**
     step_based_itls = [output.itl for output in outputs_sorted]
 
-    # Calculate metrics manually (like Dooly does)
-    import numpy as np
+    # print(f"\n[DEBUG] Verifying index alignment after sorting:")
+    # print(f"  outputs_sorted[99]: start={outputs_sorted[99].start_time:.3f}s, tokens={outputs_sorted[99].output_tokens}, prompt={outputs_sorted[99].prompt_len}")
+    # print(f"  sample_requests[99]: prompt={sample_requests[99].prompt_len}, expected_output={sample_requests[99].expected_output_len}")
 
-    ttfts = [output.ttft for output in outputs]
-    latencies = [output.latency for output in outputs]
-    input_lens = [output.prompt_len for output in outputs]
-    output_lens = [output.output_tokens for output in outputs]
+    print(f"\n[DEBUG] Checking timestamp ranges:")
+    print(f"  Min start_time: {min(o.start_time for o in outputs_sorted):.6f}s")
+    print(f"  Max start_time: {max(o.start_time for o in outputs_sorted):.6f}s")
+    print(f"  Sample latencies (first 5): {[f'{o.latency:.3f}s' for o in outputs_sorted[:5]]}")
+    print(f"  Sample TTFTs (first 5): {[f'{o.ttft:.3f}s' for o in outputs_sorted[:5]]}")
 
-    # Calculate throughput
-    total_output_tokens = sum(output_lens)
-    total_input_tokens = sum(input_lens)
-    request_throughput = len(outputs) / duration
-    output_throughput = total_output_tokens / duration
-    total_throughput = (total_input_tokens + total_output_tokens) / duration
+    # Calculate metrics using vLLM's standard function
+    print("\nCalculating metrics...")
+    bench_metrics, actual_output_lens = calculate_metrics(
+        input_requests=sample_requests,
+        outputs=outputs_sorted,
+        dur_s=duration,
+        tokenizer=None,
+        selected_percentiles=[50.0, 95.0, 99.0],
+        goodput_config_dict={},
+    )
 
-    # Calculate TTFT percentiles
-    ttfts_ms = np.array(ttfts) * 1000  # Convert to ms
-    ttft_mean = np.mean(ttfts_ms)
-    ttft_median = np.median(ttfts_ms)
-    ttft_p95 = np.percentile(ttfts_ms, 95)
-    ttft_p99 = np.percentile(ttfts_ms, 99)
+    print(f"\n[DEBUG] actual_output_lens from calculate_metrics: {actual_output_lens[-5:]}")
+    print(f"[DEBUG] output.output_tokens from outputs list: {[o.output_tokens for o in outputs[-5:]]}")
 
-    # Calculate ITL stats
-    all_itls = []
-    for output in outputs:
-        if output.itl:
-            all_itls.extend(output.itl)
+    # Print results
+    print("\n" + "=" * 80)
+    print("RESULTS")
+    print("=" * 80)
+    print(f"Completed:             {bench_metrics.completed}/{args.num_requests}")
+    print(f"Failed:                {bench_metrics.failed}")
+    print(f"Duration:              {duration:.2f}s")
+    print(f"Request throughput:    {bench_metrics.request_throughput:.2f} req/s")
+    print(f"Output throughput:     {bench_metrics.output_throughput:.2f} tok/s")
+    print(f"Total token throughput:{bench_metrics.total_token_throughput:.2f} tok/s")
+    print()
+    print(f"TTFT (Time to First Token):")
+    print(f"  Mean:   {bench_metrics.mean_ttft_ms:.2f} ms")
+    print(f"  Median: {bench_metrics.median_ttft_ms:.2f} ms")
+    print(f"  P95:    {dict(bench_metrics.percentiles_ttft_ms).get(95.0, 0):.2f} ms")
+    print(f"  P99:    {dict(bench_metrics.percentiles_ttft_ms).get(99.0, 0):.2f} ms")
+    print()
+    print(f"TPOT (Time Per Output Token):")
+    print(f"  Mean:   {bench_metrics.mean_tpot_ms:.2f} ms")
+    print(f"  Median: {bench_metrics.median_tpot_ms:.2f} ms")
+    print(f"  P95:    {dict(bench_metrics.percentiles_tpot_ms).get(95.0, 0):.2f} ms")
+    print(f"  P99:    {dict(bench_metrics.percentiles_tpot_ms).get(99.0, 0):.2f} ms")
+    print()
+    print(f"ITL (Inter-Token Latency):")
+    print(f"  Mean:   {bench_metrics.mean_itl_ms:.2f} ms")
+    print(f"  Median: {bench_metrics.median_itl_ms:.2f} ms")
+    print()
+    print(f"E2E Latency:")
+    print(f"  Mean:   {bench_metrics.mean_e2el_ms:.2f} ms")
+    print(f"  Median: {bench_metrics.median_e2el_ms:.2f} ms")
+    print(f"  P95:    {dict(bench_metrics.percentiles_e2el_ms).get(95.0, 0):.2f} ms")
+    print(f"  P99:    {dict(bench_metrics.percentiles_e2el_ms).get(99.0, 0):.2f} ms")
+    print("=" * 80)
 
-    if all_itls:
-        itls_ms = np.array(all_itls) * 1000  # Convert to ms
-        itl_mean = np.mean(itls_ms)
-        itl_median = np.median(itls_ms)
-        itl_p95 = np.percentile(itls_ms, 95)
-        itl_p99 = np.percentile(itls_ms, 99)
-    else:
-        itl_mean = itl_median = itl_p95 = itl_p99 = 0.0
+    # Save results in vLLM-compatible format
+    from datetime import datetime
+    output_data = {
+        'date': datetime.now().strftime("%Y%m%d-%H%M%S"),
+        'backend': 'vllm_streaming',
+        'model_id': args.model,
+        'num_prompts': args.num_requests,
+        'arrival_rate': args.arrival_rate,
+        'input_len': args.input_len,
+        'output_len': args.output_len,
+        'range_ratio': args.range_ratio,
+        'duration': duration,
+        'completed': bench_metrics.completed,
+        'failed': bench_metrics.failed,
+        'request_throughput': bench_metrics.request_throughput,
+        'output_throughput': bench_metrics.output_throughput,
+        'total_throughput': bench_metrics.total_token_throughput,
+        'mean_ttft_ms': bench_metrics.mean_ttft_ms,
+        'median_ttft_ms': bench_metrics.median_ttft_ms,
+        'p95_ttft_ms': dict(bench_metrics.percentiles_ttft_ms).get(95.0, 0),
+        'p99_ttft_ms': dict(bench_metrics.percentiles_ttft_ms).get(99.0, 0),
+        'mean_tpot_ms': bench_metrics.mean_tpot_ms,
+        'median_tpot_ms': bench_metrics.median_tpot_ms,
+        'p95_tpot_ms': dict(bench_metrics.percentiles_tpot_ms).get(95.0, 0),
+        'p99_tpot_ms': dict(bench_metrics.percentiles_tpot_ms).get(99.0, 0),
+        'mean_itl_ms': bench_metrics.mean_itl_ms,
+        'median_itl_ms': bench_metrics.median_itl_ms,
+        'mean_e2el_ms': bench_metrics.mean_e2el_ms,
+        'median_e2el_ms': bench_metrics.median_e2el_ms,
+        'p95_e2el_ms': dict(bench_metrics.percentiles_e2el_ms).get(95.0, 0),
+        'p99_e2el_ms': dict(bench_metrics.percentiles_e2el_ms).get(99.0, 0),
+        'input_lens': [req.prompt_len for req in sample_requests],
+        'output_lens': actual_output_lens,
+        'ttfts': [output.ttft for output in outputs_sorted],
+        'itls': step_based_itls,  # **Use our preserved step-based ITL data, not outputs_sorted**
+        'start_times': [output.start_time for output in outputs_sorted],
 
-    # Prepare results (matching Dooly format)
-    results = {
-        "endpoint_type": "vllm",
-        "backend": args.backend,
-        "model": args.model,
-        "num_prompts": len(requests),
-        "arrival_rate": args.arrival_rate,
-        "duration": duration,
-        "request_throughput": request_throughput,
-        "output_throughput": output_throughput,
-        "total_throughput": total_throughput,
-        
-        "mean_ttft_ms": ttft_mean,
-        "median_ttft_ms": ttft_median,
-        "p95_ttft_ms": ttft_p95,
-        "p99_ttft_ms": ttft_p99,
-        "mean_itl_ms": itl_mean,
-        "median_itl_ms": itl_median,
-        "p95_itl_ms": itl_p95,
-        "p99_itl_ms": itl_p99,
-        
-        "ttfts": ttfts,  # In seconds
-        "itls": step_based_itls,  # In seconds
-        "latencies": latencies,  # In seconds
-        "input_lens": input_lens,
-        "output_lens": output_lens,
+        # Batch information for each request
+        'batch_info': [dict(step_batch) for step_batch in step_batches],
     }
 
-    # Save results
-    print(f"\nSaving results to: {args.output}")
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"✓ Results saved")
+        json.dump(output_data, f, indent=2)
 
-    # Save batch composition
-    if args.batch_composition_output and "batch_composition" in extra_data:
-        print(f"Saving batch composition to: {args.batch_composition_output}")
-        Path(args.batch_composition_output).parent.mkdir(parents=True, exist_ok=True)
+    print(f"\n✓ Results saved to {args.output}")
+
+    # Export batch composition to separate file if requested
+    if args.batch_composition_output:
+        batch_composition_data = []
+        for step_batch in step_batches:
+            batch_composition_data.append({
+                "step_id": step_batch["step_id"],
+                "sim_time_ms": round(step_batch["sim_time_ms"], 2),
+                "elapsed_time_ms": round(step_batch["elapsed_time_ms"], 2),  # **Add elapsed_time_ms**
+                "batch_size": step_batch["batch_size"],
+                "scheduled_req_ids": step_batch["scheduled_req_ids"],
+                "num_scheduled_new": step_batch["num_scheduled_new"],
+                "num_scheduled_cached": step_batch["num_scheduled_cached"],
+                "total_tokens_scheduled": step_batch["total_tokens_scheduled"],
+                "free_blocks": step_batch["free_blocks"],
+                "waiting_count": step_batch["waiting_count"],
+                "running_count": step_batch["running_count"],
+                "finished_req_ids": step_batch["finished_req_ids"],
+                "preempted_req_ids": step_batch["preempted_req_ids"],
+            })
+
         with open(args.batch_composition_output, 'w') as f:
-            json.dump(extra_data["batch_composition"], f, indent=2)
-        print(f"✓ Batch composition saved")
+            json.dump(batch_composition_data, f, indent=2)
 
-    # Print summary
-    print(f"\n{'='*60}")
-    print(f"Benchmark Summary (log_stats disabled)")
-    print(f"{'='*60}")
-    print(f"Duration: {duration:.2f}s")
-    print(f"Request Throughput: {request_throughput:.2f} req/s")
-    print(f"Output Throughput: {output_throughput:.2f} tok/s")
-    print(f"Total Throughput: {total_throughput:.2f} tok/s")
-    print(f"Mean TTFT: {ttft_mean:.2f}ms")
-    print(f"Median TTFT: {ttft_median:.2f}ms")
-    print(f"P95 TTFT: {ttft_p95:.2f}ms")
-    print(f"P99 TTFT: {ttft_p99:.2f}ms")
-    print(f"Mean ITL: {itl_mean:.2f}ms")
-    print(f"P99 ITL: {itl_p99:.2f}ms")
+        print(f"✓ Batch composition saved to {args.batch_composition_output}")
 
 
 if __name__ == "__main__":
