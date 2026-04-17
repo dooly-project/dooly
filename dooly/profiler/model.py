@@ -45,7 +45,7 @@ class ModelInfo:
         self.all_resolved_ops: List[Tuple[ModuleInfo, Callable, str, str]] = []  # All ops with signatures
         self.to_profile_resolved: List[Tuple[ModuleInfo, Callable]] = []
         
-    def compare_with_many(self, models: List['ModelInfo'], db_path: Optional[str] = None) -> None:
+    def compare_with_many(self, models: List['ModelInfo'], db_path: Optional[str] = None, overwrite=False) -> None:
         all_models = list(models)
         if self not in all_models:
             all_models.insert(0, self)
@@ -55,7 +55,7 @@ class ModelInfo:
         model_names = [model.name for model in all_models]
         # list of [list of (ModuleInfo, Callable)]
         model_modules = [model.to_profile_resolved for model in all_models]
-        pruned, all_ops = comparator.prune_overlaps(model_modules, model_names, db_path=db_path)
+        pruned, all_ops = comparator.prune_overlaps(model_modules, model_names, db_path=db_path, overwrite=overwrite)
 
         # update all models
         for model in all_models:

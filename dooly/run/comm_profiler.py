@@ -88,12 +88,24 @@ def _run_profiling_on_worker_standalone(
                 # Measure
                 latencies = []
                 for _ in range(measure_iters):
+                    # Create CUDA events for GPU timing
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+
+                    # Clear any pending operations
                     torch.cuda.synchronize()
-                    start = time.perf_counter()
+
+                    # Record GPU kernel execution time
+                    start_event.record()
                     _ = tp_group.all_reduce(tensor)
+                    end_event.record()
+
+                    # Wait for completion
                     torch.cuda.synchronize()
-                    end = time.perf_counter()
-                    latencies.append((end - start) * 1000)
+
+                    # Get GPU time in milliseconds
+                    gpu_time_ms = start_event.elapsed_time(end_event)
+                    latencies.append(gpu_time_ms)
 
                 latency = np.median(latencies)
 
@@ -105,7 +117,8 @@ def _run_profiling_on_worker_standalone(
                     'size_bytes': size_bytes,
                     'dtype': dtype_str,
                     'dim_param': plan_info['all_reduce']['dim_param'],
-                    'num_dims': len([size]),
+                    # 'num_dims': len([size]),
+                    'num_dims': plan_info['all_reduce']['dim_count'],
                     'latency_ms': latency
                 })
             except Exception as e:
@@ -149,12 +162,24 @@ def _run_profiling_on_worker_standalone(
                 # Measure
                 latencies = []
                 for _ in range(measure_iters):
+                    # Create CUDA events for GPU timing
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+
+                    # Clear any pending operations
                     torch.cuda.synchronize()
-                    start = time.perf_counter()
+
+                    # Record GPU kernel execution time
+                    start_event.record()
                     _ = tp_group.all_gather(tensor, dim=dim_param)
+                    end_event.record()
+
+                    # Wait for completion
                     torch.cuda.synchronize()
-                    end = time.perf_counter()
-                    latencies.append((end - start) * 1000)
+
+                    # Get GPU time in milliseconds
+                    gpu_time_ms = start_event.elapsed_time(end_event)
+                    latencies.append(gpu_time_ms)
 
                 latency = np.median(latencies)
 
@@ -208,12 +233,24 @@ def _run_profiling_on_worker_standalone(
                 # Measure
                 latencies = []
                 for _ in range(measure_iters):
+                    # Create CUDA events for GPU timing
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+
+                    # Clear any pending operations
                     torch.cuda.synchronize()
-                    start = time.perf_counter()
+
+                    # Record GPU kernel execution time
+                    start_event.record()
                     _ = tp_group.reduce_scatter(tensor, dim=dim_param)
+                    end_event.record()
+
+                    # Wait for completion
                     torch.cuda.synchronize()
-                    end = time.perf_counter()
-                    latencies.append((end - start) * 1000)
+
+                    # Get GPU time in milliseconds
+                    gpu_time_ms = start_event.elapsed_time(end_event)
+                    latencies.append(gpu_time_ms)
 
                 latency = np.median(latencies)
 
@@ -322,10 +359,40 @@ class CommProfiler:
         
         print(f"✓ Database initialized at {self.db_path}")
 
+    def should_profile(self, tp_size, overwrite=False):
+        """Check if we should profile based on existing data and overwrite flag."""
+        if overwrite:
+            print("[COMM] Overwrite mode enabled - will re-profile all operations")
+            return True
+
+        if not hasattr(self, 'plan_info') or not self.plan_info:
+            return False
+
+        # Check if any planned operations need profiling
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        needs_profiling = False
+        for op_name in self.plan_info.keys():
+            # Check if this operation already has data
+            existing_count = cursor.execute("""
+                SELECT COUNT(*) FROM coll_op_results
+                WHERE operation = ? AND topology = ? AND tp_size = ?
+            """, (op_name, "mew1", tp_size)).fetchone()[0]
+
+            if existing_count == 0:
+                needs_profiling = True
+                print(f"[COMM] {op_name} needs profiling (no existing data)")
+            else:
+                print(f"[COMM] {op_name} already profiled ({existing_count} measurements), skipping")
+
+        conn.close()
+        return needs_profiling
+
     def plan(self, collectives: List[Any]):
         from dooly.profiler.finput import ProfileInput
-        
-        # extract input shape, dim0, dim1 
+
+        # extract input shape, dim0, dim1
         self.plan_info: Dict[str, Dict[str, Any]]= {}
         
         for collective in collectives:
@@ -427,18 +494,38 @@ class CommProfiler:
             
         print(f"✓ Completed {len(self.results)} profiling measurements")
 
-    def save_to_db(self):
+    def save_to_db(self, overwrite=True):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         unique_ops = set()
-        
+
         for result in self.results:
-            # insert rows of new data
-            cursor.execute("""
-                INSERT OR REPLACE INTO coll_op_results
-                (operation, topology, backend, tp_size, size_bytes, dtype, dim_param, num_dims, latency_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            # Check if this configuration already exists
+            existing = cursor.execute("""
+                SELECT id FROM coll_op_results
+                WHERE operation = ? AND topology = ? AND backend = ?
+                AND tp_size = ? AND size_bytes = ? AND dtype = ?
+                AND dim_param = ? AND num_dims = ?
             """, (
+                result['operation'], result['topology'], result['backend'],
+                result['tp_size'], result['size_bytes'], result['dtype'],
+                result['dim_param'], result['num_dims']
+            )).fetchone()
+
+            if existing and overwrite:
+                # Update existing result
+                cursor.execute("""
+                    UPDATE coll_op_results
+                    SET latency_ms = ?
+                    WHERE id = ?
+                """, (result['latency_ms'], existing[0]))
+            elif not existing:
+                # Insert new result
+                cursor.execute("""
+                    INSERT INTO coll_op_results
+                    (operation, topology, backend, tp_size, size_bytes, dtype, dim_param, num_dims, latency_ms)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
                 result['operation'],
                 result['topology'],
                 result['backend'],

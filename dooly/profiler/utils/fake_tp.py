@@ -179,4 +179,30 @@ def apply_fake_tp_patches(tp_size: int) -> None:
     # linear.get_tensor_model_parallel_world_size = lambda: tp_size
     # linear.get_tensor_model_parallel_rank = lambda: 0
 
+    # --- ParallelConfig hooking -------------------------------------------
+    # Patch ParallelConfig to return fake TP size for FlashInfer num_qo_heads calculation
+    def patch_parallel_config():
+        try:
+            from vllm.config.parallel import ParallelConfig as OriginalParallelConfig
+
+            # Store reference to original init method
+            original_init = OriginalParallelConfig.__init__
+
+            def patched_init(self, *args, **kwargs):
+                # Call original init first
+                original_init(self, *args, **kwargs)
+                # Override tensor_parallel_size with fake TP size
+                self.tensor_parallel_size = tp_size
+
+            # Replace the __init__ method
+            OriginalParallelConfig.__init__ = patched_init
+
+            print(f"[FakeTP] ParallelConfig patched: tensor_parallel_size will be overridden to {tp_size}")
+
+        except ImportError:
+            # vllm.config.parallel not yet imported, that's fine
+            print(f"[FakeTP] ParallelConfig not yet imported, will be patched when imported")
+
+    patch_parallel_config()
+
     print(f"[FakeTP] Patches applied: TP={tp_size}")

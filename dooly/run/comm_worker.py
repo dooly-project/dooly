@@ -12,7 +12,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
-def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path):
+def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path, overwrite=False):
     """
     Worker function for comm profiling in spawned process.
     Runs with REAL TP (no fake TP patches).
@@ -44,8 +44,13 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
     comm_profiler = CommProfiler(config=comm_config, db_path=db_path)
     comm_profiler.make_db()
     comm_profiler.plan(collective_ops)
-    comm_profiler.profile(model_name, dtype_str, comm_config, tp_size, collective_backend, "mew1")
-    comm_profiler.save_to_db()
+
+    # Check if we should profile based on existing data
+    if comm_profiler.should_profile(tp_size, overwrite=overwrite):
+        comm_profiler.profile(model_name, dtype_str, comm_config, tp_size, collective_backend, "mew1")
+        comm_profiler.save_to_db(overwrite=overwrite)
+    else:
+        print("[COMM] Skipping profiling - all operations already have data and overwrite=False")
 
 if __name__ == '__main__':
     import argparse
@@ -57,6 +62,7 @@ if __name__ == '__main__':
     parser.add_argument('--dtype', required=True)
     parser.add_argument('--tp-size', type=int, required=True)
     parser.add_argument('--db-path', required=True)
+    parser.add_argument('--overwrite', action='store_true', help="Whether to overwrite existing profiling data in the database")
     args = parser.parse_args()
 
     # Load collective ops from pickle file
@@ -64,4 +70,4 @@ if __name__ == '__main__':
         collective_ops = pickle.load(f)
 
     # Run worker
-    comm_profiler_worker(args.model, collective_ops, args.dtype, args.tp_size, args.db_path)
+    comm_profiler_worker(args.model, collective_ops, args.dtype, args.tp_size, args.db_path, overwrite=args.overwrite)

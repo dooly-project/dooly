@@ -246,6 +246,7 @@ class ModuleComparator:
         model_module_infos: List[List[Tuple[ModuleInfo, Callable]]],
         model_names: Optional[List[str]] = None,
         db_path: Optional[str] = None,
+        overwrite: bool = False,
     ) -> Dict[str, List[Tuple[ModuleInfo, Callable, str, str]]]:
         if model_names is None:
             model_names = [f"Model{i+1}" for i in range(len(model_module_infos))]
@@ -256,12 +257,14 @@ class ModuleComparator:
                 f"number of names ({len(model_names)})"
             )
 
-        # Load existing signatures from database
+        # Load existing signatures from database (unless overwrite is True)
         existing_hashes = set()
-        if db_path:
+        if db_path and not overwrite:
             existing_hashes = self._load_existing_signatures(db_path)
             if existing_hashes:
                 print(f"[COMPARATOR] Loaded {len(existing_hashes)} existing signatures from database")
+        elif overwrite:
+            print(f"[COMPARATOR] Overwrite mode enabled - ignoring existing signatures in database")
 
         pruned: Dict[str, List[Tuple[ModuleInfo, Callable, str]]] = {name: [] for name in model_names}
         all_ops: Dict[str, List[Tuple[ModuleInfo, Callable, str, str]]] = {name: [] for name in model_names}

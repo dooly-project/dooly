@@ -326,6 +326,68 @@ class Profiler:
 
         return run_results
 
+    def _profile_gpu_busy(
+        self,
+        run_fn: Callable,
+        warmup_runs: int = 5,
+        profile_runs: int = 20
+    ) -> List[float]:
+        """
+        GPU busy profiling method for minimal CPU overhead and accurate GPU timing.
+
+        This method keeps the GPU busy with background work while the CPU queues
+        up all event recordings in advance. This eliminates CPU scheduling delays
+        between kernel launches and provides more accurate GPU-only timing.
+
+        Benefits:
+        - Eliminates CPU scheduling overhead between iterations
+        - GPU stays busy, avoiding idle time between kernels
+        - More accurate timing for fast operations
+        - Reduces measurement artifacts from CPU-GPU synchronization
+
+        Args:
+            run_fn: Callable that executes the operation to profile
+            warmup_runs: Number of warmup iterations
+            profile_runs: Number of profiling measurements
+
+        Returns:
+            List of timing measurements in milliseconds
+        """
+        # Warmup
+        for _ in range(warmup_runs):
+            run_fn()
+        torch.cuda.synchronize()
+
+        # Create background work tensors (large enough to keep GPU busy)
+        busy_tensor1 = torch.randn(4096, 4096, dtype=torch.float32, device=torch.device("cuda:0"))
+        busy_tensor2 = torch.randn(4096, 4096, dtype=torch.float32, device=torch.device("cuda:0"))
+
+        # Create all events upfront
+        start_events = [torch.cuda.Event(enable_timing=True) for _ in range(profile_runs)]
+        end_events = [torch.cuda.Event(enable_timing=True) for _ in range(profile_runs)]
+
+        # Start GPU busy work (non-blocking on CPU)
+        busy_event = torch.cuda.Event()
+        for _ in range(3):  # Keep GPU busy with background matrix multiplications
+            torch.matmul(busy_tensor1, busy_tensor2)
+        busy_event.record()
+
+        # While GPU is busy, CPU queues up all the event recordings
+        for i in range(profile_runs):
+            start_events[i].record()
+            run_fn()
+            end_events[i].record()
+
+        # Wait for everything to complete
+        torch.cuda.synchronize()
+
+        # Collect all timings
+        timings = []
+        for i in range(profile_runs):
+            timings.append(start_events[i].elapsed_time(end_events[i]))
+
+        return timings
+
     def _init_db(self) -> None:
         """Initialize SQLite database with required tables."""
         # Create parent directory if needed
@@ -494,6 +556,11 @@ class Profiler:
             # Phase 2: Profile vLLM modules in subprocess (needs vLLM context)
             if vllm_modules:
                 print(f"\n[PROFILER] Phase 2: Profiling {len(vllm_modules)} vLLM modules")
+                # Debug: Check VLLM_FAKE_TP before spawning subprocess
+                import os
+                fake_tp_parent = os.environ.get("VLLM_FAKE_TP", "Not Set")
+                print(f"[PROFILER PARENT] VLLM_FAKE_TP before subprocess: {fake_tp_parent}")
+
                 p = mp.Process(
                     target=self._profile_vllm_modules_subprocess,
                     args=(model, vllm_modules, result_queue)
@@ -566,6 +633,12 @@ class Profiler:
 
         This runs in a subprocess to ensure GPU memory is fully freed when done.
         """
+        # Debug: Check if VLLM_FAKE_TP is set in subprocess
+        import os
+        fake_tp = os.environ.get("VLLM_FAKE_TP", "Not Set")
+        print(f"\n[PROFILER SUBPROCESS] VLLM_FAKE_TP env var: {fake_tp}")
+        print(f"[PROFILER SUBPROCESS] World config TP: {self.world_config.get('tp', 1)}")
+
         # Initialize VLLMLayerProfiler
         self.module_caller = VLLMLayerProfiler(
             model_name=model.name,
@@ -670,6 +743,14 @@ class Profiler:
                 args, kwargs = prepare_op_args(callable_obj, module.operation_name, inputs)
 
                 def run_callable():
+                    # Debug: Print shapes for Attention profiling (non-context version)
+                    # if "Attention" in module.operation_name:
+                    #     print(f"\n[PROFILER] Profiling {module.operation_name} with shapes (no context):")
+                    #     for i, (pi, tensor) in enumerate(zip(module.inputs, inputs)):
+                    #         if hasattr(tensor, 'shape'):
+                    #             print(f"  Input {i}: {tensor.shape} (dtype={tensor.dtype})")
+                    #     print(f"  Config: batch_config={batch_config}")
+
                     # Reconstruct kwargs from arg_name if present (for modules called with keyword args)
                     has_named = any(
                         getattr(pi, 'arg_name', None) is not None
@@ -691,32 +772,13 @@ class Profiler:
                         callable_obj(*args, **kwargs)
 
                 try:
-                    # NEW: Use batched CUDA graph profiling for minimal CPU overhead
+                    # use batched CUDA graph profiling for minimal CPU overhead
                     run_results = self._profile_with_batched_cuda_graph(
                         run_fn=run_callable,
                         warmup_runs=5,
                         profile_runs=20,
                         iterations_per_graph=10
                     )
-
-                    # OLD: Standard sequential profiling (commented out)
-                    # # Warmup
-                    # for _ in range(5):
-                    #     run_callable()
-                    #
-                    # torch.cuda.synchronize()
-                    #
-                    # start_event = torch.cuda.Event(enable_timing=True)
-                    # end_event = torch.cuda.Event(enable_timing=True)
-                    #
-                    # run_results = []
-                    # for _ in range(20):
-                    #     start_event.record()
-                    #     run_callable()
-                    #     end_event.record()
-                    #     torch.cuda.synchronize()
-                    #     latency_ms = start_event.elapsed_time(end_event)
-                    #     run_results.append(latency_ms)
 
                     # Use original inputs for shape tracking (not args which may have list wrapping)
                     all_inputs = inputs
@@ -926,33 +988,21 @@ class Profiler:
                 run_fn = run_callable_with_context if forward_context else run_callable
 
                 try:
-                    # NEW: Use batched CUDA graph profiling for minimal CPU overhead
-                    run_results = self._profile_with_batched_cuda_graph(
-                        run_fn=run_fn,
-                        warmup_runs=5,
-                        profile_runs=20,
-                        iterations_per_graph=10
-                    )
-
-                    # OLD: Standard sequential profiling (commented out)
-                    # warm up
-                    # for _ in range(5):
-                    #     run_fn()
-                    
-                    # torch.cuda.synchronize()
-                    
-                    # start_event = torch.cuda.Event(enable_timing=True)
-                    # end_event = torch.cuda.Event(enable_timing=True)
-                    
-                    # # 20 runs
-                    # run_results = []
-                    # for _ in range(20):
-                    #     start_event.record()
-                    #     run_fn()
-                    #     end_event.record()
-                    #     torch.cuda.synchronize()
-                    #     latency_ms = start_event.elapsed_time(end_event)
-                    #     run_results.append(latency_ms)
+                    # For Attention modules, use gpu_busy method for accurate timing
+                    if "Attention" in module.operation_name:
+                        run_results = self._profile_gpu_busy(
+                            run_fn=run_fn,
+                            warmup_runs=5,
+                            profile_runs=20
+                        )
+                    else:
+                        # Use batched CUDA graph profiling for other operations
+                        run_results = self._profile_with_batched_cuda_graph(
+                            run_fn=run_fn,
+                            warmup_runs=5,
+                            profile_runs=20,
+                            iterations_per_graph=10
+                        )
 
                     # Use original inputs for shape tracking (before prepare_op_args wraps list args)
                     all_inputs = inputs
@@ -1086,11 +1136,26 @@ class Profiler:
 
                         # Create relationship in model_operations table
                         count = getattr(module, 'count', 1)
-                        conn.execute(
-                            """INSERT OR IGNORE INTO model_operations (model_id, operation_id, count)
-                               VALUES (?, ?, ?)""",
-                            (model_id, operation_id, count)
-                        )
+                        # Check if exists, then update or insert
+                        existing = conn.execute(
+                            """SELECT id FROM model_operations
+                               WHERE model_id = ? AND operation_id = ?""",
+                            (model_id, operation_id)
+                        ).fetchone()
+
+                        if existing:
+                            conn.execute(
+                                """UPDATE model_operations
+                                   SET count = ?
+                                   WHERE model_id = ? AND operation_id = ?""",
+                                (count, model_id, operation_id)
+                            )
+                        else:
+                            conn.execute(
+                                """INSERT INTO model_operations (model_id, operation_id, count)
+                                   VALUES (?, ?, ?)""",
+                                (model_id, operation_id, count)
+                            )
 
                 # Write collective operations
                 import hashlib
@@ -1167,20 +1232,44 @@ class Profiler:
                         collective_id = cursor.lastrowid
 
                     # Link model to collective with AGGREGATED count
-                    # Use INSERT OR IGNORE to preserve original profiling data (matches model_operations behavior)
-                    conn.execute("""
-                        INSERT OR IGNORE INTO model_collectives (model_id, collective_id, count)
-                        VALUES (?, ?, ?)
-                    """, (model_id, collective_id, total_count))
+                    # Check if exists, then update or insert
+                    existing = conn.execute("""
+                        SELECT id FROM model_collectives
+                        WHERE model_id = ? AND collective_id = ?
+                    """, (model_id, collective_id)).fetchone()
+
+                    if existing:
+                        conn.execute("""
+                            UPDATE model_collectives
+                            SET count = ?
+                            WHERE model_id = ? AND collective_id = ?
+                        """, (total_count, model_id, collective_id))
+                    else:
+                        conn.execute("""
+                            INSERT INTO model_collectives (model_id, collective_id, count)
+                            VALUES (?, ?, ?)
+                        """, (model_id, collective_id, total_count))
 
                     # Store model-specific collective configuration
-                    # Use INSERT OR IGNORE to preserve original config (matches model_operations behavior)
+                    # Check if exists, then update or insert
                     metadata = collective_metadata[key]
-                    conn.execute("""
-                        INSERT OR IGNORE INTO model_collective_configs
-                        (model_id, collective_id, batch_param, model_config_dim)
-                        VALUES (?, ?, ?, ?)
-                    """, (model_id, collective_id, metadata['batch_param'], metadata['model_config_dim']))
+                    existing = conn.execute("""
+                        SELECT id FROM model_collective_configs
+                        WHERE model_id = ? AND collective_id = ?
+                    """, (model_id, collective_id)).fetchone()
+
+                    if existing:
+                        conn.execute("""
+                            UPDATE model_collective_configs
+                            SET batch_param = ?, model_config_dim = ?
+                            WHERE model_id = ? AND collective_id = ?
+                        """, (metadata['batch_param'], metadata['model_config_dim'], model_id, collective_id))
+                    else:
+                        conn.execute("""
+                            INSERT INTO model_collective_configs
+                            (model_id, collective_id, batch_param, model_config_dim)
+                            VALUES (?, ?, ?, ?)
+                        """, (model_id, collective_id, metadata['batch_param'], metadata['model_config_dim']))
 
                 if collective_counts:
                     print(f"[PROFILER] Wrote {len(collective_counts)} unique collective operations for {model.name}:")
@@ -1234,33 +1323,74 @@ class Profiler:
                 kv_cache_size = workload_params.get('kv_cache_size', None)
                 is_context = is_prefill is not None and kv_cache_size is not None and prefill_chunk_size is not None
 
-                # Insert result with individual columns for workload params
-                conn.execute(
-                    """INSERT INTO results (
-                        signature_hash,
-                        mean_latency_ms, median_latency_ms, max_latency_ms, min_latency_ms, std_latency_ms,
-                        num_tokens, num_requests,
-                        is_context, is_prefill, kv_cache_size, prefill_chunk_size,
-                        num_tensor_parallel_workers,
-                        input_shapes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        sig_hash,
-                        result.get('mean_latency_ms'),
-                        result.get('median_latency_ms'),
-                        result.get('max_latency_ms'),
-                        result.get('min_latency_ms'),
-                        result.get('std_latency_ms'),
-                        num_tokens,
-                        num_requests,
-                        is_context,
-                        is_prefill,
-                        kv_cache_size,
-                        prefill_chunk_size,
-                        result.get('num_tensor_parallel_workers', self.tp_config),
-                        json.dumps(result.get('input_shapes', [])),
+                # Check if this exact configuration already exists
+                tp_workers = result.get('num_tensor_parallel_workers', self.tp_config)
+                existing = conn.execute(
+                    """SELECT id FROM results
+                       WHERE signature_hash = ?
+                       AND (num_tokens = ? OR (num_tokens IS NULL AND ? IS NULL))
+                       AND (num_requests = ? OR (num_requests IS NULL AND ? IS NULL))
+                       AND (is_context = ? OR (is_context IS NULL AND ? IS NULL))
+                       AND (is_prefill = ? OR (is_prefill IS NULL AND ? IS NULL))
+                       AND (kv_cache_size = ? OR (kv_cache_size IS NULL AND ? IS NULL))
+                       AND (prefill_chunk_size = ? OR (prefill_chunk_size IS NULL AND ? IS NULL))
+                       AND num_tensor_parallel_workers = ?""",
+                    (sig_hash,
+                     num_tokens, num_tokens,
+                     num_requests, num_requests,
+                     is_context, is_context,
+                     is_prefill, is_prefill,
+                     kv_cache_size, kv_cache_size,
+                     prefill_chunk_size, prefill_chunk_size,
+                     tp_workers)
+                ).fetchone()
+
+                if existing:
+                    # Update existing result with new measurements
+                    conn.execute(
+                        """UPDATE results
+                           SET mean_latency_ms = ?, median_latency_ms = ?,
+                               max_latency_ms = ?, min_latency_ms = ?, std_latency_ms = ?,
+                               input_shapes = ?, created_at = CURRENT_TIMESTAMP
+                           WHERE id = ?""",
+                        (
+                            result.get('mean_latency_ms'),
+                            result.get('median_latency_ms'),
+                            result.get('max_latency_ms'),
+                            result.get('min_latency_ms'),
+                            result.get('std_latency_ms'),
+                            json.dumps(result.get('input_shapes', [])),
+                            existing[0]
+                        )
                     )
-                )
+                else:
+                    # Insert new result
+                    conn.execute(
+                        """INSERT INTO results (
+                            signature_hash,
+                            mean_latency_ms, median_latency_ms, max_latency_ms, min_latency_ms, std_latency_ms,
+                            num_tokens, num_requests,
+                            is_context, is_prefill, kv_cache_size, prefill_chunk_size,
+                            num_tensor_parallel_workers,
+                            input_shapes
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            sig_hash,
+                            result.get('mean_latency_ms'),
+                            result.get('median_latency_ms'),
+                            result.get('max_latency_ms'),
+                            result.get('min_latency_ms'),
+                            result.get('std_latency_ms'),
+                            num_tokens,
+                            num_requests,
+                            is_context,
+                            is_prefill,
+                            kv_cache_size,
+                            prefill_chunk_size,
+                            tp_workers,
+                            json.dumps(result.get('input_shapes', [])),
+                        )
+                    )
 
             conn.execute("COMMIT")
             print(f"[PROFILER] Wrote {len(results)} results to database at {self.db_path}")

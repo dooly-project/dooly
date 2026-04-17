@@ -68,6 +68,17 @@ def parse_args() -> argparse.Namespace:
                         help="Path to SQLite database for persistent storage and deduplication")
     parser.add_argument("--gpu", type=str, default="0",
                         help="GPU device ID to use (default: 0)")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Force re-profiling even if signatures already exist in database")
+    parser.add_argument("--profile-method", default="cuda_event",
+                        choices=["cuda_event", "kineto", "wall_clock"],
+                        help="Profiling method for network operations (default: cuda_event)")
+    parser.add_argument("--profile-comm", action="store_true",
+                        help="Profile communication operations")
+    parser.add_argument("--overwrite-comm", action="store_true",
+                        help="Force re-profiling of communication operations")
+    parser.add_argument("--no-cuda-graph-comm", action="store_true",
+                        help="Disable CUDA graph profiling for communication operations")
     return parser.parse_args()
 
 
@@ -110,7 +121,7 @@ def resolve_model(model, dtype, attention_backend, max_seq_len, result_queue, gp
     vlp.close()
     print(f"=== Resolution complete for {model.name} ({dtype}) ({attention_backend}) ===\n")
 
-def run_comm_profiler(models, dtype_str, tp_size, db_path):
+def run_comm_profiler(models, dtype_str, tp_size, db_path, overwrite, profile_method="cuda_event", use_cuda_graph=True):
     """Run comm profiler via subprocess with clean environment (no fake TP)."""
     import subprocess
     import pickle
@@ -118,6 +129,8 @@ def run_comm_profiler(models, dtype_str, tp_size, db_path):
 
     print(f"\n{'='*60}")
     print(f"Launching comm profiler via subprocess (REAL TP={tp_size})")
+    print(f"Profile method: {profile_method.upper()}")
+    print(f"CUDA Graph: {'ENABLED' if use_cuda_graph else 'DISABLED'}")
     print(f"Clean environment WITHOUT VLLM_FAKE_TP")
     print(f"{'='*60}\n")
 
@@ -135,17 +148,34 @@ def run_comm_profiler(models, dtype_str, tp_size, db_path):
     clean_env.pop('VLLM_FAKE_TP', None)
 
     try:
-        # Run comm_worker.py directly
-        comm_worker_path = os.path.join(os.path.dirname(__file__), 'comm_worker.py')
-        result = subprocess.run(
-            [
+        # Choose worker based on profile method
+        if profile_method in ["kineto", "wall_clock"]:
+            # Use the KINETO-enabled worker for advanced profiling methods
+            comm_worker_path = os.path.join(os.path.dirname(__file__), 'comm_worker_kineto.py')
+        else:
+            # Use the original worker for cuda_event method
+            comm_worker_path = os.path.join(os.path.dirname(__file__), 'comm_worker.py')
+            if not use_cuda_graph:
+                cmd.append('--no-cuda-graph')
+
+        cmd = [
                 sys.executable, comm_worker_path,
                 '--model', model_name,
                 '--collective-ops-pkl', collective_ops_path,
                 '--dtype', dtype_str,
                 '--tp-size', str(tp_size),
                 '--db-path', db_path,
-            ],
+            ]
+
+        # Add profile method for kineto worker
+        if profile_method in ["kineto", "wall_clock"]:
+            cmd.extend(['--profile-method', profile_method])
+
+        if overwrite:
+            cmd.append('--overwrite')
+
+        result = subprocess.run(
+            cmd,
             env=clean_env,
             check=False
         )
@@ -154,7 +184,7 @@ def run_comm_profiler(models, dtype_str, tp_size, db_path):
             print(f"\n✗ Comm profiling failed with exit code {result.returncode}")
             sys.exit(result.returncode)
         else:
-            print(f"\n✓ Comm profiling completed successfully")
+            print(f"\n✓ Comm profiling ({profile_method}) completed successfully")
     finally:
         # Cleanup temp file
         os.unlink(collective_ops_path)
@@ -186,7 +216,7 @@ def main() -> None:
             print(f"Run {i + 1} failed with exit code {p.exitcode}")
             
     # Compare modules across models
-    models[0].compare_with_many(models[1:], db_path=args.db_path)
+    models[0].compare_with_many(models[1:], db_path=args.db_path, overwrite=args.overwrite)
     
     print("Profiling Plan (Computation): ")
     
@@ -218,13 +248,16 @@ def main() -> None:
     elapsed_s = time() - start_time
    
     # limit model to profile by one
-    if models[0].collective_ops and len(models) == 1:
+    if models[0].collective_ops and len(models) == 1 and args.profile_comm:
         # Run comm profiling in separate process (no fake TP)
         run_comm_profiler(
             models=models,
             dtype_str=args.dtype,
             tp_size=args.tp,
-            db_path=args.db_path
+            db_path=args.db_path,
+            overwrite=args.overwrite_comm,
+            profile_method=args.profile_method,
+            use_cuda_graph=not args.no_cuda_graph_comm  # Default True unless disabled
         )
     
     
