@@ -140,12 +140,9 @@ class SimplifiedExecutionTimeEstimator:
                     r.min_latency_ms, r.std_latency_ms, r.num_tokens, r.num_requests,
                     r.is_context, r.is_prefill, r.kv_cache_size, r.prefill_chunk_size,
                     r.num_tensor_parallel_workers, r.input_shapes, r.created_at,
-                    s.operation_name, s.signature_hash,
-                    pm.model_name, pm.backend
+                    s.operation_name, s.signature_hash
                 FROM results r
                 JOIN signatures s ON r.signature_hash = s.signature_hash
-                JOIN model_operations mo ON s.operation_id = mo.operation_id
-                JOIN profiled_models pm ON mo.model_id = pm.model_id
                 WHERE s.signature_hash IN ({})
             """.format(','.join('?' * len(signature_list)))
 

@@ -304,7 +304,7 @@ class SimulationResult:
             "median_ttft_ms": np.median(all_ttfts) if completed > 0 else 0,
             "p95_ttft_ms": np.percentile(all_ttfts, 95) if completed > 0 else 0,
             "p99_ttft_ms": np.percentile(all_ttfts, 99) if completed > 0 else 0,
-            "mean_itl_ms": sum(t.mean_inter_token_latency_ms for t in traces if t.mean_inter_token_latency_ms is not None) / completed if completed > 0 else 0,
+            "mean_itl_ms": float(np.mean(all_itls)) if all_itls else 0,  # Flat mean across all tokens (matches vLLM's calculate_metrics)
             "median_itl_ms": np.median(all_itls) if all_itls else 0,
             "p95_itl_ms": np.percentile(all_itls, 95) if all_itls else 0,
             "p99_itl_ms": np.percentile(all_itls, 99) if all_itls else 0,

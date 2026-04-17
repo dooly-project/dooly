@@ -175,7 +175,12 @@ class DoolySim:
                 current_time_ms = sim_time_ms
                 while request_idx < len(all_requests) and all_requests[request_idx].arrival_time * 1000.0 <= current_time_ms:
                     req_config = all_requests[request_idx]
-                    process_input_ms = self._add_request(req_config, result, current_time_ms)
+                    # Use the request's scheduled arrival time, not current sim_time.
+                    # This matches vLLM which records metrics.arrival_time as the
+                    # scheduled time. Without this, requests that arrive during a
+                    # previous step's execution have their wait time excluded from TTFT.
+                    scheduled_arrival_ms = req_config.arrival_time * 1000.0
+                    process_input_ms = self._add_request(req_config, result, scheduled_arrival_ms)
                     process_input_times.append(process_input_ms)
                     if verbose:
                         print(f"[t={sim_time_ms:.1f}ms] Request {req_config.request_id} arrived "

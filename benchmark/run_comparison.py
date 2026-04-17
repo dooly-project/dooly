@@ -88,7 +88,7 @@ def generate_batch_configs(output_dir: str) -> List[str]:
             "description": scenario["description"],
             "model": "meta-llama/Llama-3.1-8B",
             "backend": "FLASHINFER",
-            "tensor_parallel_size": 2,
+            "tensor_parallel_size": 1,
             "prefill_requests": scenario["prefill_requests"],
             "decode_requests": scenario["decode_requests"]
         }
@@ -104,7 +104,7 @@ def generate_batch_configs(output_dir: str) -> List[str]:
 def main():
     # Configuration
     CACHE_DIR = "./cache/tp2/meta-llama/Llama-3.1-8B/"
-    DB_PATH = "/home/jkim38/dooly/profiler/database/dooly.db"
+    DB_PATH = "/home/jkim38/dooly/database/dooly-mew3.db"
     RESULTS_DIR = "./results/"
     CONFIGS_DIR = "./batch_configs/"
     WARMUP = 3

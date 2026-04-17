@@ -62,8 +62,11 @@ def run_streaming_benchmark(
     # Track batch composition per step
     step_batches = []  # List of {"step": N, "batch_size": M, "req_ids": [...]}
 
-    # **NEW: Track step-by-step token generation for per-token ITL calculation (like Dooly)**
-    request_step_data = {}  # req_id -> [{"step_duration": float, "tokens_generated": int}, ...]
+    # Track wall-clock timestamps for each token (matching Dooly's token_events approach).
+    # ITL = gap between consecutive token timestamps, avoiding step_duration attribution
+    # errors from vLLM's pipelined execution (where engine.step() includes processing
+    # the previous step's outputs before executing the current batch).
+    request_token_timestamps = {}  # req_id -> [wall_clock_sec, ...]
 
     # CPU/GPU timing data collection disabled - using timestamp instrumentation instead
     cpu_gpu_timing_data = []
@@ -149,7 +152,6 @@ def run_streaming_benchmark(
 
         # Step the engine if there are requests to process
         # if engine.has_unfinished_requests():
-        # Get scheduler to collect info
         scheduler = engine.engine_core.engine_core.scheduler  # Get first scheduler (for TP=1)
 
         # Store original schedule method to intercept the scheduling output
@@ -204,6 +206,21 @@ def run_streaming_benchmark(
 
         current_time = time.perf_counter() - start_time
         print(f"[t={current_time:.3f}s] Step {step_count} completed in {step_duration*1000:.2f}ms")
+
+        # Track token timestamps for ITL calculation (matching Dooly's approach).
+        # Records wall-clock time when each token is observed in request_outputs,
+        # so ITL = gap between consecutive observations. This avoids step_duration
+        # attribution issues from vLLM's pipelined engine.step().
+        step_wall_time_sec = step_end - start_time
+        for request_output in request_outputs:
+            out_req_id = request_output.request_id
+            if hasattr(request_output, 'outputs') and request_output.outputs:
+                current_token_count = len(request_output.outputs[0].token_ids)
+                if out_req_id not in request_token_timestamps:
+                    request_token_timestamps[out_req_id] = []
+                prev_count = len(request_token_timestamps[out_req_id])
+                for _ in range(current_token_count - prev_count):
+                    request_token_timestamps[out_req_id].append(step_wall_time_sec)
 
         # # NEW: CPU/GPU split timing with Kineto profiling
         # # Measure wall-clock time for total duration
@@ -309,40 +326,6 @@ def run_streaming_benchmark(
             #           f"gpu={gpu_time_ms:.2f}ms, cpu_overhead={cpu_overhead_ms:.2f}ms "
             #           f"({'prefill' if num_scheduled_new > 0 else 'decode'})")
 
-        # **NEW: Record step data for per-token ITL calculation (matching Dooly's approach)**
-        if captured_sched_output and captured_sched_output.num_scheduled_tokens:
-            # Build a map of request_id to request object for phase detection
-            req_phase_map = {}
-            for req in scheduler.running:
-                # Get the base request ID without hash suffix
-                base_req_id = req.request_id.split('-')[0]
-                # Check if request is in decode phase
-                # A request is in decode if it has processed all its prompt tokens
-                is_in_decode = req.num_computed_tokens >= len(req.prompt_token_ids)
-                req_phase_map[base_req_id] = is_in_decode
-
-            for req_id_with_hash, tokens_this_step in captured_sched_output.num_scheduled_tokens.items():
-                if tokens_this_step > 0:  # Only record if tokens were actually processed
-                    # Strip hash suffix to match completion request_id format
-                    req_id = req_id_with_hash.split('-')[0]  # 'req_0-9e7c4253' -> 'req_0'
-
-                    if req_id not in request_step_data:
-                        request_step_data[req_id] = []
-
-                    # Check if THIS specific request is in decode phase
-                    is_this_req_decode = req_phase_map.get(req_id, False)
-
-                    # For decode: record 1 token per step for ITL
-                    # For prefill: 0 tokens (prefill doesn't generate output tokens for ITL)
-                    output_tokens_generated = 1 if is_this_req_decode else 0
-
-                    request_step_data[req_id].append({
-                        "step_duration": step_duration,  # Actual wall-clock step duration in seconds
-                        "tokens_generated": output_tokens_generated,  # Only count decode tokens for ITL
-                        "step_id": step_count,
-                        "is_prefill": not is_this_req_decode
-                    })
-
         # Process outputs
         for request_output in request_outputs:
             # if verbose:
@@ -361,60 +344,27 @@ def run_streaming_benchmark(
                 # Get metrics from request_output
                 metrics = request_output.metrics
 
-                # **NEW: Calculate per-token ITLs using step duration data (matching Dooly's approach)**
+                # Calculate per-token ITLs from wall-clock timestamps.
+                # Uses gaps between consecutive token observation times (matching
+                # Dooly's inter_token_latencies_ms = token_events[i].timestamp -
+                # token_events[i-1].timestamp). Gives N-1 values for N tokens.
+                # This avoids step_duration attribution errors from vLLM's
+                # pipelined engine.step() which includes previous step's output
+                # processing in the current step's wall-clock time.
                 itls = []
-
-                # Debug: Confirm this code path is reached
-                if len(outputs) < 5:
-                    print(f"\n[DEBUG] Processing request {req_id} for ITL calculation")
-                if req_id in request_step_data:
-                    # Reconstruct ITL array from step-by-step data
-                    for step_data in request_step_data[req_id]:
-                        step_duration_sec = step_data["step_duration"]
-                        tokens_in_step = step_data["tokens_generated"]
-
-                        # Each token in this step gets the same ITL (the step duration)
-                        # This matches Dooly's logic exactly
-                        for _ in range(tokens_in_step):
-                            itls.append(step_duration_sec)
-
-                    # Debug output for first few requests
-                    if len(outputs) < 3:
-                        print(f"\n[DEBUG] {req_id} - Using STEP-BASED ITL calculation")
-                        print(f"  Steps recorded: {len(request_step_data[req_id])}")
-                        decode_steps = [s for s in request_step_data[req_id] if not s.get('is_prefill', False)]
-                        prefill_steps = [s for s in request_step_data[req_id] if s.get('is_prefill', False)]
-                        print(f"  Decode steps: {len(decode_steps)}, Prefill steps: {len(prefill_steps)}")
-                        print(f"  Total output tokens from decode steps: {len(itls)}")
-                        if decode_steps:
-                            step_durations = [s["step_duration"]*1000 for s in decode_steps[:3]]
-                            print(f"  Sample decode step durations: {step_durations}ms")
-
-                # Fallback to original method if step data not available
+                if req_id in request_token_timestamps:
+                    timestamps = request_token_timestamps[req_id]
+                    itls = [timestamps[i] - timestamps[i-1]
+                            for i in range(1, len(timestamps))]
                 elif metrics.num_generation_tokens > 1:
-                    avg_itl = ((metrics.last_token_ts - metrics.first_token_ts) / metrics.num_generation_tokens)
-                    itls = [avg_itl] * metrics.num_generation_tokens
+                    # Fallback: average ITL from vLLM internal metrics
+                    avg_itl = ((metrics.last_token_ts - metrics.first_token_ts)
+                            / (metrics.num_generation_tokens - 1))
+                    itls = [avg_itl] * (metrics.num_generation_tokens - 1)
 
-                    # Debug output for first few requests
-                    if len(outputs) < 3:
-                        print(f"\n[DEBUG] {req_id} - Using FALLBACK averaged ITL calculation")
-                        print(f"  req_id in request_step_data: {req_id in request_step_data}")
-                        print(f"  request_step_data keys: {list(request_step_data.keys())[:5]}")
-                        print(f"  avg_itl: {avg_itl*1000:.3f}ms")
-
-                # Debug: Show ITL calculation method for first few requests
-                if len(outputs) < 3 and verbose:
-                    if req_id in request_step_data:
-                        print(f"\n[DEBUG] {req_id} ITL calculation using step data:")
-                        print(f"  Total tokens generated: {len(itls)}")
-                        print(f"  Number of steps: {len(request_step_data[req_id])}")
-                        print(f"  Sample ITL values (first 5): {[f'{itl*1000:.2f}ms' for itl in itls[:5]]}")
-                        # Check for outliers
-                        max_itl = max(itls) if itls else 0
-                        if max_itl > 0.05:  # >50ms
-                            print(f"  *** Found outlier ITL: {max_itl*1000:.2f}ms ***")
-                    else:
-                        print(f"\n[DEBUG] {req_id} using fallback averaged ITL")
+                if len(outputs) < 3:
+                    print(f"\n[DEBUG] {req_id} ITL: {len(itls)} values, "
+                        f"first 3: {[f'{x*1000:.2f}ms' for x in itls[:3]]}")
 
                 # Use arrival_time from our requests list (ground truth)
                 relative_start_time = request_arrival_times[req_id]
@@ -547,7 +497,7 @@ def main():
 
         # Auto-set output files if they're still defaults
         if args.output == "vllm_streaming.json":
-            args.output = f"./comparison/vllm_{dataset_name}.json"
+            args.output = f"./vllm_{dataset_name}.json"
 
         if not args.batch_composition_output:
             args.batch_composition_output = f"./comparison/vllm_batch_{dataset_name}.json"
@@ -615,7 +565,13 @@ def main():
             enforce_eager=False,
             load_format="dummy",
             disable_log_stats=False,
-            tensor_parallel_size=args.tp
+            tensor_parallel_size=args.tp,
+            # Disable async scheduling to ensure each engine.step() synchronously
+            # executes the batch it schedules (matching Dooly's behavior).
+            # Without this, TP>1 uses step_with_batch_queue() which pipelines
+            # scheduling and execution across steps, causing a one-step delay
+            # that inflates TTFT by ~one decode step.
+            async_scheduling=False,
         )
 
     # Load or generate requests
