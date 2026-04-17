@@ -165,10 +165,66 @@ def apply_fake_tp_patches(tp_size: int) -> None:
     fake_group = FakeTPGroup()
 
     # --- parallel_state --------------------------------------------------
+    # TP group functions
     ps.get_tp_group = lambda: fake_group
     communication_op.get_tp_group = lambda: fake_group
     ps.get_tensor_model_parallel_world_size = lambda: tp_size
     ps.get_tensor_model_parallel_rank = lambda: 0
+
+    # Pipeline parallel functions (use defaults for single-GPU)
+    ps.get_pipeline_model_parallel_world_size = lambda: 1
+    ps.get_pipeline_model_parallel_rank = lambda: 0
+
+    # Data parallel functions (use defaults for single-GPU)
+    ps.get_data_parallel_world_size = lambda: 1
+    ps.get_data_parallel_rank = lambda: 0
+
+    # Context parallel functions (use defaults)
+    ps.get_prefill_context_model_parallel_world_size = lambda: 1
+    ps.get_prefill_context_model_parallel_rank = lambda: 0
+    ps.get_decode_context_model_parallel_world_size = lambda: 1
+    ps.get_decode_context_model_parallel_rank = lambda: 0
+    
+    try:
+        from vllm.config.model import ModelConfig
+        # Store original method
+        original_get_num_attention_heads = ModelConfig.get_num_attention_heads
+
+        def fake_get_num_attention_heads(self, parallel_config):
+            """Patched version that uses fake TP size instead of real parallel_config."""
+            num_heads = self.model_arch_config.total_num_attention_heads
+            result = num_heads // tp_size  # Use fake TP size instead of parallel_config.tensor_parallel_size
+            print(f"[FakeTP] get_num_attention_heads: {num_heads} // {tp_size} = {result} (vs original: {num_heads // parallel_config.tensor_parallel_size})")
+            return result
+
+        # Apply the patch
+        ModelConfig.get_num_attention_heads = fake_get_num_attention_heads
+
+        print(f"[FakeTP] Patched ModelConfig.get_num_attention_heads to use TP={tp_size}")
+
+    except ImportError:
+        print(f"[FakeTP] Warning: Could not patch ModelConfig.get_num_attention_heads")
+    
+    try:
+        from vllm.config.model import ModelConfig
+        # Store original method
+        original_get_num_attention_heads = ModelConfig.get_num_attention_heads
+
+        def fake_get_num_attention_heads(self, parallel_config):
+            """Patched version that uses fake TP size instead of real parallel_config."""
+            num_heads = self.model_arch_config.total_num_attention_heads
+            result = num_heads // tp_size  # Use fake TP size instead of parallel_config.tensor_parallel_size
+            print(f"[FakeTP] get_num_attention_heads: {num_heads} // {tp_size} = {result} (vs original: {num_heads // parallel_config.tensor_parallel_size})")
+            return result
+
+        # Apply the patch
+        ModelConfig.get_num_attention_heads = fake_get_num_attention_heads
+
+        print(f"[FakeTP] Patched ModelConfig.get_num_attention_heads to use TP={tp_size}")
+
+    except ImportError:
+        print(f"[FakeTP] Warning: Could not patch ModelConfig.get_num_attention_heads")
+
 
     # MIGHT NOT NEED THIS ANYMORE:
     # # --- distributed communication (no-ops) ------------------------------
@@ -179,30 +235,5 @@ def apply_fake_tp_patches(tp_size: int) -> None:
     # linear.get_tensor_model_parallel_world_size = lambda: tp_size
     # linear.get_tensor_model_parallel_rank = lambda: 0
 
-    # --- ParallelConfig hooking -------------------------------------------
-    # Patch ParallelConfig to return fake TP size for FlashInfer num_qo_heads calculation
-    def patch_parallel_config():
-        try:
-            from vllm.config.parallel import ParallelConfig as OriginalParallelConfig
-
-            # Store reference to original init method
-            original_init = OriginalParallelConfig.__init__
-
-            def patched_init(self, *args, **kwargs):
-                # Call original init first
-                original_init(self, *args, **kwargs)
-                # Override tensor_parallel_size with fake TP size
-                self.tensor_parallel_size = tp_size
-
-            # Replace the __init__ method
-            OriginalParallelConfig.__init__ = patched_init
-
-            print(f"[FakeTP] ParallelConfig patched: tensor_parallel_size will be overridden to {tp_size}")
-
-        except ImportError:
-            # vllm.config.parallel not yet imported, that's fine
-            print(f"[FakeTP] ParallelConfig not yet imported, will be patched when imported")
-
-    patch_parallel_config()
 
     print(f"[FakeTP] Patches applied: TP={tp_size}")

@@ -22,6 +22,7 @@ import os
 # This allows us to access the model directly in the main process
 
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE"] = str(1024 * 1024 * 1024)
 
 import torch
