@@ -8,6 +8,7 @@ It is populated from two sources:
 The registry enables efficient taint lookup when resolving -1 dimensions in reshape operations.
 """
 
+import pdb
 from typing import Optional, Dict, Set
 from .types import Taint
 
@@ -134,11 +135,11 @@ def register_taint(value: int | float, taint: Taint, components: Optional[Dict[T
             'taint': Taint('MIX'),
             'components': components
         }
+        print(f"[REGISTRY] Registered value={value} taint=MIX components={components}, Registry: {TAINT_REGISTRY}")
     else:
         # Pure taint
         TAINT_REGISTRY[value] = taint
-
-    # print(f"[REGISTRY] Registered value {value} with taint {TAINT_REGISTRY[value]}")
+        print(f"[REGISTRY] Registered value={value} taint={taint}, Registry: {TAINT_REGISTRY}")
 
 def lookup_taint(value: int | float):
     """Look up taint info for a value in the global registry.
