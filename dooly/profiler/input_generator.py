@@ -193,8 +193,17 @@ class InputGenerator:
                         # MODEL_CONFIG dimension - keep fixed value from trace
                         shape.append(actual_dim_value)
 
-                # Validate shape
+                # Validate shape. A dim of 0 typically means the original call
+                # had a None here (e.g. optional Tensor args like output_scale /
+                # kv_cache_dummy_dep in unified_attention_with_output). Skip
+                # that single input by substituting None — preserves positional
+                # order for downstream args/kwargs packing — instead of
+                # aborting the whole input list.
                 if not all(isinstance(d, int) and d > 0 for d in shape):
+                    if any(isinstance(d, int) and d == 0 for d in shape):
+                        print(f"[InputGenerator] Shape {shape} has zero dim — treating as None")
+                        inputs.append(None)
+                        continue
                     print(f"[InputGenerator] Invalid shape {shape}, skipping input")
                     print(f"[InputGenerator]   actual_shape={profile_input.actual_shape}")
                     print(f"[InputGenerator]   dimensions={[d.value for d in profile_input.dimensions]}")

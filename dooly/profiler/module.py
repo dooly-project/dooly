@@ -216,10 +216,51 @@ class ModuleComparator:
             # No children: return just anchor's params
             return anchor_params_tuple
 
+    def _get_kernel_signature(self, module: ModuleInfo) -> Tuple[str, ...]:
+        """Distinct GPU-kernel symbols launched under this anchor.
+
+        Sorted, deduped so the same set produces the same tuple regardless of
+        order. Two ops that share CPU-level shape params but dispatch different
+        kernels (e.g. Gemma local vs global attention under FlashInfer) get
+        different signatures from this alone.
+        """
+        return tuple(sorted({k.name for k in module.kernels if k.name}))
+
+    def _get_module_kernel_signature(self, module: ModuleInfo) -> Tuple[str, ...]:
+        """Kernels reachable from the anchor's nearest containing module.
+
+        Mirrors the `module_kernel_tuple` dimension used by trace.py's
+        _deduplicate_module_infos so the DB signature stays aligned with the
+        trace-time grouping. Without this, two trace-dedup groups whose
+        anchor-level fields happen to collide (e.g. Gemma's
+        unified_kv_cache_update under SWA=true vs SWA=false Attention, where
+        the direct kernel is identical `reshape_and_cache_flash`) hash to the
+        same sig_hash and one variant's count silently overwrites the other.
+        """
+        nearest = module.hierarchy.nearest_module if module.hierarchy else None
+        if nearest is None:
+            return ()
+        return tuple(sorted(getattr(nearest, 'descendant_kernels', frozenset())))
+
     def _module_signature(
         self, module: ModuleInfo
-    ) -> Tuple[str, str, Tuple[Tuple[str, Any], ...]]:
-        return (module.operation_name, self._get_model_param_signature(module))
+    ) -> Tuple:
+        # Module-level anchors (post-walk-up Attention, etc.) need the
+        # containing-module kernel set so SWA / fused-variant splits propagate
+        # to distinct DB rows. Standalone cpu_op anchors do NOT need it —
+        # their own kernel + input shapes fully determine their latency, and
+        # including module_kernel_tuple would split identical-latency profile
+        # targets on irrelevant sibling-context differences (e.g. an
+        # RMSNorm's fused-residual-add kernel has no effect on an inner
+        # aten::mul's own latency).
+        parts = [
+            module.operation_name,
+            self._get_model_param_signature(module),
+            self._get_kernel_signature(module),
+        ]
+        if module.is_module:
+            parts.append(self._get_module_kernel_signature(module))
+        return tuple(parts)
 
     def _hash_signature(self, signature: Tuple) -> str:
         """Convert a signature tuple to a stable hash string."""

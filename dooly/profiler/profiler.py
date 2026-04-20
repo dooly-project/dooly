@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 import traceback
 from typing import Dict, List, Any, Optional, Union, Callable, Tuple
+from collections import defaultdict
 from tqdm import tqdm
 from vllm.distributed import parallel_state
 import multiprocessing as mp
@@ -840,7 +841,18 @@ class Profiler:
             layer_name = None
             if module.is_module and self.module_caller is not None:
                 name_to_module = make_dict(self.module_caller.model)
-                layer_name = self.module_caller.get_layer_name_by_module(module.operation_name, name_to_module)
+                # Prefer the resolver's kernel-matched path when present.
+                # Without this, get_layer_name_by_module defaults to paths[0]
+                # (e.g. layer 0) for every Attention variant, so the second
+                # variant's submodule at layer 1 is profiled with layer 0's
+                # forward_context → KeyError on self.layer_name lookup.
+                resolved_path = getattr(module, '_resolved_path', None)
+                if resolved_path is not None:
+                    layer_name = self.module_caller.get_layer_name_by_module(
+                        module.operation_name, {module.operation_name: [resolved_path]}
+                    ) or resolved_path
+                else:
+                    layer_name = self.module_caller.get_layer_name_by_module(module.operation_name, name_to_module)
 
             generator = InputGenerator(
                 module=module,
@@ -1113,53 +1125,68 @@ class Profiler:
                     print(f"[PROFILER] Created new model entry (model_id={model_id})")
 
                 # Use all_resolved_ops which contains ALL operations this model uses
-                # (not just the ones that need profiling)
+                # (not just the ones that need profiling).
+                #
+                # Multiple all_resolved_ops entries may share the same sig_hash
+                # when trace-dedup over-splits by sibling-kernel context
+                # (e.g. two GemmaRMSNorm "bands" whose inner aten::mul kernel
+                # is identical; the comparator collapses them back to one
+                # sig_hash for cpu_op anchors). Sum their counts before the
+                # INSERT loop so model_operations reflects the true total
+                # instead of the last iteration's count overwriting earlier
+                # ones. Module-level anchors whose sig_hash already
+                # distinguishes variants (e.g. SWA-split Attention) stay as
+                # separate keys here and still land in their own rows.
+                counts_per_sig: Dict[str, int] = defaultdict(int)
+                templates_per_sig: Dict[str, Tuple[Any, str]] = {}
                 for module, callable_obj, sig_hash, sig_json in model.all_resolved_ops:
-                    if sig_hash:
-                        # First check if signature already exists
+                    if not sig_hash:
+                        continue
+                    counts_per_sig[sig_hash] += getattr(module, 'count', 1)
+                    if sig_hash not in templates_per_sig:
+                        templates_per_sig[sig_hash] = (module, sig_json)
+
+                for sig_hash, total_count in counts_per_sig.items():
+                    module, sig_json = templates_per_sig[sig_hash]
+
+                    cursor = conn.execute(
+                        "SELECT operation_id FROM signatures WHERE signature_hash = ?",
+                        (sig_hash,)
+                    )
+                    existing = cursor.fetchone()
+
+                    if existing:
+                        operation_id = existing[0]
+                    else:
                         cursor = conn.execute(
-                            "SELECT operation_id FROM signatures WHERE signature_hash = ?",
-                            (sig_hash,)
+                            """INSERT INTO signatures (signature_hash, operation_name, signature_json)
+                               VALUES (?, ?, ?)""",
+                            (sig_hash, module.operation_name, sig_json)
                         )
-                        existing = cursor.fetchone()
+                        operation_id = cursor.lastrowid
 
-                        if existing:
-                            operation_id = existing[0]
-                        else:
-                            # Only insert if it doesn't exist (avoids incrementing counter)
-                            cursor = conn.execute(
-                                """INSERT INTO signatures (signature_hash, operation_name, signature_json)
-                                   VALUES (?, ?, ?)""",
-                                (sig_hash, module.operation_name, sig_json)
-                            )
-                            operation_id = cursor.lastrowid
+                    existing = conn.execute(
+                        """SELECT id FROM model_operations
+                           WHERE model_id = ? AND operation_id = ?""",
+                        (model_id, operation_id)
+                    ).fetchone()
 
-                        # Create relationship in model_operations table
-                        count = getattr(module, 'count', 1)
-                        # Check if exists, then update or insert
-                        existing = conn.execute(
-                            """SELECT id FROM model_operations
+                    if existing:
+                        conn.execute(
+                            """UPDATE model_operations
+                               SET count = ?
                                WHERE model_id = ? AND operation_id = ?""",
-                            (model_id, operation_id)
-                        ).fetchone()
-
-                        if existing:
-                            conn.execute(
-                                """UPDATE model_operations
-                                   SET count = ?
-                                   WHERE model_id = ? AND operation_id = ?""",
-                                (count, model_id, operation_id)
-                            )
-                        else:
-                            conn.execute(
-                                """INSERT INTO model_operations (model_id, operation_id, count)
-                                   VALUES (?, ?, ?)""",
-                                (model_id, operation_id, count)
-                            )
+                            (total_count, model_id, operation_id)
+                        )
+                    else:
+                        conn.execute(
+                            """INSERT INTO model_operations (model_id, operation_id, count)
+                               VALUES (?, ?, ?)""",
+                            (model_id, operation_id, total_count)
+                        )
 
                 # Write collective operations
                 import hashlib
-                from collections import defaultdict
                 topology = os.environ.get("DOOLY_TOPOLOGY", "mew1")  # Get from environment or default
 
                 # Aggregate counts for each unique collective operation signature

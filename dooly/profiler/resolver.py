@@ -21,6 +21,53 @@ from dooly.profiler.importer import OpImporter
 from dooly.profiler.vllm_layer_profiler import make_dict, VLLMLayerProfiler
 
 
+def _dim_is_tokens(dim) -> bool:
+    """Return True if dim is a NUM_TOKS-like dimension (covers MAX_NUM_TOKS)."""
+    name = getattr(dim, 'value', None) or str(dim)
+    return 'NUM_TOK' in name.upper()
+
+
+def _dim_is_requests(dim) -> bool:
+    name = getattr(dim, 'value', None) or str(dim)
+    return 'NUM_REQ' in name.upper()
+
+
+def _extract_num_tokens_from_inputs(inputs) -> Optional[int]:
+    """Find the trace's NUM_TOKS value by inspecting Tensor inputs.
+
+    Returns the dim value at the first axis whose DimensionType matches a
+    NUM_TOKS-style tag. Falls back to the first axis of the first non-zero
+    Tensor input if no explicit NUM_TOKS tag is present.
+    """
+    fallback = None
+    for inp in inputs:
+        if getattr(inp, 'type', None) != 'Tensor':
+            continue
+        dims = getattr(inp, 'dimensions', None) or []
+        shape = getattr(inp, 'actual_shape', None) or []
+        if not shape:
+            continue
+        for i, d in enumerate(dims):
+            if _dim_is_tokens(d) and i < len(shape) and shape[i] > 0:
+                return int(shape[i])
+        if fallback is None and shape[0] > 0:
+            fallback = int(shape[0])
+    return fallback
+
+
+def _extract_num_requests_from_inputs(inputs) -> Optional[int]:
+    """Same idea as _extract_num_tokens_from_inputs, for NUM_REQS dims."""
+    for inp in inputs:
+        if getattr(inp, 'type', None) != 'Tensor':
+            continue
+        dims = getattr(inp, 'dimensions', None) or []
+        shape = getattr(inp, 'actual_shape', None) or []
+        for i, d in enumerate(dims):
+            if _dim_is_requests(d) and i < len(shape) and shape[i] > 0:
+                return int(shape[i])
+    return None
+
+
 class ModuleResolver:
     """Validates and merges ModuleInfo objects before profiling.
     
@@ -47,6 +94,9 @@ class ModuleResolver:
         self.max_seq_len = max_seq_len
         # Build module name → path dict once
         self._name_to_module = make_dict(vlp.model) if vlp else {}
+        # Cache path selection keyed by (class_name, target_kernel_tuple) so
+        # dummy-with-capture runs at most once per distinct kernel variant.
+        self._path_cache: Dict[Tuple[str, Tuple[str, ...]], str] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -192,9 +242,48 @@ class ModuleResolver:
 
         callable_path = paths[0]  # default: first path
 
-        # If there are multiple candidate paths, use the ancestor event chain
-        # to narrow down to paths that live under the correct parent submodule.
-        if len(paths) > 1 and module.hierarchy is not None:
+        # Path disambiguation when one class (e.g. "Attention") has many
+        # instances. Two strategies, in order of preference:
+        #   1. Kernel-match: if the ModuleInfo knows which GPU kernels its
+        #      anchor launched, pick the first path whose dummy forward pass
+        #      actually launches that kernel set. Needed for Gemma-style
+        #      alternating attention where layer[0] and layer[1] expose the
+        #      same class but different FlashInfer kernel variants.
+        #   2. Ancestor-class filter: fallback used when kernel info is empty
+        #      or matching fails (covers GemmaRMSNorm-style cases).
+        #
+        # Target kernels come from the containing module's full descendant
+        # kernel set (annotated by the parser). This is critical when two
+        # sibling CPU ops launch distinct kernels inside the same module —
+        # e.g. unified_kv_cache_update and unified_attention_with_output
+        # both sit under Attention. Taking only the anchor's own kernels
+        # would leave kv_cache_update indistinguishable across SWA variants,
+        # because its reshape_and_cache_flash kernel is identical per layer.
+        nearest_module = module.hierarchy.nearest_module if module.hierarchy else None
+        if nearest_module is not None and getattr(nearest_module, 'descendant_kernels', None):
+            target_kernels = tuple(sorted(nearest_module.descendant_kernels))
+        else:
+            target_kernels = tuple(sorted({k.name for k in module.kernels if k.name}))
+
+        if len(paths) > 1 and target_kernels:
+            cache_key = (lookup_name, target_kernels)
+            cached = self._path_cache.get(cache_key)
+            if cached is not None and cached in paths:
+                callable_path = cached
+                print(f"[RESOLVER]   Kernel-match cache hit → {callable_path}")
+            else:
+                matched = self._pick_path_by_kernels(paths, module, set(target_kernels))
+                if matched is not None:
+                    callable_path = matched
+                    self._path_cache[cache_key] = matched
+                    print(f"[RESOLVER]   Kernel-match picked {callable_path}")
+
+        # Remember the picked path on the ModuleInfo so the outer dummy run
+        # (post-import) uses it to key forward_context / build_layer_metadata
+        # instead of defaulting to paths[0] via get_layer_name_by_module.
+        module._resolved_path = callable_path
+
+        if callable_path == paths[0] and len(paths) > 1 and module.hierarchy is not None:
             ancestor = module.hierarchy.anchor.parent  # parent of the GemmaRMSNorm event
             while ancestor is not None:
                 if ancestor.cat == 'module':
@@ -220,11 +309,69 @@ class ModuleResolver:
             print(f"[RESOLVER]   get_submodule failed for '{callable_path}': {e}")
             return None
 
+    def _pick_path_by_kernels(
+        self, paths: List[str], module: ModuleInfo, target_kernels: set
+    ) -> Optional[str]:
+        """Return the first path whose dummy forward launches target_kernels.
+
+        For each candidate path we get the submodule, run the standard resolver
+        dummy pass under a CUDA profiler, and accept if the captured kernel
+        name set is a superset of target_kernels (extra kernels from allocator
+        / reshape activity are fine).
+        """
+        for path in paths:
+            try:
+                submodule = self.vlp.model.get_submodule(path)
+            except Exception:
+                continue
+            captured = self._capture_kernels(submodule, module, layer_name=path)
+            if captured is None:
+                continue
+            if target_kernels.issubset(captured):
+                return path
+            # Log mismatch to help debugging without being too noisy.
+            missing = sorted(target_kernels - captured)
+            if missing:
+                print(f"[RESOLVER]   path={path} missing {missing[0][:80]}...")
+        return None
+
+    def _capture_kernels(
+        self,
+        callable_obj: Callable,
+        module: ModuleInfo,
+        layer_name: Optional[str] = None,
+    ) -> Optional[set]:
+        """Run one dummy forward and return the set of GPU kernel names launched."""
+        from torch.profiler import profile, ProfilerActivity
+        from torch.autograd import DeviceType
+
+        try:
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                ok = self._try_dummy_run(callable_obj, module, layer_name_override=layer_name)
+                if not ok:
+                    return None
+                torch.cuda.synchronize()
+        except Exception as e:
+            print(f"[RESOLVER]   Kernel capture failed: {e}")
+            return None
+
+        captured: set = set()
+        for evt in prof.events():
+            dev = getattr(evt, 'device_type', None)
+            if dev == DeviceType.CUDA and evt.name:
+                captured.add(evt.name)
+        return captured
+
     # ------------------------------------------------------------------
     # Dummy run
     # ------------------------------------------------------------------
 
-    def _try_dummy_run(self, callable_obj: Callable, module: ModuleInfo) -> bool:
+    def _try_dummy_run(
+        self,
+        callable_obj: Callable,
+        module: ModuleInfo,
+        layer_name_override: Optional[str] = None,
+    ) -> bool:
         """Run one forward pass to verify the callable works with the given inputs.
 
         Uses a small workload to minimize overhead. Catches CUDA errors
@@ -232,12 +379,28 @@ class ModuleResolver:
 
         For modules that require forward context (Attention, Mamba), uses
         VLLMLayerProfiler's infrastructure to set up proper metadata.
+
+        layer_name_override lets path disambiguation (kernel-match) drive the
+        forward-context key. Without it, get_layer_name_by_module always
+        returns paths[0]'s layer_name, and running submodules at other paths
+        trips a KeyError inside vLLM's per-layer metadata lookup.
         """
         try:
             # Use get_layer_name_by_module to determine if forward context is needed
             layer_name = None
-            if module.is_module and self.vlp is not None:
-                layer_name = self.vlp.get_layer_name_by_module(module.operation_name, self._name_to_module)
+            if layer_name_override is not None:
+                layer_name = layer_name_override
+            elif module.is_module and self.vlp is not None:
+                # Prefer the path that _import_module picked (set in
+                # module._resolved_path during import), so that kernel-matched
+                # layer selections flow into forward_context / metadata lookup.
+                resolved_path = getattr(module, '_resolved_path', None)
+                if resolved_path is not None:
+                    layer_name = self.vlp.get_layer_name_by_module(
+                        module.operation_name, {module.operation_name: [resolved_path]}
+                    ) or resolved_path
+                else:
+                    layer_name = self.vlp.get_layer_name_by_module(module.operation_name, self._name_to_module)
                 # print(f"[RESOLVER DEBUG] layer_name for {module.operation_name}: {layer_name}")
 
             generator = InputGenerator(
@@ -248,25 +411,37 @@ class ModuleResolver:
                 dtype=self.dtype,
             )
 
-            workload_configs = generator.prepare_inputs(
-                mode="vidur",
-                use_batch_config=(layer_name is not None)
-            )
-            assert(workload_configs is not None)
+            # Derive the dummy workload from the trace's actual tensor shapes.
+            # Using the exact NUM_TOKS the tracer recorded forces FlashInfer
+            # (and similar backends) to dispatch the same kernel specialization
+            # captured during tracing — kernel-match matches without needing
+            # kernel-name normalization.
+            trace_num_tokens = _extract_num_tokens_from_inputs(module.inputs)
+            trace_num_requests = _extract_num_requests_from_inputs(module.inputs)
 
-            workload_batch = workload_configs[0]
-            # print(f"[RESOLVER DEBUG] workload_batch type: {type(workload_batch).__name__}")
-            if isinstance(workload_batch, AttentionBatchConfig):
-                # print(f"[RESOLVER DEBUG] AttentionBatchConfig: batch_size={workload_batch.batch_size}, "
-                    #   f"is_prefill={workload_batch.is_prefill}, kv_cache_size={workload_batch.kv_cache_size}")
-                if workload_batch.is_prefill:
-                    # Prefill: num_tokens = prefill_chunk_size
-                    tensor_workload = [workload_batch.prefill_chunk_size + workload_batch.kv_cache_size]
-                else:
-                    # Decode: num_tokens = batch_size (1 token per request) 
-                    tensor_workload = [workload_batch.kv_cache_size] * workload_batch.batch_size
+            if layer_name is not None:
+                # Attention-style module needs AttentionBatchConfig; assume the
+                # tracer ran a prefill (that's how the FlashInfer prefill
+                # kernels in the trace got dispatched). Batch size 1 matches
+                # what vLLM typically runs during trace generation.
+                if trace_num_tokens is None or trace_num_tokens <= 0:
+                    print("[RESOLVER]   Could not derive num_tokens from trace inputs")
+                    return False
+                workload_batch = AttentionBatchConfig(
+                    prefill_chunk_size=trace_num_tokens,
+                    kv_cache_size=0,
+                    batch_size=1,
+                    is_prefill=True,
+                )
+                tensor_workload = [trace_num_tokens]
             else:
-                tensor_workload = workload_batch
+                # Non-attention: a single scalar num_tokens (or per-request
+                # slice) is enough; mirror the generator's dict format.
+                workload_batch = {
+                    'num_tokens': trace_num_tokens or 1,
+                    'num_requests': trace_num_requests or 1,
+                }
+                tensor_workload = [trace_num_tokens or 1]
 
             inputs, workload_params = generator._create_tensor_inputs_from_params(tensor_workload)
             if not inputs:
@@ -288,6 +463,8 @@ class ModuleResolver:
             args, kwargs = prepare_op_args(callable_obj, module.operation_name, inputs)
 
             forward_context = None
+            slot_mapping_dict = None
+            num_tokens_for_context = None
             if layer_name and isinstance(workload_batch, AttentionBatchConfig):
                 # print(f"[RESOLVER DEBUG] Setting up forward_context for layer: {layer_name}")
                 batch_config = AttentionBatchConfig(
@@ -304,10 +481,21 @@ class ModuleResolver:
                         return False
                     layer_metadata, _ = result
                     forward_context = {layer_name: layer_metadata}
-                    # print(f"[RESOLVER DEBUG] forward_context set successfully")
+
+                    # Mirror profiler.py:920-923 — without slot_mapping +
+                    # num_actual_tokens in the forward context, vLLM's
+                    # unified_kv_cache_update silently skips
+                    # reshape_and_cache_flash_kernel and the attention kernel
+                    # dispatch can misroute (kernel-match sees nothing).
+                    common_meta = self.vlp._build_common_attention_metadata(batch_config, kv_cache_gid=0)
+                    if common_meta is not None:
+                        slot_mapping_dict = {layer_name: common_meta.slot_mapping}
+                        num_tokens_for_context = common_meta.num_actual_tokens
                 except Exception as e:
                     print(f"[RESOLVER]   Could not build metadata for {layer_name}: {e}")
                     forward_context = None
+                    slot_mapping_dict = None
+                    num_tokens_for_context = None
             else:
                 # print(f"[RESOLVER DEBUG] No forward_context needed (layer_name={layer_name}, is_AttentionBatchConfig={isinstance(workload_batch, AttentionBatchConfig)})")
                 pass
@@ -369,11 +557,23 @@ class ModuleResolver:
                         #         # print(f"[RESOLVER DEBUG]     {k}={v.shape}")
                         
                         with set_current_vllm_config(self.vlp.vllm_config):
-                            with set_forward_context(forward_context, self.vlp.vllm_config, virtual_engine=0):
+                            with set_forward_context(
+                                forward_context,
+                                self.vlp.vllm_config,
+                                virtual_engine=0,
+                                num_tokens=num_tokens_for_context,
+                                slot_mapping=slot_mapping_dict,
+                            ):
                                 callable_obj(*positional_tensors, **kwarg_tensors)
                     else:
                         with set_current_vllm_config(self.vlp.vllm_config):
-                            with set_forward_context(forward_context, self.vlp.vllm_config, virtual_engine=0):
+                            with set_forward_context(
+                                forward_context,
+                                self.vlp.vllm_config,
+                                virtual_engine=0,
+                                num_tokens=num_tokens_for_context,
+                                slot_mapping=slot_mapping_dict,
+                            ):
                                 callable_obj(*args, **kwargs)
 
             run_fn = run_callable_with_context if forward_context else run_callable

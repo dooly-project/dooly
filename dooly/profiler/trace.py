@@ -335,18 +335,56 @@ class TraceParser:
             model_params_list = info._semantic_params_list()
             model_params_tuple = tuple(sorted(model_params_list[0].items())) if model_params_list else ()
 
-            signature = (base_name, info.operation_name, model_params_tuple)
+            # Kernel-level discriminator: two anchors with identical CPU-op
+            # shapes but different GPU kernels (e.g. Gemma local vs global
+            # attention under FlashInfer) must stay as separate groups so the
+            # profiler measures each variant independently.
+            kernel_tuple = tuple(sorted({k.name for k in info.kernels if k.name}))
+
+            # Containing-module discriminator: tells apart CPU ops whose own
+            # kernel is identical but whose sibling ops under the same parent
+            # module dispatch different kernels (e.g. Gemma's
+            # unified_kv_cache_update — same reshape_and_cache kernel at every
+            # layer, but the sibling attention_with_output dispatches local
+            # vs global FlashInfer templates). Without this, all 42 layers'
+            # kv_cache_update collapse into one group and the SWA partition
+            # is lost during resolver absorb.
+            nearest_module = info.hierarchy.nearest_module if info.hierarchy else None
+            module_kernel_tuple: Tuple[str, ...] = ()
+            if nearest_module is not None:
+                module_kernel_tuple = tuple(sorted(
+                    getattr(nearest_module, 'descendant_kernels', frozenset())
+                ))
+
+            signature = (
+                base_name,
+                info.operation_name,
+                model_params_tuple,
+                kernel_tuple,
+                module_kernel_tuple,
+            )
 
             # dictionary of lists that group module infos by signature
             groups[signature].append(info)
 
         deduplicated: List[ModuleInfo] = []
-        for (base_name, _op_name, _model_params_tuple), infos in groups.items():
+        for (
+            base_name,
+            _op_name,
+            _model_params_tuple,
+            _kernel_tuple,
+            _module_kernel_tuple,
+        ), infos in groups.items():
             # use the first info as template since all have same signature
             template = infos[0]
             count = len(infos)
-            
-            print(f"[DEBUG] Deduplicating {count} modules with signature: {base_name}, operation: {template.operation_name}, model_params: {_model_params_tuple}")
+
+            print(
+                f"[DEBUG] Deduplicating {count} modules with signature: {base_name}, "
+                f"operation: {template.operation_name}, model_params: {_model_params_tuple}, "
+                f"kernels: {_kernel_tuple}, "
+                f"module_kernels: {_module_kernel_tuple}"
+            )
 
             dedup_info = ModuleInfo(
                 module_name=base_name,

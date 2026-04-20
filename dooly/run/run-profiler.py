@@ -8,12 +8,19 @@ from time import time
 # run-profiler.py -> run/ -> dooly/ -> dooly (repo root)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-# Parse --tp early and set VLLM_FAKE_TP env var BEFORE importing vLLM modules.
-# vllm_layer_profiler.py applies fake TP patches at module level based on this env var.
+# Parse --tp and --gpu early BEFORE importing vLLM / torch / CUDA.
+# - VLLM_FAKE_TP: vllm_layer_profiler.py applies fake TP patches at module load.
+# - CUDA_VISIBLE_DEVICES: must be set before any CUDA init so the main process
+#   (which runs _profile_raw_ops directly) and every spawned child / subprocess
+#   (resolve_model, _profile_vllm_modules_subprocess, run_comm_profiler) inherit
+#   the same GPU selection. Otherwise --gpu only reaches VLLMLayerProfiler and
+#   the main process + comm worker silently fall back to GPU 0.
 _pre_parser = argparse.ArgumentParser(add_help=False)
 _pre_parser.add_argument("--tp", type=int, default=1)
+_pre_parser.add_argument("--gpu", type=str, default="0,1,2,3")
 _pre_args, _ = _pre_parser.parse_known_args()
 os.environ["VLLM_FAKE_TP"] = str(_pre_args.tp)
+os.environ["CUDA_VISIBLE_DEVICES"] = _pre_args.gpu
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import torch

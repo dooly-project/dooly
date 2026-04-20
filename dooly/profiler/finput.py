@@ -160,17 +160,21 @@ def extract_inputs_from_taint(
         scalar_val = concrete_inputs[i] if concrete_inputs and i < len(concrete_inputs) else None
         
         if len(dims) == 0:
-            # Empty dims from trace - could be:
-            # 1. A true scalar (dtype='Scalar', 'ScalarList', 'Bool', or has concrete value)
-            # 2. A tensor whose dims weren't recorded (dtype='' for list elements like aten::index)
+            # Empty dims from trace - three distinct cases we now keep separate:
+            # 1. Python-scalar arg (dtype='Scalar'/'ScalarList'/'Bool'/'bool' or
+            #    dtype=='' with a concrete value) — taint tracked it as a value.
+            # 2. 0-d tensor (scalar buffer like Gemma's normalizer, RMSNorm eps,
+            #    rope constants): dtype is a real tensor dtype
+            #    (e.g. 'c10::BFloat16') and Input Dims is []. Must stay Tensor
+            #    so the generator emits torch.ones(()) of the same dtype —
+            #    otherwise aten::mul_.Tensor etc. can't match a schema.
+            # 3. Tensor recovered via taint dims (e.g. aten::index list elems).
             scalar_type_indicators = {'Scalar', 'ScalarList', 'Bool', 'bool'}
             is_trace_scalar = (dtype in scalar_type_indicators or (dtype == '' and scalar_val))
-
-            # print(f"[DEBUG @ finput] scalar_type_indicatrs: {scalar_type_indicators}")
-            # print(f"[DEBUG @ finput] is_trace_scalar: {is_trace_scalar}")
+            is_tensor_dtype = bool(dtype) and dtype not in scalar_type_indicators
 
             if not is_trace_scalar and taint_input is not None and len(taint_input.dimensions) > 0:
-                # Taint has dimension info and trace doesn't indicate scalar - use taint to create tensor
+                # Case 3: taint has dimension info — use it to create tensor
                 dim_types = [dim.dim_type for dim in taint_input.dimensions]
                 actual_shape = [dim.value for dim in taint_input.dimensions]
                 dim_components = [dim.components for dim in taint_input.dimensions]
@@ -183,8 +187,18 @@ def extract_inputs_from_taint(
                     actual_shape=actual_shape,
                     dimension_components=dim_components
                 )
+            elif not is_trace_scalar and is_tensor_dtype:
+                # Case 2: 0-d tensor (scalar buffer). Preserve as Tensor with
+                # empty shape so InputGenerator's Tensor branch emits a 0-d
+                # tensor of matching dtype.
+                profile_input = ProfileInput(
+                    type="Tensor",
+                    dtype=dtype,
+                    dimensions=[],
+                    actual_shape=[],
+                )
             else:
-                # Scalar input
+                # Case 1: Python scalar
                 profile_input = ProfileInput(
                     type="Scalar",
                     dtype=dtype or "Scalar",
