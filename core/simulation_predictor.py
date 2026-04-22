@@ -93,6 +93,9 @@ class SimulationPredictor:
         self.model_operations = self._load_model_operations(db_path)
         self.model_collectives = self._load_model_collectives(db_path)
         self.collective_configs = self._load_model_collective_configs(db_path)
+        # (op_name, sig_hash) pairs profiled with is_context=1; estimator trains
+        # them with separate prefill/decode models. Drives the split at lookup time.
+        self.context_split_ops = self._load_context_split_ops(db_path)
 
     def _init_predictor(self, cache_dir: str, db_path: str):
         """Initialize latency predictor from CSV cache ONLY.
@@ -138,15 +141,19 @@ class SimulationPredictor:
                     f"{'='*80}"
                 )
 
-            # Infer operation_is_context from operation names
+            # Infer operation_is_context from cache key naming: any op with a
+            # _prefill or _decode variant in the cache is context-split (the
+            # estimator only produces those when is_context=1 in the DB).
+            # This covers Attention, FusedMoE, and any future context-sensitive op.
+            import re
             operation_is_context = {}
             for op_name in cache.predictions.keys():
-                # Attention operations have _prefill or _decode suffix
                 base_name = op_name.replace('_prefill', '').replace('_decode', '')
-                # Remove signature hash
-                import re
                 base_name = re.sub(r'_[0-9a-f]{8}$', '', base_name)
-                operation_is_context[base_name] = 'Attention' in base_name or 'attention' in base_name.lower()
+                if '_prefill' in op_name or '_decode' in op_name:
+                    operation_is_context[base_name] = True
+                else:
+                    operation_is_context.setdefault(base_name, False)
 
             predictor = OperationTimePredictor(
                 models={},  # No sklearn models needed for CSV cache
@@ -196,6 +203,40 @@ class SimulationPredictor:
         except Exception as e:
             print(f"Warning: Failed to load model operations: {e}")
             return {}
+
+    def _load_context_split_ops(self, db_path: str) -> set:
+        """Return {(operation_name, signature_hash)} for ops whose measurements
+        include is_context=1 rows in the DB.
+
+        These ops need the estimator's prefill/decode split handling (same as
+        Attention). Derived from the DB so new context-sensitive ops (e.g.
+        FusedMoE) don't require hardcoding in the predictor.
+        """
+        if not os.path.exists(db_path):
+            return set()
+        try:
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute(
+                """
+                SELECT DISTINCT s.operation_name, s.signature_hash
+                FROM signatures s
+                JOIN results r ON r.signature_hash = s.signature_hash
+                JOIN model_operations mo ON mo.operation_id = s.operation_id
+                JOIN profiled_models pm ON pm.model_id = mo.model_id
+                WHERE pm.model_name = ? AND pm.backend = ?
+                  AND r.is_context = 1
+                """,
+                (self.model_name, self.backend),
+            ).fetchall()
+            conn.close()
+            result = {(op, sig) for op, sig in rows}
+            if result:
+                print(f"Context-split ops (prefill/decode): "
+                      f"{sorted({op for op, _ in result})}")
+            return result
+        except Exception as e:
+            print(f"Warning: Failed to load context_split_ops: {e}")
+            return set()
 
     def _load_model_collectives(self, db_path: str):
         """Load collective operations for this model configuration.
@@ -388,8 +429,11 @@ class SimulationPredictor:
                 sig_short = sig_hash[:8]
                 model_key = f"{op_name}_{sig_short}"
 
-                # For Attention operations, check for _prefill and _decode variants
-                if op_name == "Attention":
+                # Ops whose profile has is_context=1 rows get a prefill/decode split
+                # (estimator trains separate models with the same feature schema).
+                is_split = (op_name, sig_hash) in self.context_split_ops
+
+                if is_split:
                     prefill_key = f"{op_name}_prefill_{sig_short}"
                     decode_key = f"{op_name}_decode_{sig_short}"
                     # Check both models (for sklearn) and predictions (for CSV cache)
@@ -402,7 +446,7 @@ class SimulationPredictor:
                             print(f"[DEBUG Step {step_id}] Skipping {op_name}_{sig_short} - no prefill/decode models found")
                         continue
                 else:
-                    # Standard check for non-Attention operations
+                    # Standard check for non-split operations
                     # Check both models (for sklearn) and predictions (for CSV cache)
                     if model_key not in self.latency_predictor.models and model_key not in self.latency_predictor.predictions:
                         if is_verbose():
@@ -410,7 +454,7 @@ class SimulationPredictor:
                         continue
 
                 # Predict latency based on operation type
-                if op_name == "Attention":
+                if is_split:
                     op_latency = self._estimate_attention_latency(batch, sig_short, op_name, step_id)
                     contribution = op_latency * count
                     total_latency_ms += contribution
@@ -541,8 +585,11 @@ class SimulationPredictor:
                 sig_short = sig_hash[:8]
                 model_key = f"{op_name}_{sig_short}"
 
-                # For Attention operations, check for _prefill and _decode variants
-                if op_name == "Attention":
+                # Ops whose profile has is_context=1 rows get a prefill/decode split
+                # (estimator trains separate models with the same feature schema).
+                is_split = (op_name, sig_hash) in self.context_split_ops
+
+                if is_split:
                     prefill_key = f"{op_name}_prefill_{sig_short}"
                     decode_key = f"{op_name}_decode_{sig_short}"
                     # Check both models (for sklearn) and predictions (for CSV cache)
@@ -555,7 +602,7 @@ class SimulationPredictor:
                             print(f"[DEBUG Step {step_id}] Skipping {op_name}_{sig_short} - no prefill/decode models found")
                         continue
                 else:
-                    # Standard check for non-Attention operations
+                    # Standard check for non-split operations
                     # Check both models (for sklearn) and predictions (for CSV cache)
                     if model_key not in self.latency_predictor.models and model_key not in self.latency_predictor.predictions:
                         if is_verbose():
@@ -563,7 +610,7 @@ class SimulationPredictor:
                         continue
 
                 # Predict latency based on operation type
-                if op_name == "Attention":
+                if is_split:
                     op_latency = self._estimate_attention_latency(batch, sig_short, op_name, step_id)
                     contribution = op_latency * count
                     total_latency_ms += contribution

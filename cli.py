@@ -81,7 +81,7 @@ def main():
 
 
     # Simulator Operations ###############################################
-    parser.add_argument("--max-steps", type=int, default=100000,
+    parser.add_argument("--max-steps", type=int, default=10000000,
                        help="Maximum simulation steps")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose output")

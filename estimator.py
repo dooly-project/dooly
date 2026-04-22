@@ -173,6 +173,18 @@ class SimplifiedExecutionTimeEstimator:
         filter_str = f" (filtered by {', '.join(filter_info)})" if filter_info else ""
         print(f"Loaded {len(self.results_df)} results{filter_str}")
 
+        if self.results_df.empty:
+            raise SystemExit(
+                "\nERROR: no profiled results match the requested filter.\n"
+                f"  model={self.config.model}\n"
+                f"  backend={self.config.backend}\n"
+                f"  tp_size={self.config.tp_size}\n"
+                f"  db_path={self.config.db_path}\n"
+                "List what's actually in the DB with:\n"
+                f"  sqlite3 {self.config.db_path} "
+                "'SELECT model_name, backend, tp_degree FROM profiled_models;'"
+            )
+
         # Check if new columns exist, otherwise parse from workload_params
         self._ensure_columns()
 

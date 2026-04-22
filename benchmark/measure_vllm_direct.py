@@ -7,6 +7,19 @@ import numpy as np
 
 try:
     import torch
+    # Disable torch.compile / Dynamo globally before vLLM imports so the
+    # measurement side matches the profiler-side trace, which is captured
+    # under taintracer.hooks.install_hooks — that utility sets the same flag
+    # for its own reasons (tainted-tensor dispatch is incompatible with
+    # Dynamo). Without this, real vLLM runs modules like GemmaRMSNorm through
+    # a fused Triton kernel (e.g. triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0)
+    # while the profiler recorded the 10 individual aten kernels, so the
+    # simulator's predicted-latency sum wouldn't correspond to the measured
+    # single-kernel cost. Keeping this flag aligned preserves apples-to-
+    # apples comparison between simulator predictions and direct measurement.
+    import torch._dynamo
+    torch._dynamo.config.disable = False
+
     from vllm import LLM, SamplingParams
     from vllm.benchmarks.serve import calculate_metrics, BenchmarkMetrics
     from vllm.benchmarks.datasets import SampleRequest
@@ -861,6 +874,9 @@ def main():
     backend = config.get('backend', args.attention_backend)
     tp = config.get('tensor_parallel_size', args.tensor_parallel_size)
 
+    from vllm.config import CompilationConfig
+    from vllm.config.compilation import CompilationMode, CUDAGraphMode
+    
     llm = LLM(
         model=model,
         dtype="bfloat16",  # Ensure consistent dtype with Dooly
@@ -873,6 +889,10 @@ def main():
         load_format="dummy",
         enforce_eager=True,
         enable_prefix_caching=False,
+        # compilation_config=CompilationConfig(
+        #     mode=CompilationMode.NONE,
+        #     cudagraph_mode=CUDAGraphMode.FULL
+        # ),
         profiler_config={
             'profiler': 'torch',
             'torch_profiler_dir': './vllm_profiles',

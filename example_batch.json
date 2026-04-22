@@ -1,14 +1,14 @@
 {
-  "model": "meta-llama/Llama-3.1-8B",
+  "model": "mistralai/Ministral-8B-Instruct-2410",
   "backend": "FLASHINFER",
   "tensor_parallel_size": 1,
   "topology": "mew1",
   "description": "Example mixed batch with prefill requests",
   "prefill_requests": [
     {
-      "tokens": 1024,
+      "tokens": 65,
       "kv_cache": 0,
-      "comment": "New prefill request with 1024 tokens"
+      "comment": "New prefill request with 65 tokens"
     }
   ]
 }

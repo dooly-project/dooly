@@ -402,7 +402,7 @@ Examples:
     parser.add_argument('--cache-dir', type=str, required=True,
                         help='Directory containing CSV prediction caches')
     parser.add_argument('--db-path', type=str,
-                        default='/home/jkim38/dooly/profiler/database/dooly-test.db',
+                        default='/home/jkim38/dooly/profiler/database/dooly-new.db',
                         help='Path to profiling database')
 
     # Output options

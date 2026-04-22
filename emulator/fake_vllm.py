@@ -15,7 +15,20 @@ def apply_vllm_patch():
     Worker.compile_or_warm_up_model = lambda *a, **k: 0
     Worker.execute_dummy_batch = lambda *a, **k: None
 
-    from vllm.platforms import current_platform                                                                                                                                                   
+    from vllm.platforms import current_platform
     current_platform.__class__.dist_backend = "gloo"
+
+    # DoolySim does not run real kernels. Skip quantization weight-repack
+    # paths that call CUDA-only kernels (e.g. gptq_marlin_repack) during
+    # load. Required for gpt-oss-20b (MXFP4) under CUDA_VISIBLE_DEVICES="".
+    try:
+        from vllm.model_executor.layers.quantization.mxfp4 import (
+            Mxfp4MoEMethod,
+            XpuMxfp4MoEMethod,
+        )
+        Mxfp4MoEMethod.process_weights_after_loading = lambda *a, **k: None
+        XpuMxfp4MoEMethod.process_weights_after_loading = lambda *a, **k: None
+    except ImportError:
+        pass
 
     print("[Fake vLLM] Pathces applied!")

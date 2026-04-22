@@ -86,7 +86,7 @@ def generate_batch_configs(output_dir: str) -> List[str]:
         config_path = os.path.join(output_dir, f"batch_{scenario['name']}.json")
         config_data = {
             "description": scenario["description"],
-            "model": "meta-llama/Llama-3.1-8B",
+            "model": "mistralai/Ministral-8B-Instruct-2410",
             "backend": "FLASHINFER",
             "tensor_parallel_size": 1,
             "prefill_requests": scenario["prefill_requests"],
@@ -103,12 +103,12 @@ def generate_batch_configs(output_dir: str) -> List[str]:
 
 def main():
     # Configuration
-    CACHE_DIR = "./cache/tp2/meta-llama/Llama-3.1-8B/"
-    DB_PATH = "/home/jkim38/dooly/database/dooly-mew3.db"
+    CACHE_DIR = "./cache/tp1/mistralai/Ministral-8B-Instruct-2410/"
+    DB_PATH = "/home/jkim38/dooly/profiler/database/dooly-test.db"
     RESULTS_DIR = "./results/"
     CONFIGS_DIR = "./batch_configs/"
     WARMUP = 3
-    ITERATIONS = 4
+    ITERATIONS = 1
 
     print("Batch Comparison Runner")
     print("=" * 80)
@@ -148,7 +148,7 @@ def main():
             "--batch-config", config_file,
             "--cache-dir", CACHE_DIR,
             "--db-path", DB_PATH,
-            "--json-output", dooly_output
+            "--json-output", dooly_output,
         ]
 
         dooly_success = run_command(dooly_cmd, f"Dooly prediction for {config_name}")
@@ -159,7 +159,7 @@ def main():
             "--batch-config", config_file,
             "--warmup", str(WARMUP),
             "--iterations", str(ITERATIONS),
-            "--max-model-len", "8194",
+            "--max-model-len", "8192",
             "--max-num-seqs", "256",
             "--gpu-memory", "0.9",
             "--out-dir", RESULTS_DIR,

@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import json
+import logging
 import argparse
 from pathlib import Path
 from typing import List, Dict
@@ -24,8 +25,18 @@ import torch
 # Kineto profiling imports for CPU/GPU timing separation
 from torch.profiler import profile, ProfilerActivity, record_function
 
+# Disable torch.compile / Dynamo globally before vLLM imports so the
+# measurement side matches the profiler-side trace, which is captured under
+# taintracer.hooks.install_hooks (that utility also sets this flag for its
+# own reasons). Without this, real vLLM runs modules like GemmaRMSNorm
+# through a fused Triton kernel while the profiler recorded the individual
+# aten kernels, so the simulator's predicted-latency sum wouldn't match
+# measured single-kernel cost.
+# import torch._dynamo
+# torch._dynamo.config.disable = True
+
 try:
-    from vllm import LLM 
+    from vllm import LLM
     from vllm import EngineArgs, LLMEngine, SamplingParams
     from vllm.benchmarks.serve import calculate_metrics, BenchmarkMetrics
     from vllm.benchmarks.datasets import SampleRequest
@@ -42,7 +53,11 @@ simulator_dir = Path(__file__).parent.parent
 if str(simulator_dir) not in sys.path:
     sys.path.insert(0, str(simulator_dir))
 
-from tools.vllm_request_generator import generate_vllm_requests_from_instance, generate_sharegpt_requests_from_instance
+from tools.vllm_request_generator import (
+    generate_vllm_requests_from_instance,
+    generate_sharegpt_requests_from_instance,
+    generate_hf_conversation_requests_from_instance,
+)
 
 
 def run_streaming_benchmark(
@@ -96,6 +111,62 @@ def run_streaming_benchmark(
         prompts = [TokensPrompt(prompt_token_ids=token_ids) for _, token_ids, _, _ in requests]
         llm.generate(prompts, sampling_params=warmup_sampling_params)
         torch.cuda.synchronize()
+
+    # ------------------------------------------------------------------
+    # Streaming-path warmup: one dummy request through the exact
+    # engine.add_request + engine.step() loop the real benchmark uses.
+    # The llm.generate() warmup above autotunes kernels at packed-batch
+    # shapes (e.g. M=max_num_batched_tokens); it does NOT warm the
+    # "single isolated request" path the streaming loop hits at idx=0.
+    # For MoE models (Marlin MXFP4) this path must be autotuned before
+    # the real run or idx=0's prefill pays hundreds of ms of autotune.
+    #
+    # Side-effect safety: uses a unique request_id so it cannot collide
+    # with real requests; drains engine before returning; never touches
+    # the main-loop tracking dicts (request_token_timestamps,
+    # request_batch_info, step_batches, request_arrival_times — all
+    # still-empty at this point) or benchmark timers (start_time /
+    # benchmark_start_time set AFTER this block).
+    # ------------------------------------------------------------------
+    _warmup_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=8,
+        ignore_eos=True,
+    )
+    # Sweep several prompt lengths at quantiles of the request distribution
+    # to seed Marlin MoE autotune at multiple isolated-request M values.
+    # Deduped so each M is warmed once; 5 lengths × ~8-token decode each
+    # adds a couple seconds at most and covers the common shapes the
+    # scheduler will later form under real arrival patterns.
+    _sorted_tokens = sorted((r[1] for r in requests), key=len)
+    _n = len(_sorted_tokens)
+    _warmup_tokens_list = []
+    if _n > 0:
+        _seen_lens: set = set()
+        for q in (0.10, 0.30, 0.50, 0.70, 0.90):
+            idx = min(_n - 1, int(q * _n))
+            tokens = _sorted_tokens[idx]
+            if len(tokens) in _seen_lens:
+                continue
+            _seen_lens.add(len(tokens))
+            _warmup_tokens_list.append(tokens)
+
+    print(
+        f"Streaming-path warmup: {len(_warmup_tokens_list)} isolated-request "
+        f"shapes through engine.step() "
+        f"(M={sorted(len(t) for t in _warmup_tokens_list)})..."
+    )
+    for i, tokens in enumerate(_warmup_tokens_list):
+        _warmup_req_id = f"__dooly_streaming_warmup_{i}__"
+        engine.add_request(
+            request_id=_warmup_req_id,
+            prompt=tokens,
+            params=_warmup_params,
+        )
+        while engine.has_unfinished_requests():
+            engine.step()
+    torch.cuda.synchronize()
+    print("Streaming-path warmup done.")
 
     print(f"Warm up done. Running real runs.")
     # tqdm
@@ -171,8 +242,8 @@ def run_streaming_benchmark(
         step_start = time.perf_counter()
 
         # Debug: Check request scheduling behavior
-        print(f"\n[DEBUG] Step {step_count} - before engine.step()")
-        print(f"  Scheduler state: running={len(scheduler.running)}, waiting={len(scheduler.waiting)}")
+        # print(f"\n[DEBUG] Step {step_count} - before engine.step()")
+        # print(f"  Scheduler state: running={len(scheduler.running)}, waiting={len(scheduler.waiting)}")
 
         request_outputs = engine.step()
 
@@ -181,31 +252,31 @@ def run_streaming_benchmark(
         step_duration = step_end - step_start
 
         # Debug: Show what was actually scheduled and executed in this step
-        if captured_sched_output:
-            print(f"[DEBUG] Step {step_count} - after engine.step()")
-            print(f"  Scheduled new reqs: {len(captured_sched_output.scheduled_new_reqs)}")
-            print(f"  Scheduled cached reqs: {captured_sched_output.scheduled_cached_reqs.num_reqs}")
-            print(f"  Total tokens scheduled: {captured_sched_output.total_num_scheduled_tokens}")
+        # if captured_sched_output:
+        #     print(f"[DEBUG] Step {step_count} - after engine.step()")
+        #     print(f"  Scheduled new reqs: {len(captured_sched_output.scheduled_new_reqs)}")
+        #     print(f"  Scheduled cached reqs: {captured_sched_output.scheduled_cached_reqs.num_reqs}")
+        #     print(f"  Total tokens scheduled: {captured_sched_output.total_num_scheduled_tokens}")
 
-            # Show request outputs
-            print(f"  Request outputs returned: {len(request_outputs)}")
-            for i, output in enumerate(request_outputs[:2]):
-                print(f"    output[{i}]: id={output.request_id[:15]}, finished={output.finished}")
-                if hasattr(output, 'outputs') and output.outputs:
-                    print(f"      tokens_generated={len(output.outputs[0].token_ids)}")
+        #     # Show request outputs
+        #     print(f"  Request outputs returned: {len(request_outputs)}")
+        #     for i, output in enumerate(request_outputs[:2]):
+        #         print(f"    output[{i}]: id={output.request_id[:15]}, finished={output.finished}")
+        #         if hasattr(output, 'outputs') and output.outputs:
+        #             print(f"      tokens_generated={len(output.outputs[0].token_ids)}")
 
         print(f"  Step duration: {step_duration*1000:.2f}ms")
 
         # More debug for first step
-        if step_count == 0:
-            print(f"[DEBUG] First step completed:")
-            print(f"  Duration: {step_duration*1000:.2f}ms")
-            print(f"  Outputs returned: {len(request_outputs)}")
-            if request_outputs and hasattr(request_outputs[0], 'finished'):
-                print(f"  First output finished: {request_outputs[0].finished}")
+        # if step_count == 0:
+        #     print(f"[DEBUG] First step completed:")
+        #     print(f"  Duration: {step_duration*1000:.2f}ms")
+        #     print(f"  Outputs returned: {len(request_outputs)}")
+        #     if request_outputs and hasattr(request_outputs[0], 'finished'):
+        #         print(f"  First output finished: {request_outputs[0].finished}")
 
         current_time = time.perf_counter() - start_time
-        print(f"[t={current_time:.3f}s] Step {step_count} completed in {step_duration*1000:.2f}ms")
+        # print(f"[t={current_time:.3f}s] Step {step_count} completed in {step_duration*1000:.2f}ms")
 
         # Track token timestamps for ITL calculation (matching Dooly's approach).
         # Records wall-clock time when each token is observed in request_outputs,
@@ -221,36 +292,6 @@ def run_streaming_benchmark(
                 prev_count = len(request_token_timestamps[out_req_id])
                 for _ in range(current_token_count - prev_count):
                     request_token_timestamps[out_req_id].append(step_wall_time_sec)
-
-        # # NEW: CPU/GPU split timing with Kineto profiling
-        # # Measure wall-clock time for total duration
-        # wall_start = time.perf_counter()
-
-        # # Create CUDA events for precise GPU timing
-        # gpu_start = torch.cuda.Event(enable_timing=True)
-        # gpu_end = torch.cuda.Event(enable_timing=True)
-
-        # # Record GPU start time
-        # gpu_start.record()
-
-        # # Execute the step
-        # request_outputs = engine.step()
-
-        # # Record GPU end time
-        # gpu_end.record()
-
-        # # Synchronize to ensure GPU work completes
-        # torch.cuda.synchronize()
-
-        # wall_end = time.perf_counter()
-
-        # # Calculate timings
-        # wall_time_ms = (wall_end - wall_start) * 1000
-        # gpu_time_ms = gpu_start.elapsed_time(gpu_end)
-        # cpu_overhead_ms = wall_time_ms - gpu_time_ms
-
-        # # Use wall time as step_duration for compatibility
-        # step_duration = wall_end - wall_start
 
         # Restore original schedule method
         scheduler.schedule = original_schedule
@@ -320,11 +361,6 @@ def run_streaming_benchmark(
             print(f"[Step {step_count}] SCHED: reqs={sorted(scheduled_req_ids)}, "
                     f"tokens={total_tokens_scheduled}, "
                     f"new={num_scheduled_new}, cached={num_scheduled_cached}")
-            # CPU/GPU timing logging disabled - using timestamp instrumentation instead
-            # if step_count % 10 == 0 or num_scheduled_new > 0:
-            #     print(f"[Step {step_count}] TIMING: wall={wall_time_ms:.2f}ms, "
-            #           f"gpu={gpu_time_ms:.2f}ms, cpu_overhead={cpu_overhead_ms:.2f}ms "
-            #           f"({'prefill' if num_scheduled_new > 0 else 'decode'})")
 
         # Process outputs
         for request_output in request_outputs:
@@ -362,9 +398,9 @@ def run_streaming_benchmark(
                             / (metrics.num_generation_tokens - 1))
                     itls = [avg_itl] * (metrics.num_generation_tokens - 1)
 
-                if len(outputs) < 3:
-                    print(f"\n[DEBUG] {req_id} ITL: {len(itls)} values, "
-                        f"first 3: {[f'{x*1000:.2f}ms' for x in itls[:3]]}")
+                # if len(outputs) < 3:
+                #     print(f"\n[DEBUG] {req_id} ITL: {len(itls)} values, "
+                #         f"first 3: {[f'{x*1000:.2f}ms' for x in itls[:3]]}")
 
                 # Use arrival_time from our requests list (ground truth)
                 relative_start_time = request_arrival_times[req_id]
@@ -445,6 +481,13 @@ def main():
                        help="Load requests from JSONL file (for exact comparison)")
     parser.add_argument("--use-sharegpt", type=str, metavar="SHAREGPT_PATH",
                        help="Use ShareGPT dataset (path to ShareGPT JSON)")
+    parser.add_argument("--use-hf-dataset", type=str, metavar="HF_DATASET_PATH",
+                       help=("Use a HuggingFace conversation dataset via vLLM's "
+                             "ConversationDataset (e.g. Aeala/ShareGPT_Vicuna_unfiltered)"))
+    parser.add_argument("--hf-dataset-split", type=str, default="train",
+                       help="HF dataset split (default: train)")
+    parser.add_argument("--hf-dataset-subset", type=str, default=None,
+                       help="HF dataset subset/config name (optional)")
     parser.add_argument("--num-requests", type=int, default=100,
                        help="Number of requests")
     parser.add_argument("--arrival-rate", type=float, default=5.0,
@@ -496,6 +539,20 @@ def main():
             args.export_requests = f"./dataset/{dataset_name}.jsonl"
 
         # Auto-set output files if they're still defaults
+        if args.output == "vllm_streaming.json":
+            args.output = f"./vllm_{dataset_name}.json"
+
+        if not args.batch_composition_output:
+            args.batch_composition_output = f"./comparison/vllm_batch_{dataset_name}.json"
+
+    elif args.use_hf_dataset:
+        # HF conversation dataset: hf-{basename}-{rate}rps-{num_requests}reqs
+        hf_basename = args.use_hf_dataset.replace('/', '_')
+        dataset_name = f"hf-{hf_basename}-{args.arrival_rate:.0f}rps-{args.num_requests}reqs"
+
+        if not args.export_requests:
+            args.export_requests = f"./dataset/{dataset_name}.jsonl"
+
         if args.output == "vllm_streaming.json":
             args.output = f"./vllm_{dataset_name}.json"
 
@@ -554,8 +611,11 @@ def main():
     print("=" * 80)
     print()
     
+    logging.getLogger("vllm.v1.metrics.loggers").setLevel(logging.CRITICAL)
+
     llm = LLM(
             model=args.model,
+            dtype="bfloat16",
             attention_backend=args.backend,
             max_model_len=args.max_model_len,
             max_num_seqs=args.max_num_seqs,
@@ -566,6 +626,10 @@ def main():
             load_format="dummy",
             disable_log_stats=False,
             tensor_parallel_size=args.tp,
+            # compilation_config=CompilationConfig(
+            #     mode=CompilationMode.NONE,
+            #     cudagraph_mode=CUDAGraphMode.FULL
+            # ),
             # Disable async scheduling to ensure each engine.step() synchronously
             # executes the batch it schedules (matching Dooly's behavior).
             # Without this, TP>1 uses step_with_batch_queue() which pipelines
@@ -639,10 +703,41 @@ def main():
             )
             for vllm_req in vllm_requests
         ]
-        
+
         print(f"[REQUESTS] Req_id: {requests[-1][0]} - output len: {requests[-1][2]}")
         print(f"[VLLM_REQUESTS] Req_id: {vllm_requests[-1].request_id} - output len: {vllm_requests[-1].expected_output_len}")
         # exit(0)
+    elif args.use_hf_dataset:
+        # Generate from a HuggingFace conversation dataset
+        print(f"Generating requests from HF dataset: {args.use_hf_dataset}")
+        dooly_requests, vllm_requests = generate_hf_conversation_requests_from_instance(
+            llm=llm,
+            num_requests=args.num_requests,
+            arrival_rate=args.arrival_rate,
+            dataset_path=args.use_hf_dataset,
+            dataset_split=args.hf_dataset_split,
+            dataset_subset=args.hf_dataset_subset,
+            custom_output_len=args.output_len,
+            seed=args.seed,
+        )
+
+        if args.export_requests:
+            from tools.vllm_request_generator import export_vllm_dataset_jsonl
+            arrival_times = [r.arrival_time for r in dooly_requests]
+            export_vllm_dataset_jsonl(vllm_requests, arrival_times, args.export_requests)
+
+        requests = [
+            (req.request_id, req.prompt_token_ids, req.max_tokens, req.arrival_time)
+            for req in dooly_requests
+        ]
+        sample_requests = [
+            SampleRequest(
+                prompt=vllm_req.prompt,
+                prompt_len=vllm_req.prompt_len,
+                expected_output_len=vllm_req.expected_output_len,
+            )
+            for vllm_req in vllm_requests
+        ]
     else:
         # Generate requests using RandomDataset (same as dooly_sim)
         print("Generating requests with vLLM RandomDataset...")
@@ -687,7 +782,7 @@ def main():
     print("Running streaming benchmark...")
     outputs, duration, step_batches = run_streaming_benchmark(
         llm=llm,
-        warmup=0,
+        warmup=2,
         requests=requests,
         verbose=args.verbose,
     )
@@ -796,7 +891,7 @@ def main():
         'start_times': [output.start_time for output in outputs_sorted],
 
         # Batch information for each request
-        'batch_info': [dict(step_batch) for step_batch in step_batches],
+        # 'batch_info': [dict(step_batch) for step_batch in step_batches],
     }
 
     with open(args.output, 'w') as f:
