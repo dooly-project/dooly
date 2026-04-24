@@ -7,8 +7,9 @@ import threading
 import dataclasses
 from typing import Optional, Tuple
 import torch
+import torch as _torch
 from torch.profiler import record_function
-
+import traceback as tb
 from .types import Taint, DimTaint, TaintedInt, TaintedFloat, TaintedShape
 from .tensor import TaintedTensor
 
@@ -399,6 +400,7 @@ def _wrap_factory_output(original_fn):
     """Wrap a tensor creation function to propagate taints from TaintedInt sizes."""
     @functools.wraps(original_fn)
     def wrapper(*args, **kwargs):
+
         has_taint, taints = _extract_taints_from_args(args, kwargs)
 
         # Debug: track creation of tensors with dimension 269
@@ -409,11 +411,16 @@ def _wrap_factory_output(original_fn):
         #     except:
         #         pass
 
+        # self = args[0]
+        # device = self.device
+        # if 'device' not in kwargs:
+        #     kwargs['device'] = device
+
         plain_args = _unwrap_for_factory(args)
         plain_kwargs = _unwrap_for_factory(kwargs)
 
         result = original_fn(*plain_args, **plain_kwargs)
-        if has_taint:
+        if has_taint and result.numel() > 0:
             return TaintedTensor(result, taints)
         return result
 
@@ -1198,7 +1205,6 @@ def _wrap_split(original_fn):
                         else:
                             # Plain int → dimension loses taint
                             new_taints[dim] = None
-
                     new_results.append(TaintedTensor(result, tuple(new_taints)))
                 return tuple(new_results)
             else:
@@ -2431,6 +2437,11 @@ def _wrap_einsum(original_fn):
 
 def install_hooks(int_patch_modules=()):
     """Install hooks on tensor creation functions and enable profiler integration."""
+
+    import torch as _torch
+
+    print(f"[DEBUG install_hooks] default device at hook install time: {_torch._C._get_default_device()}")
+    print(f"[DEBUG install_hooks] test zeros device: {_torch.zeros(1).device}")
     import os
 
     # Disable torch.dynamo - TaintedTensor's custom __torch_dispatch__ is incompatible
@@ -2526,10 +2537,27 @@ def install_hooks(int_patch_modules=()):
         torch.full = _wrap_factory_output(torch._original_full)
         torch.as_tensor = _wrap_factory_output(torch._original_as_tensor)
         torch.from_numpy = _wrap_factory_output(torch._original_from_numpy)
-        
-                
+
+        # DeviceContext.__torch_function__ checks `func in _device_constructors()`.
+        # Our wrappers call the originals directly, so `func` is the pre-patch
+        # object. If _device_constructors() was cached after patching it would
+        # only contain the wrappers, missing the originals.  Mutate the set now
+        # so both are present regardless of cache timing.
+        from torch.utils._device import _device_constructors as _dc
+        _dc().update({
+            _original_zeros,
+            _original_ones,
+            _original_empty,
+            _original_randn,
+            _original_rand,
+            _original_arange,
+            torch._original_tensor,
+            torch._original_full,
+            torch._original_as_tensor,
+        })
+
         # to speed up init process
-        torch.Tensor.uniform_ = lambda self, *args, **kwargs: self
+        # torch.Tensor.uniform_ = lambda self, *args, **kwargs: self
 
     # Swap dispatch to profiler-annotated version
     # DEBUG: Set DISABLE_PROFILER_DISPATCH=1 to use original dispatch

@@ -69,9 +69,6 @@ def register_taint(value: int | float, taint: Taint, components: Optional[Dict[T
 
         # Check if we have a nested DimTaint
         if isinstance(taint, DimTaint):
-            print(f"[ERROR] Nested DimTaint passed to register_taint for value {value}")
-            print(f"  Outer DimTaint.taint = {taint}")
-            print(f"  Inner DimTaint.taint = {taint.taint}")
             # Extract the actual Taint from the nested structure
             while isinstance(taint, DimTaint):
                 taint = taint.taint
@@ -135,11 +132,9 @@ def register_taint(value: int | float, taint: Taint, components: Optional[Dict[T
             'taint': Taint('MIX'),
             'components': components
         }
-        print(f"[REGISTRY] Registered value={value} taint=MIX components={components}, Registry: {TAINT_REGISTRY}")
     else:
         # Pure taint
         TAINT_REGISTRY[value] = taint
-        print(f"[REGISTRY] Registered value={value} taint={taint}, Registry: {TAINT_REGISTRY}")
 
 def lookup_taint(value: int | float):
     """Look up taint info for a value in the global registry.

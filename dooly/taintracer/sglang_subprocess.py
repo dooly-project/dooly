@@ -25,8 +25,109 @@ import os
 import time
 import pdb
 import threading
+from .registry import register_taint
+from .types import TaintedInt, TaintedFloat, Taint
+from .tensor import TaintedTensor
+import traceback
 
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
+# Attributes to taint in SchedulerConfig
+SERVER_ARGS_TAINT_MAP = {
+    # Note: Commenting out max_num_batched_tokens to prevent buffer tainting
+    # Only runtime values (total_num_scheduled_tokens) should be tainted as NUM_TOKS
+    'max_total_num_tokens': 'MAX_NUM_TOKS',
+    'max_running_requests': 'MAX_NUM_REQS',
+
+}
+
+_original_server_args_getattribute = None
+_original_input_batch_num_reqs = None
+
+def patch_server_args(server_args):
+    """Patch SchedulerConfig and InputBatch for workload tainting.
+
+    1. SchedulerConfig: max_num_batched_tokens -> NUM_TOKS, max_num_seqs -> NUM_REQS
+       These taint the buffer sizes used in tensor creation.
+
+    2. InputBatch.num_reqs: Returns TaintedInt for the ACTUAL runtime batch size.
+       This is needed because num_reqs = len(req_id_to_index) is a plain int,
+       and we need the runtime batch dimension to be tainted for LogitsProcessor etc.
+
+    """
+    server_args_cls  = type(server_args)
+    import os
+    global _original_server_args_getattribute
+    global _original_input_batch_num_reqs
+
+    # print(f"[DEBUG @ patch_input_buffers] Called! PID={os.getpid()}", flush=True)
+
+    # Patch SchedulerConfig
+    try:
+        from sglang.srt.managers.scheduler import Scheduler
+        # print("[DEBUG @ patch_input_buffers] Patching SchedulerConfig", flush=True)
+
+        if _original_server_args_getattribute is None:
+            _original_server_args_getattribute = Scheduler.__getattribute__
+
+            def patched_getattribute(self, name):
+                value = _original_server_args_getattribute(self, name)
+                if name in SERVER_ARGS_TAINT_MAP and isinstance(value, int):
+                    raw = int(value)  # strip any existing taint from propagation
+                    taint_name = SERVER_ARGS_TAINT_MAP[name]
+                    register_taint(raw, taint_name)
+                    return TaintedInt(raw, taint_name)
+                return value
+
+            Scheduler.__getattribute__ = patched_getattribute
+    except ImportError as e:
+        print(f"[DEBUG @ patch_input_buffers] SchedulerConfig ImportError - {e}", flush=True)
+
+    # Patch SchedulerOutput to taint num_scheduled_tokens and total_num_scheduled_tokens
+    try:
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        # print("[DEBUG @ patch_input_buffers] Patching SchedulerOutput", flush=True)
+
+        _original_schedule_batch_getattribute = ScheduleBatch.__getattribute__
+
+        def patched_scheduler_output_getattribute(self, name):
+            value = _original_schedule_batch_getattribute(self, name)
+            # if name == 'extend_lens':
+            #     print(f"[DEBUG @ patch_input_buffers] extend_lens accessed!")
+            #     if isinstance(value, list) and not isinstance(value, TaintedList):
+            #         print(f"[DEBUG @ patch_input_buffers] Registering NUM_REQS")
+            #         register_taint(len(value), Taint('NUM_REQS'))
+            #         return TaintedList(value)
+            if name == 'extend_num_tokens':
+                if isinstance(value, int) and not isinstance(value, TaintedInt):
+                    register_taint(value, Taint('NUM_TOKS'))
+                    return TaintedInt(value, 'NUM_TOKS')
+            return value
+
+        ScheduleBatch.__getattribute__ = patched_scheduler_output_getattribute
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch                                                                                                                         
+                                                                                                                                                                                                
+        _original_init_new = ForwardBatch.init_new.__func__                                                                                                                                           
+                                                                                                                                                                                                        
+        @classmethod                                              
+        def patched_init_new(cls, batch, model_runner):
+            ret = _original_init_new(cls, batch, model_runner)                                                                                                                                        
+            num_reqs = len(batch.seq_lens)
+            register_taint(num_reqs, Taint('NUM_REQS'))   
+            if not isinstance(ret.seq_lens, TaintedTensor):                                                                                                                                            
+                ret.seq_lens = TaintedTensor(ret.seq_lens, [Taint('NUM_REQS')])
+            if not isinstance(ret.positions, TaintedTensor):                                                                                                                         
+                ret.positions = TaintedTensor(ret.positions, [Taint('NUM_REQS')])                                                                                                
+            return ret                                                                                                                                                                           
+        
+        ForwardBatch.init_new = patched_init_new  
+
+
+        print("[DEBUG @ patch_input_buffers] SchedulerOutput patch applied", flush=True)
+    except ImportError as e:
+        print(f"[DEBUG @ patch_input_buffers] SchedulerOutput ImportError - {e}", flush=True)
+
 
 
 def tainted_run_scheduler_process(
@@ -58,11 +159,11 @@ def tainted_run_scheduler_process(
     # 2. Re-install tensor factory hooks, custom-op hooks, and int()
     #    patches for the rotary-embedding layer.
     # ------------------------------------------------------------------
-    # install_hooks(
-    #     int_patch_modules=[
-    #         "sglang.srt.layers.rotary_embedding",
-    #     ]
-    # )
+    install_hooks(
+        int_patch_modules=[
+            "sglang.srt.layers.rotary_embedding",
+        ]
+    )
 
     # ------------------------------------------------------------------
     # 3. Patch DummyModelLoader.load_model so that:
@@ -123,19 +224,25 @@ def tainted_run_scheduler_process(
             time.sleep(2)
             with open(dump_path, "wb") as f:
                 pickle.dump(dict(TAINT_REGISTRY), f)
-            print(f"[taintracer] Dumped {len(TAINT_REGISTRY)} entries to {dump_path}")
 
-    print("[DEBUG] threadingprocess running")
     dump_thread = threading.Thread(target=dump_to_file, daemon=True)
     dump_thread.start()
 
 
-    # ------------------------------------------------------------------
-    # 4. Delegate to the real scheduler, then dump registry on exit.
-    # ------------------------------------------------------------------
     from sglang.srt.managers.scheduler import run_scheduler_process
+    try:
+        patch_server_args(server_args)
+    except Exception as e:
+        print(f"[tainted_run_scheduler_process] patch_server_args failed: {e}", flush=True)
+        traceback.print_exc()
 
-    print("[DEBUG] run process")
+
+    # ------------------------------------------------------------------
+    # 4. Delegate to the real scheduler wrapped in torch profiler so that
+    #    GPU kernels (running in this subprocess) are captured in the trace.
+    # ------------------------------------------------------------------
+    # install_hooks()
+
     try:
         return run_scheduler_process(
             server_args,

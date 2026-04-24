@@ -13,6 +13,7 @@ import sys
 import socket
 import argparse
 import time
+import torch
 
 
 def find_free_port() -> int:
@@ -34,7 +35,7 @@ parser.add_argument("--tp", "--tensor_parallel_size", type=int, default=1, dest=
 parser.add_argument("--dtype", type=str, default="bfloat16", help="Model dtype")
 parser.add_argument("--prompts", type=str, default="Hello, how are you? I am fine, and ", help="Prompt to run")
 parser.add_argument("--max-tokens", type=int, default=1, help="Max tokens to generate")
-parser.add_argument("--trace_dir", type=str, default="./vllm_traces_tp", help="Directory to save trace")
+parser.add_argument("--trace_dir", type=str, default="/home/anooprac/profiler/vllm_traces_tp", help="Directory to save trace")
 parser.add_argument("--gpu", type=int, default=0, help="GPU device index to use")
 parser.add_argument("--attention-backend", type=str, default="FLASHINFER", help="Attention backend (FLASHINFER, FLASH_ATTN, XFORMERS)")
 parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
@@ -42,8 +43,8 @@ args = parser.parse_args()
 
 import torch
 import torch.profiler
-os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["SGLANG_ENABLE_TORCH_INFERENCE_MODE"] = "1"
 
 print(f"[Tracer] Set VLLM_ATTENTION_BACKEND={args.attention_backend}")
 
@@ -71,14 +72,10 @@ if "TAINT_REGISTRY_DUMP_BASE" not in os.environ:
 # disable_taint_tracking()
 # print("[Tracer] Taint tracking DISABLED during initialization/warm-up")
 
-patch_autoconfig(verbose=True)
+patch_autoconfig()
 # patch_common_attention_metadata()
 # patch_input_buffers()
-# install_hooks(
-#     int_patch_modules=[
-#         "vllm.model_executor.layers.rotary_embedding",
-#     ]
-# )
+install_hooks()
 
 # # Patch DummyModelLoader to force CUDA move
 # # (dummy models are loaded into CPU for some reason when tainting is enabled)
@@ -176,9 +173,19 @@ if __name__ == "__main__":
 
         # print(Engine.run_scheduler_process_func.__qualname__)
 
-        llm = TaintedEngine(model_path=args.model)
+        # Set TORCH_TRACE_DIR for sglang_subprocess.py to pick up inside the spawned process.
+        os.environ["TORCH_TRACE_DIR"] = args.trace_dir
 
-        # Shut down so the scheduler subprocess exits and flushes the registry dump
+        prompts = [args.prompts, args.prompts, args.prompts, args.prompts, args.prompts]
+        llm = TaintedEngine(model_path=args.model, enable_metrics=True, disable_cuda_graph=True, disable_piecewise_cuda_graph=True, load_format="dummy", enable_tokenizer_batch_encode=True)
+        llm.start_profile(output_dir=args.trace_dir, activities=[
+                "CPU",
+                "GPU",
+            ], with_stack=False, record_shapes=True, )
+        sampling_params={"max_new_tokens": 1, "temperature": 0.0}
+        outputs = llm.generate(prompt=prompts, sampling_params=sampling_params)
+        llm.stop_profile()
+        print(f"output: {outputs}")
 
         # Sleep so children process dumping thread has time to write back to file
         time.sleep(5)

@@ -419,15 +419,15 @@ def unpatch_autoconfig():
         except ImportError:
             pass
 
-_original_scheduler_config_getattribute = None
+_original_server_args_getattribute = None
 _original_input_batch_num_reqs = None
 
 # Attributes to taint in SchedulerConfig
-SCHEDULER_CONFIG_TAINT_MAP = {
+SERVER_ARGS_TAINT_MAP = {
     # Note: Commenting out max_num_batched_tokens to prevent buffer tainting
     # Only runtime values (total_num_scheduled_tokens) should be tainted as NUM_TOKS
-    'max_num_batched_tokens': 'MAX_NUM_TOKS',
-    'max_num_seqs': 'MAX_NUM_REQS',
+    'max_total_num_tokens': 'MAX_NUM_TOKS',
+    'max_running_requests': 'MAX_NUM_REQS',
 
 }
 
@@ -494,131 +494,131 @@ def patch_input_buffers():
 
     """
     import os
-    global _original_scheduler_config_getattribute
+    global _original_server_args_getattribute
     global _original_input_batch_num_reqs
 
     # print(f"[DEBUG @ patch_input_buffers] Called! PID={os.getpid()}", flush=True)
 
     # Patch SchedulerConfig
     try:
-        from vllm.config.scheduler import SchedulerConfig
+        from sglang.srt.server_args import ServerArgs
         # print("[DEBUG @ patch_input_buffers] Patching SchedulerConfig", flush=True)
 
-        if _original_scheduler_config_getattribute is None:
-            _original_scheduler_config_getattribute = SchedulerConfig.__getattribute__
+        if _original_server_args_getattribute is None:
+            _original_server_args_getattribute = ServerArgs.__getattribute__
 
             def patched_getattribute(self, name):
-                value = _original_scheduler_config_getattribute(self, name)
-                if name in SCHEDULER_CONFIG_TAINT_MAP:
+                value = _original_server_args_getattribute(self, name)
+                if name in SERVER_ARGS_TAINT_MAP:
                     if isinstance(value, int) and not isinstance(value, TaintedInt):
-                        register_taint(value, Taint(SCHEDULER_CONFIG_TAINT_MAP[name]))
-                        return TaintedInt(value, SCHEDULER_CONFIG_TAINT_MAP[name])
+                        register_taint(value, Taint(SERVER_ARGS_TAINT_MAP[name]))
+                        return TaintedInt(value, SERVER_ARGS_TAINT_MAP[name])
                 return value
 
-            SchedulerConfig.__getattribute__ = patched_getattribute
+            ServerArgs.__getattribute__ = patched_getattribute
             # print("[DEBUG @ patch_input_buffers] SchedulerConfig patch applied", flush=True)
     except ImportError as e:
         print(f"[DEBUG @ patch_input_buffers] SchedulerConfig ImportError - {e}", flush=True)
 
     # Patch SchedulerOutput to taint num_scheduled_tokens and total_num_scheduled_tokens
-    try:
-        from vllm.v1.core.sched.output import SchedulerOutput
-        # print("[DEBUG @ patch_input_buffers] Patching SchedulerOutput", flush=True)
+    # try:
+    #     from vllm.v1.core.sched.output import SchedulerOutput
+    #     # print("[DEBUG @ patch_input_buffers] Patching SchedulerOutput", flush=True)
 
-        # Custom dict that returns TaintedInt for len()
-        class TaintedLenDict(dict):
-            def __len__(self):
-                return TaintedInt(super().__len__(), 'NUM_REQS')
+    #     # Custom dict that returns TaintedInt for len()
+    #     class TaintedLenDict(dict):
+    #         def __len__(self):
+    #             return TaintedInt(super().__len__(), 'NUM_REQS')
 
-        _original_scheduler_output_getattribute = SchedulerOutput.__getattribute__
+    #     _original_scheduler_output_getattribute = SchedulerOutput.__getattribute__
 
-        def patched_scheduler_output_getattribute(self, name):
-            value = _original_scheduler_output_getattribute(self, name)
-            if name == 'num_scheduled_tokens':
-                if isinstance(value, dict) and not isinstance(value, TaintedLenDict):
-                    register_taint(len(value), Taint('NUM_REQS'))
-                    return TaintedLenDict(value)
-            elif name == 'total_num_scheduled_tokens':
-                if isinstance(value, int) and not isinstance(value, TaintedInt):
-                    register_taint(value, Taint('NUM_TOKS'))
-                    return TaintedInt(value, 'NUM_TOKS')
-            return value
+    #     def patched_scheduler_output_getattribute(self, name):
+    #         value = _original_scheduler_output_getattribute(self, name)
+    #         if name == 'num_scheduled_tokens':
+    #             if isinstance(value, dict) and not isinstance(value, TaintedLenDict):
+    #                 register_taint(len(value), Taint('NUM_REQS'))
+    #                 return TaintedLenDict(value)
+    #         elif name == 'total_num_scheduled_tokens':
+    #             if isinstance(value, int) and not isinstance(value, TaintedInt):
+    #                 register_taint(value, Taint('NUM_TOKS'))
+    #                 return TaintedInt(value, 'NUM_TOKS')
+    #         return value
 
-        SchedulerOutput.__getattribute__ = patched_scheduler_output_getattribute
-        # print("[DEBUG @ patch_input_buffers] SchedulerOutput patch applied", flush=True)
-    except ImportError as e:
-        print(f"[DEBUG @ patch_input_buffers] SchedulerOutput ImportError - {e}", flush=True)
+    #     SchedulerOutput.__getattribute__ = patched_scheduler_output_getattribute
+    #     # print("[DEBUG @ patch_input_buffers] SchedulerOutput patch applied", flush=True)
+    # except ImportError as e:
+    #     print(f"[DEBUG @ patch_input_buffers] SchedulerOutput ImportError - {e}", flush=True)
 
-    # Patch model_runner's len() to prevent it from stripping int subclasses
-    try:
-        import vllm.v1.worker.gpu.model_runner as model_runner_mod
-        # print("[DEBUG @ patch_input_buffers] Patching model_runner.len (v2)", flush=True)
-        import builtins
-        _original_len = builtins.len
+    # # Patch model_runner's len() to prevent it from stripping int subclasses
+    # try:
+    #     import vllm.v1.worker.gpu.model_runner as model_runner_mod
+    #     # print("[DEBUG @ patch_input_buffers] Patching model_runner.len (v2)", flush=True)
+    #     import builtins
+    #     _original_len = builtins.len
         
-        def tainted_len(obj):
-            if hasattr(obj, '__class__') and obj.__class__.__name__ == 'TaintedLenDict':
-                return obj.__len__()
-            return _original_len(obj)
+    #     def tainted_len(obj):
+    #         if hasattr(obj, '__class__') and obj.__class__.__name__ == 'TaintedLenDict':
+    #             return obj.__len__()
+    #         return _original_len(obj)
             
-        model_runner_mod.len = tainted_len
-        # print("[DEBUG @ patch_input_buffers] model_runner.len (v2) patch applied", flush=True)
-    except ImportError as e:
-        print(f"[DEBUG @ patch_input_buffers] v2 model_runner ImportError - {e}", flush=True)
+    #     model_runner_mod.len = tainted_len
+    #     # print("[DEBUG @ patch_input_buffers] model_runner.len (v2) patch applied", flush=True)
+    # except ImportError as e:
+    #     print(f"[DEBUG @ patch_input_buffers] v2 model_runner ImportError - {e}", flush=True)
 
-    # Patch ModelArchitectureConfig to prevent Pydantic from stripping taints during coercion
-    try:
-        from vllm.config.model_arch import ModelArchitectureConfig
-        if not hasattr(ModelArchitectureConfig, '_is_taint_patched'):
-            _original_model_arch_config_init = ModelArchitectureConfig.__init__
+    # # Patch ModelArchitectureConfig to prevent Pydantic from stripping taints during coercion
+    # try:
+    #     from vllm.config.model_arch import ModelArchitectureConfig
+    #     if not hasattr(ModelArchitectureConfig, '_is_taint_patched'):
+    #         _original_model_arch_config_init = ModelArchitectureConfig.__init__
 
-            def patched_model_arch_config_init(self, *args, **kwargs):
-                # Save a copy of the kwargs to preserve taints before Pydantic coerces them
-                _kwargs_copy = kwargs.copy()
+    #         def patched_model_arch_config_init(self, *args, **kwargs):
+    #             # Save a copy of the kwargs to preserve taints before Pydantic coerces them
+    #             _kwargs_copy = kwargs.copy()
 
-                # Run original pydantic init which coerces types
-                _original_model_arch_config_init(self, *args, **kwargs)
+    #             # Run original pydantic init which coerces types
+    #             _original_model_arch_config_init(self, *args, **kwargs)
 
-                # Restore tainted ints
-                for k, v in _kwargs_copy.items():
-                    if isinstance(v, TaintedInt):
-                        object.__setattr__(self, k, v)
+    #             # Restore tainted ints
+    #             for k, v in _kwargs_copy.items():
+    #                 if isinstance(v, TaintedInt):
+    #                     object.__setattr__(self, k, v)
 
-            ModelArchitectureConfig.__init__ = patched_model_arch_config_init
-            ModelArchitectureConfig._is_taint_patched = True
-    except ImportError as e:
-        print(f"[DEBUG @ patch_input_buffers] ModelArchitectureConfig ImportError - {e}", flush=True)
+    #         ModelArchitectureConfig.__init__ = patched_model_arch_config_init
+    #         ModelArchitectureConfig._is_taint_patched = True
+    # except ImportError as e:
+    #     print(f"[DEBUG @ patch_input_buffers] ModelArchitectureConfig ImportError - {e}", flush=True)
 
-    # Patch ModelConfig to recursively taint all integer attributes after __post_init__
-    try:
-        from vllm.config.model import ModelConfig
-        if not hasattr(ModelConfig, '_is_recursive_taint_patched'):
-            _original_model_config_post_init = ModelConfig.__post_init__
+    # # Patch ModelConfig to recursively taint all integer attributes after __post_init__
+    # try:
+    #     from vllm.config.model import ModelConfig
+    #     if not hasattr(ModelConfig, '_is_recursive_taint_patched'):
+    #         _original_model_config_post_init = ModelConfig.__post_init__
 
-            def patched_model_config_post_init(self, *args, **kwargs):
-                # Run original __post_init__ with all arguments
-                _original_model_config_post_init(self, *args, **kwargs)
-                # Recursively taint all integer attributes
-                print(f"[TAINT] ModelConfig.__post_init__ called, tainting as MODEL_CONFIG", flush=True)
-                _recursively_taint_config(self, taint_str='MODEL_CONFIG')
+    #         def patched_model_config_post_init(self, *args, **kwargs):
+    #             # Run original __post_init__ with all arguments
+    #             _original_model_config_post_init(self, *args, **kwargs)
+    #             # Recursively taint all integer attributes
+    #             print(f"[TAINT] ModelConfig.__post_init__ called, tainting as MODEL_CONFIG", flush=True)
+    #             _recursively_taint_config(self, taint_str='MODEL_CONFIG')
         
-            def patched_model_config_setattr(self, name, value):
-                # Intercept changes to num_attention_heads and other integer attributes that might be set after __post_init__
-                if isinstance(value, int) and not isinstance(value, (bool, TaintedInt)):
-                    register_taint(value, Taint('MODEL_CONFIG'))
-                    value = TaintedInt(value, 'MODEL_CONFIG')
-                elif isinstance(value, float) and not isinstance(value, TaintedFloat):
-                    register_taint(value, Taint('MODEL_CONFIG'))
-                    value = TaintedFloat(value, 'MODEL_CONFIG')
-                object.__setattr__(self, name, value)
+    #         def patched_model_config_setattr(self, name, value):
+    #             # Intercept changes to num_attention_heads and other integer attributes that might be set after __post_init__
+    #             if isinstance(value, int) and not isinstance(value, (bool, TaintedInt)):
+    #                 register_taint(value, Taint('MODEL_CONFIG'))
+    #                 value = TaintedInt(value, 'MODEL_CONFIG')
+    #             elif isinstance(value, float) and not isinstance(value, TaintedFloat):
+    #                 register_taint(value, Taint('MODEL_CONFIG'))
+    #                 value = TaintedFloat(value, 'MODEL_CONFIG')
+    #             object.__setattr__(self, name, value)
 
-            ModelConfig.__post_init__ = patched_model_config_post_init
-            ModelConfig.__setattr__ = patched_model_config_setattr
+    #         ModelConfig.__post_init__ = patched_model_config_post_init
+    #         ModelConfig.__setattr__ = patched_model_config_setattr
             
-            ModelConfig._is_recursive_taint_patched = True
+    #         ModelConfig._is_recursive_taint_patched = True
             
-    except ImportError as e:
-        print(f"[DEBUG @ patch_input_buffers] ModelConfig ImportError - {e}", flush=True)
+    # except ImportError as e:
+    #     print(f"[DEBUG @ patch_input_buffers] ModelConfig ImportError - {e}", flush=True)
 
     # Patch CacheConfig via __init__ and __setattr__ since block_size is set after init
     # try:
