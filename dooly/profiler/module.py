@@ -33,6 +33,13 @@ class ModuleInfo:
     count: int = 0 # count of occurance (before deduplication)
     hierarchy: Optional[OperationHierarchy] = field(default=None, repr=False)
     absorbed_ops: List[str] = field(default_factory=list)  # ops merged into this module by resolver
+    # Short hash of the module instance's primitive attrs, captured by the
+    # taintracer via _extract_module_state_hash. Populated only for modules
+    # (is_module=True) whose MODULE annotation carried a STATE: trailer.
+    # Used by _module_signature so two layer instances that differ only in
+    # runtime-branching config (e.g. sliding_window=None vs 4096) hash to
+    # distinct signatures even when their kernel symbols match.
+    state_hash: str = ""
     
     # Convenience properties for accessing hierarchy info
     @property
@@ -260,6 +267,14 @@ class ModuleComparator:
         ]
         if module.is_module:
             parts.append(self._get_module_kernel_signature(module))
+            # Module-instance state hash. Distinguishes two instances of the
+            # same class that share kernel symbols but differ in
+            # runtime-branching config (e.g. Attention layers with
+            # sliding_window=None vs 4096 under FA2/Triton — the kernel
+            # symbol alone can't see the difference, but the module's
+            # primitive attrs can). Empty string for older traces or modules
+            # with no capturable state — preserves legacy hash behavior.
+            parts.append(module.state_hash or "")
         return tuple(parts)
 
     def _hash_signature(self, signature: Tuple) -> str:

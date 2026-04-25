@@ -576,7 +576,7 @@ class TaintedTensor(torch.Tensor):
         input_infos = []
         propagation_dict = {}
         primary_tainted_tensor = None
-        
+
         def collect_from(obj):
             nonlocal primary_tainted_tensor
             if isinstance(obj, TaintedTensor):

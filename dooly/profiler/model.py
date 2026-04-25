@@ -37,7 +37,11 @@ class ModelInfo:
             verbose=False,
             metadata_path=None
         )
-        
+        # Preserve the tracer-time taint registry so the resolver can do
+        # inverse lookups (e.g. which value carries NUM_REQS?) without having
+        # to rescan the trace file.
+        self.taint_registry = getattr(parser, 'taint_registry', {}) or {}
+
         self.used_ops: List[ModuleInfo] = [op for op in self.all_ops if not op.is_collective_op]
         self.collective_ops: List[ModuleInfo] = [op for op in self.all_ops if op.is_collective_op]
         self.to_profile: List[ModuleInfo] = self.used_ops

@@ -86,6 +86,7 @@ class ModuleResolver:
         dtype: torch.dtype = torch.bfloat16,
         max_batch_size: int = 4,
         max_seq_len: int = 128,
+        taint_registry: Optional[Dict[int, str]] = None,
     ):
         self.vlp = vlp
         self.importer = importer
@@ -97,6 +98,22 @@ class ModuleResolver:
         # Cache path selection keyed by (class_name, target_kernel_tuple) so
         # dummy-with-capture runs at most once per distinct kernel variant.
         self._path_cache: Dict[Tuple[str, Tuple[str, ...]], str] = {}
+        # Trace-time TAINT_REGISTRY (value -> taint name), passed in by the
+        # profiler driver after TraceParser extracted it from the trace file.
+        # Used to look up semantic dimension values (e.g. NUM_REQS) that are
+        # not tagged on the module's direct tensor inputs — the Attention
+        # module's q/k/v have NUM_TOKS but not NUM_REQS, so we fall back to
+        # this registry to recover batch_size.
+        self.taint_registry: Dict[int, str] = taint_registry or {}
+
+    def _lookup_in_registry(self, taint_name: str) -> Optional[int]:
+        """Return the registry value whose taint matches `taint_name` (first
+        hit, case-insensitive). Returns None if no entry is present."""
+        target = taint_name.upper()
+        for value, name in self.taint_registry.items():
+            if str(name).upper() == target and value > 0:
+                return int(value)
+        return None
 
     # ------------------------------------------------------------------
     # Public API
@@ -265,8 +282,33 @@ class ModuleResolver:
         else:
             target_kernels = tuple(sorted({k.name for k in module.kernels if k.name}))
 
+        # State-hash pre-filter. For backends where the kernel symbol doesn't
+        # encode every runtime-branching dim (FA2/Triton SWA: same kernel, but
+        # window_size changes behavior), narrow the candidate paths to the
+        # layer instances whose primitive attrs hash to the target value.
+        # Without this, kernel-match would succeed on layer 0 for every sig
+        # and both SWA/full variants would profile the same non-SWA layer.
+        target_state_hash = (module.state_hash or "").strip()
+        if len(paths) > 1 and target_state_hash:
+            from dooly.taintracer.hooks import _extract_module_state_hash
+            filtered_paths = []
+            for p in paths:
+                try:
+                    sub = self.vlp.model.get_submodule(p)
+                except Exception:
+                    continue
+                if _extract_module_state_hash(sub) == target_state_hash:
+                    filtered_paths.append(p)
+            if filtered_paths:
+                if len(filtered_paths) < len(paths):
+                    print(f"[RESOLVER]   State-hash filter: "
+                          f"{len(paths)} → {len(filtered_paths)} paths "
+                          f"(target={target_state_hash})")
+                paths = filtered_paths
+                callable_path = paths[0]
+
         if len(paths) > 1 and target_kernels:
-            cache_key = (lookup_name, target_kernels)
+            cache_key = (lookup_name, target_kernels, target_state_hash)
             cached = self._path_cache.get(cache_key)
             if cached is not None and cached in paths:
                 callable_path = cached
@@ -327,6 +369,10 @@ class ModuleResolver:
             captured = self._capture_kernels(submodule, module, layer_name=path)
             if captured is None:
                 continue
+            
+            # print(captured)
+            # print(target_kernels)
+            # return None
             if target_kernels.issubset(captured):
                 return path
             # Log mismatch to help debugging without being too noisy.
@@ -420,20 +466,43 @@ class ModuleResolver:
             trace_num_requests = _extract_num_requests_from_inputs(module.inputs)
 
             if layer_name is not None:
-                # Attention-style module needs AttentionBatchConfig; assume the
-                # tracer ran a prefill (that's how the FlashInfer prefill
-                # kernels in the trace got dispatched). Batch size 1 matches
-                # what vLLM typically runs during trace generation.
+                # Attention-style module needs AttentionBatchConfig. Every knob
+                # we DON'T derive from the trace will push FlashInfer (and
+                # similar backends) toward a different tile-heuristic template
+                # specialization, which makes kernel-match's issubset check
+                # fail — so the resolver silently falls back to paths[0] for
+                # every Attention sig, collapsing SWA and full-attention
+                # variants onto the same layer. Use every field we can.
                 if trace_num_tokens is None or trace_num_tokens <= 0:
                     print("[RESOLVER]   Could not derive num_tokens from trace inputs")
                     return False
+                # batch_size precedence:
+                #   1. NUM_REQS tag on one of the module's direct inputs
+                #      (rare: q/k/v only have NUM_TOKS tagged, so this is
+                #      usually None for Attention modules).
+                #   2. NUM_REQS inverse-lookup in the trace-time taint
+                #      registry (filled in at trace time, carried through
+                #      from run-tracer.py to TraceParser to here).
+                #   3. Fallback to 1.
+                trace_batch = (
+                    (trace_num_requests if (trace_num_requests and trace_num_requests > 0) else None)
+                    or self._lookup_in_registry("NUM_REQS")
+                    or 1
+                )
+                # AttentionBatchConfig.prefill_chunk_size means tokens PER SEQ,
+                # not total. Total tokens (what the Q/K/V tensors carry) is
+                # batch_size * prefill_chunk_size, so split trace_num_tokens
+                # evenly across trace_batch requests.
+                per_seq = max(1, trace_num_tokens // trace_batch)
                 workload_batch = AttentionBatchConfig(
-                    prefill_chunk_size=trace_num_tokens,
+                    prefill_chunk_size=per_seq,
                     kv_cache_size=0,
-                    batch_size=1,
+                    batch_size=trace_batch,
                     is_prefill=True,
                 )
-                tensor_workload = [trace_num_tokens]
+                # tensor_workload is the ACTUAL num_tokens the Q/K/V tensors
+                # carry (total across all batches) — equals batch * per_seq.
+                tensor_workload = [trace_batch * per_seq]
             else:
                 # Non-attention: a single scalar num_tokens (or per-request
                 # slice) is enough; mirror the generator's dict format.
@@ -492,12 +561,23 @@ class ModuleResolver:
                         slot_mapping_dict = {layer_name: common_meta.slot_mapping}
                         num_tokens_for_context = common_meta.num_actual_tokens
                 except Exception as e:
-                    print(f"[RESOLVER]   Could not build metadata for {layer_name}: {e}")
-                    forward_context = None
+                    # vLLM's invariant: forward_context must be *set* during any
+                    # module forward — even for ops that don't consume attention
+                    # metadata (MoE, Mamba, any op that calls get_forward_context
+                    # for batch-level state). Fall back to an empty context so
+                    # `get_forward_context()` finds something and doesn't raise
+                    # the "Forward context is not set" guard. Metadata content
+                    # stays empty; ops that actually need attention metadata
+                    # would fail further downstream with a clearer KeyError.
+                    print(f"[RESOLVER]   No metadata for {layer_name} "
+                          f"(ok for non-attention ops): {e}")
+                    forward_context = {layer_name: None}
                     slot_mapping_dict = None
                     num_tokens_for_context = None
             else:
-                # print(f"[RESOLVER DEBUG] No forward_context needed (layer_name={layer_name}, is_AttentionBatchConfig={isinstance(workload_batch, AttentionBatchConfig)})")
+                # No layer_name / not an AttentionBatchConfig workload: ops
+                # like aten::linear, aten::embedding, etc. don't read forward
+                # context, so leave it None to preserve existing behavior.
                 pass
             
             def run_callable():
@@ -640,6 +720,13 @@ class ModuleResolver:
             # Update anchor to parent (original failed, so safe to mutate)
             hierarchy.anchor = parent_event
 
+            # Inherit the state hash the taintracer attached to the parent's
+            # MODULE annotation (stripped by parser.py into args['state_hash']).
+            # Carrying it on the ModuleInfo lets the signature builder
+            # distinguish parents that differ only in runtime-branching
+            # config (e.g. sliding_window on FA/Triton Attention).
+            parent_state_hash = (parent_event.args or {}).get("state_hash", "") or ""
+
             return ModuleInfo(
                 module_name=parent_name,
                 operation_name=parent_name,
@@ -649,6 +736,7 @@ class ModuleResolver:
                 dtype=original.dtype,
                 hierarchy=hierarchy,
                 count=original.count,  # inherit count from original module
+                state_hash=parent_state_hash,
             )
         else:
             # cpu_op parent: use the same import path, just different op name

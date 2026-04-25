@@ -117,8 +117,9 @@ def resolve_model(model, dtype, attention_backend, max_seq_len, result_queue, gp
     resolver = ModuleResolver(
         vlp=vlp,
         importer=importer,
-        dtype=dtype
-    ) 
+        dtype=dtype,
+        taint_registry=getattr(model, 'taint_registry', {}) or {},
+    )
 
     resolved_ops = resolver.resolve(model.used_ops)
 
@@ -250,9 +251,9 @@ def main() -> None:
         gpu=args.gpu,
     )
     
-    start_time = time()
+    import time
+    start_time = time.perf_counter()
     profiler.profile(models)
-    elapsed_s = time() - start_time
    
     # limit model to profile by one
     if models[0].collective_ops and len(models) == 1 and args.profile_comm:
@@ -267,7 +268,7 @@ def main() -> None:
             use_cuda_graph=not args.no_cuda_graph_comm  # Default True unless disabled
         )
     
-    
+    elapsed_s = time.perf_counter() - start_time    
     print(f"Profiling completed in {elapsed_s:.2f}s")
 
 if __name__ == "__main__":

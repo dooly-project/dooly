@@ -2,6 +2,9 @@ import os
 import socket
 import sqlite3
 import json
+import csv
+import time
+from datetime import datetime
 from pathlib import Path
 import torch
 import torch.distributed as dist
@@ -200,6 +203,23 @@ class Profiler:
         # Initialize database if db_path provided
         if self.db_path:
             self._init_db()
+
+        # Per-operation wall-time log (CSV, one row per profiled module).
+        # When running parallel shards across GPUs, each shard sets
+        # DOOLY_TIMING_SHARD (e.g. "gpu0") so the file name is unique and
+        # workers don't race on the same CSV.
+        shard = os.environ.get("DOOLY_TIMING_SHARD", "").strip()
+        suffix = f"_{shard}" if shard else ""
+        self.timing_log_path: Optional[str] = None
+        if self.db_path:
+            self.timing_log_path = str(
+                Path(self.db_path).with_name(f"profile_timings{suffix}.csv")
+            )
+        else:
+            self.timing_log_path = str(
+                Path(output_path).parent / f"profile_timings{suffix}.csv"
+            )
+        self._init_timing_log()
 
         self.dtype = dtype
 
@@ -507,6 +527,56 @@ class Profiler:
         conn.close()
         print(f"[PROFILER] Initialized database at {self.db_path}")
 
+    # ------------------------------------------------------------------
+    # Per-operation timing log
+    # ------------------------------------------------------------------
+
+    TIMING_LOG_FIELDS = (
+        "timestamp", "model_name", "backend", "tp", "phase",
+        "operation_name", "module_name", "signature_hash",
+        "n_configs", "n_results", "wall_time_s",
+    )
+
+    def _init_timing_log(self) -> None:
+        """Ensure the timing-log CSV exists with a header."""
+        if not self.timing_log_path:
+            return
+        path = Path(self.timing_log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            with open(path, "w", newline="") as f:
+                csv.writer(f).writerow(self.TIMING_LOG_FIELDS)
+
+    def _append_timing(
+        self,
+        model_name: str,
+        phase: str,
+        operation_name: str,
+        module_name: Optional[str],
+        signature_hash: Optional[str],
+        n_configs: int,
+        n_results: int,
+        wall_time_s: float,
+    ) -> None:
+        """Append one timing row. Safe to call from parent or subprocess."""
+        if not self.timing_log_path:
+            return
+        row = [
+            datetime.utcnow().isoformat(timespec="seconds"),
+            model_name,
+            self.attention_backend,
+            self.tp_config,
+            phase,
+            operation_name,
+            module_name or "",
+            signature_hash or "",
+            n_configs,
+            n_results,
+            f"{wall_time_s:.4f}",
+        ]
+        with open(self.timing_log_path, "a", newline="") as f:
+            csv.writer(f).writerow(row)
+
     # main profiling function
     def profile(self, models_to_profile: List[ProfileModel]) -> None:
         results, attention_results, attention_kernel_infos = self._profile_models(models_to_profile)
@@ -610,16 +680,30 @@ class Profiler:
 
             torch.cuda.empty_cache()
 
+            _t_start = time.perf_counter()
             module_results = self._profile_single_raw_op(
                 module, model, callable_obj,
                 max_model_len=self.max_model_len,
                 sig_hash=sig_hash,
                 sig_json=sig_json,
             )
+            _wall_s = time.perf_counter() - _t_start
+
+            n_results = len(module_results) if module_results else 0
+            self._append_timing(
+                model_name=model.name,
+                phase="raw_op",
+                operation_name=module.operation_name,
+                module_name=module.module_name,
+                signature_hash=sig_hash,
+                n_configs=n_results,
+                n_results=n_results,
+                wall_time_s=_wall_s,
+            )
 
             if module_results:
                 all_results.extend(module_results)
-                tqdm.write(f"  Profiled {len(module_results)} configs")
+                tqdm.write(f"  Profiled {len(module_results)} configs in {_wall_s:.2f}s")
 
         print(f"[PROFILER] Finished profiling {len(all_results)} raw op configs")
         return all_results
@@ -651,11 +735,16 @@ class Profiler:
             gpu=self.gpu,
         )
 
-        # Re-resolve callables with loaded model
+        # Re-resolve callables with loaded model. Pass the taint_registry
+        # that was captured at trace time (stored on ModelInfo by TraceParser)
+        # so the resolver can recover NUM_REQS when the module's direct
+        # tensor inputs don't expose that dim — matches what
+        # run-profiler.py does at Phase 1.
         resolver = ModuleResolver(
             vlp=self.module_caller,
             importer=self.importer,
             dtype=self.dtype,
+            taint_registry=getattr(model, 'taint_registry', {}) or {},
         )
 
         resolved_modules = []
@@ -673,16 +762,30 @@ class Profiler:
 
             torch.cuda.empty_cache()
 
+            _t_start = time.perf_counter()
             module_results = self._profile_single_module_for_model(
                 module, model, callable_obj,
                 max_model_len=self.max_model_len,
                 sig_hash=sig_hash,
                 sig_json=sig_json,
             )
+            _wall_s = time.perf_counter() - _t_start
+
+            n_results = len(module_results) if module_results else 0
+            self._append_timing(
+                model_name=model.name,
+                phase="vllm_module",
+                operation_name=module.operation_name,
+                module_name=module.module_name,
+                signature_hash=sig_hash,
+                n_configs=n_results,
+                n_results=n_results,
+                wall_time_s=_wall_s,
+            )
 
             if module_results:
                 all_results.extend(module_results)
-                tqdm.write(f"  Profiled {len(module_results)} configs")
+                tqdm.write(f"  Profiled {len(module_results)} configs in {_wall_s:.2f}s")
 
         self.module_caller.close()
 
@@ -862,10 +965,11 @@ class Profiler:
                 dtype=self.dtype,
             )
 
-            workload_configs = generator.prepare_inputs(
-                mode=self.workload_mode,
-                use_batch_config=(layer_name is not None)
-            )
+            # Let the InputGenerator classify the op and pick the right sweep.
+            # Previously forced use_batch_config=True for any registered layer,
+            # which over-swept MoE (FusedMoE / SharedFusedMoE) on kv_cache_size
+            # / prefill_chunk_size axes that don't affect MoE latency.
+            workload_configs = generator.prepare_inputs(mode=self.workload_mode)
 
             # Sort workload configs by size descending so large configs fail early if OOM
             def get_config_size(config):
@@ -934,10 +1038,20 @@ class Profiler:
                             slot_mapping_dict = {layer_name: common_meta.slot_mapping}
                             num_tokens_for_context = common_meta.num_actual_tokens
                     except Exception as e:
-                        print(f"[PROFILER] Warning: Could not build metadata: {e}")
-                        forward_context = None
+                        # Metadata build failed — fall back to an empty forward_context
+                        # so vLLM's invariant holds (any module forward expects a
+                        # context set). Matches resolver.py behaviour.
+                        print(f"[PROFILER] Warning: Could not build metadata (ok for non-attention ops): {e}")
+                        forward_context = {layer_name: None}
                         slot_mapping_dict = None
                         num_tokens_for_context = None
+                elif layer_name:
+                    # Registered layer with a non-AttentionBatchConfig sweep (e.g.
+                    # MoE using the 1-D num_tokens dict path). Metadata isn't
+                    # applicable, but the module still calls get_forward_context()
+                    # internally and will raise without one. Provide an empty
+                    # context so the kernel can dispatch.
+                    forward_context = {layer_name: None}
 
                 def run_callable():
                     # Reconstruct kwargs from arg_name if present (for modules called with keyword args)

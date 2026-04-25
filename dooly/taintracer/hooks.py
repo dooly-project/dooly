@@ -71,6 +71,7 @@ _original_tensor_expand = torch.Tensor.expand
 
 # Known operations
 _original_torch_linear = torch.nn.functional.linear
+_original_torch_pad = torch.nn.functional.pad
 _original_torch_matmul = torch.matmul
 _original_tensor_matmul = torch.Tensor.matmul
 _original_torch_einsum = torch.einsum
@@ -89,6 +90,81 @@ def _pickle_original_torch_size(size_instance):
 copyreg.pickle(_original_torch_size, _pickle_original_torch_size)
 
 _original_module_call = None
+
+
+def _strip_tainted_scalars(obj):
+    """Recursively replace TaintedInt/TaintedFloat with raw Python scalars.
+
+    Tensors (including TaintedTensor) are left untouched so dispatch-level
+    taint propagation still works. Only non-tensor scalar wrappers are
+    stripped. Triton kernel launches reject TaintedInt as a constexpr
+    because its AST parser only accepts {int, bool, NoneType}; this helper
+    is called at the boundary where arguments are forwarded to `func`,
+    ensuring any TaintedInt flowing through a torch op into a downstream
+    Triton kernel is unwrapped.
+    """
+    if isinstance(obj, (TaintedInt, TaintedFloat)):
+        return obj.value
+    if isinstance(obj, (TaintedTensor, torch.Tensor)):
+        return obj
+    if isinstance(obj, TaintedShape):
+        return obj
+    if isinstance(obj, tuple):
+        out = tuple(_strip_tainted_scalars(x) for x in obj)
+        return out if type(obj) is tuple else type(obj)(*out)
+    if isinstance(obj, list):
+        return [_strip_tainted_scalars(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _strip_tainted_scalars(v) for k, v in obj.items()}
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Triton JIT patch
+# ---------------------------------------------------------------------------
+# vLLM kernels (e.g. unified_attention_with_output for gpt-oss) stash
+# TaintedInt values as attributes on backend impls during construction, then
+# forward them into Triton kernel launches as constexpr args. Triton's AST
+# parser rejects TaintedInt because it only allows {int, bool, NoneType} in
+# compile-time branches like `if SLIDING_WINDOW:`. Intercept at the
+# JITFunction.run level to unwrap tainted scalars before compilation.
+
+def _wrap_triton_run(original_run):
+    @functools.wraps(original_run)
+    def _run(self, *args, **kwargs):
+        return original_run(
+            self,
+            *_strip_tainted_scalars(args),
+            **_strip_tainted_scalars(kwargs),
+        )
+    return _run
+
+
+def _patch_triton_jit():
+    try:
+        import triton.runtime.jit as _triton_jit
+    except ImportError:
+        return  # Triton not installed; nothing to patch.
+    jit_cls = getattr(_triton_jit, "JITFunction", None)
+    if jit_cls is None or hasattr(jit_cls, "_dooly_original_run"):
+        return  # already patched, or API drifted
+    jit_cls._dooly_original_run = jit_cls.run
+    jit_cls.run = _wrap_triton_run(jit_cls.run)
+
+
+def _unpatch_triton_jit():
+    try:
+        import triton.runtime.jit as _triton_jit
+    except ImportError:
+        return
+    jit_cls = getattr(_triton_jit, "JITFunction", None)
+    if jit_cls is None:
+        return
+    orig = getattr(jit_cls, "_dooly_original_run", None)
+    if orig is not None:
+        jit_cls.run = orig
+        del jit_cls._dooly_original_run
+
 
 # ---------------------------------------------------------------------------
 # TorchFunction Hook
@@ -168,14 +244,101 @@ def _torch_function_implementation(cls, func, types, args=(), kwargs=None):
             # Fallback if logging fails
             annotated_name = f"API: {op_name} (Log Error)"
 
+    # Strip TaintedInt/TaintedFloat wrappers before handing off to `func`.
+    # Required for downstream Triton kernel launches (e.g. gpt-oss's
+    # unified_attention_with_output -> kernel_unified_attention_2d), where
+    # TaintedInt-as-constexpr is rejected by Triton's AST parser.
+    stripped_args = _strip_tainted_scalars(args)
+    stripped_kwargs = _strip_tainted_scalars(kwargs)
+
     with record_function(annotated_name):
         with torch._C.DisableTorchFunction():
-            return func(*args, **kwargs)
+            return func(*stripped_args, **stripped_kwargs)
 
 
 # ---------------------------------------------------------------------------
 # nn.Module Hook
 # ---------------------------------------------------------------------------
+
+def _extract_module_state_hash(module: "torch.nn.Module") -> str:
+    """Short deterministic hash of a module instance's primitive attrs.
+
+    Captures behavior-affecting config that differs across instances of the
+    same class (e.g. an Attention layer's ``sliding_window`` being ``None``
+    vs an int) without bloating the trace annotation.
+
+    For backends that do NOT template-specialize on these runtime args
+    (FLASH_ATTN, TRITON_ATTN), the kernel symbol is identical across SWA and
+    full-attention layers — so without this, both variants collapse to one
+    signature. Including a hash of the module's primitive attrs in the
+    annotation forces distinct signatures whenever the module's config
+    differs, letting the resolver split them correctly.
+
+    Filter policy — include only primitive/compositional values:
+      - ``None``, ``bool``, ``int``, ``float``
+      - ``tuple``/``list`` whose elements are the above
+    Everything else is skipped:
+      - tensors, nested modules, callables, and other objects (can't be
+        hashed stably)
+      - strings (almost always identifier-like: ``layer_name``, ``prefix``;
+        including them would fragment signatures uselessly per layer)
+      - private attrs (keys starting with ``_``)
+
+    Returns a 12-char hex digest, or ``""`` if no capturable attrs exist
+    (keeps old signature behavior for modules that have nothing relevant).
+    """
+    import hashlib
+
+    def is_primitive(v) -> bool:
+        if v is None or isinstance(v, (bool, int, float)):
+            return True
+        if isinstance(v, (tuple, list)):
+            return all(x is None or isinstance(x, (bool, int, float)) for x in v)
+        return False
+
+    def canonicalize(v):
+        """Strip taint-wrapper classes (TaintedInt subclasses int but
+        overrides __repr__ to add the taint label — that makes the same
+        numeric value hash differently at trace time vs resolve time). Force
+        every value down to its plain-primitive representation so repr() is
+        stable across processes."""
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return bool(v)
+        if isinstance(v, int):
+            return int(v)
+        if isinstance(v, float):
+            return float(v)
+        if isinstance(v, (tuple, list)):
+            return tuple(canonicalize(x) for x in v)
+        return v
+
+    # Attrs whose value depends on framework/runtime context rather than the
+    # module's configuration — excluded so the hash stays stable across
+    # trace-time and resolve-time process boundaries.
+    #   training   : nn.Module default state flag, can differ if .eval()
+    #                  was called in one process but not the other
+    #   quant_config, query_quant : late-bound infrastructure objects that
+    #                  may be None in one context and non-None in another
+    _NON_CONFIG_ATTRS = frozenset({"training", "quant_config", "query_quant"})
+
+    try:
+        d = vars(module)
+    except TypeError:
+        return ""
+
+    canonical = tuple(
+        (k, canonicalize(v))
+        for k, v in sorted(d.items())
+        if not k.startswith("_")
+        and k not in _NON_CONFIG_ATTRS
+        and is_primitive(v)
+    )
+    if not canonical:
+        return ""
+    return hashlib.blake2b(repr(canonical).encode(), digest_size=6).hexdigest()
+
 
 def _module_call_wrapper(self, *args, **kwargs):
     """
@@ -185,6 +348,7 @@ def _module_call_wrapper(self, *args, **kwargs):
     don't have taints, we can walk up the hierarchy to find a tainted Module.
     """
     module_name = self.__class__.__name__
+
     # Collect taint info from input tensors
     taint_str = "no_inputs"
 
@@ -247,6 +411,12 @@ def _module_call_wrapper(self, *args, **kwargs):
         if input_ints:
             # For now, don't deduplicate - just show all
             annotated_name += " ARGS:[" + ", ".join(input_ints) + "]"
+        # STATE:<hash> distinguishes module instances that differ only in
+        # runtime-branching attrs (e.g. sliding_window). See
+        # _extract_module_state_hash for the filter policy.
+        _state_hash = _extract_module_state_hash(self)
+        if _state_hash:
+            annotated_name += f" STATE:{_state_hash}"
     except Exception:
         annotated_name = f"MODULE: {module_name} (Log Error)"
 
@@ -1689,6 +1859,52 @@ def _wrap_flatten(original_fn):
     return wrapper
 
 
+def _wrap_pad(original_fn):
+    """
+    Wrap torch.nn.functional.pad - pads selected trailing dimensions.
+
+    pad is a flat tuple (pad_last_begin, pad_last_end, pad_second_last_begin,
+    pad_second_last_end, ...), grouped in pairs from the LAST input dim
+    backward. Output dim size for each padded dim is:
+        output_dim = input_dim + pad_begin + pad_end
+
+    Taint propagation:
+    - Non-padded leading dims: preserve the input's taint unchanged.
+    - Padded dims: preserve the input's taint on that dim. Padding enlarges
+      the physical size but does not change the dim's semantic role. For
+      models like gpt-oss, FusedMoE pads hidden from MODEL_CONFIG(2880) to
+      MODEL_CONFIG(3072); without this hook the padded dim falls back to an
+      untainted ?(3072) via the generic shape-matching path.
+
+    Example:
+        x = TaintedTensor((60, 2880), [NUM_TOKS, MODEL_CONFIG(2880)])
+        F.pad(x, (0, 192), mode='constant', value=0.0)
+        # result shape (60, 3072), taints [NUM_TOKS, MODEL_CONFIG]
+    """
+    @functools.wraps(original_fn)
+    def wrapper(input, pad, *args, **kwargs):
+        was_already_in_hook = getattr(TaintedTensor._inside_hook, 'active', False)
+        TaintedTensor._inside_hook.active = True
+        try:
+            result = original_fn(input, pad, *args, **kwargs)
+            if was_already_in_hook:
+                return result
+            if not isinstance(input, TaintedTensor):
+                return result
+
+            # Copy input dim taints. Pad preserves the semantic role of each dim.
+            new_taints = list(input._dim_taints)
+            # Sanity: result should have same ndim as input.
+            if len(result.shape) != len(new_taints):
+                return result
+            return TaintedTensor(result, tuple(new_taints))
+        finally:
+            if not was_already_in_hook:
+                TaintedTensor._inside_hook.active = False
+
+    return wrapper
+
+
 def _wrap_expand(original_fn):
     """
     Wrap torch.expand - broadcasts tensor to a new shape.
@@ -2290,7 +2506,7 @@ def _wrap_einops_repeat(original_fn):
     @functools.wraps(original_fn)
     def wrapper(tensor, pattern, **axes_lengths):
         was_already_in_hook = getattr(TaintedTensor._inside_hook, 'active', False)
-        TaintedTensor._inside_hook.active = True
+        TaintedTensor._inside_hook.active = False
 
         try:
             # If not a TaintedTensor, just call original
@@ -2492,6 +2708,7 @@ def install_hooks(int_patch_modules=()):
         torch.matmul = _wrap_matmul(_original_torch_matmul)
         torch.Tensor.matmul = _wrap_matmul(_original_tensor_matmul)
         torch.nn.functional.linear = _wrap_linear(_original_torch_linear)
+        torch.nn.functional.pad = _wrap_pad(_original_torch_pad)
 
         # Wrap einsum for taint propagation
         torch.einsum = _wrap_einsum(_original_torch_einsum)
@@ -2558,6 +2775,11 @@ def install_hooks(int_patch_modules=()):
     if int_patch_modules:
         patch_int_in_modules(int_patch_modules)
 
+    # Strip TaintedInt/TaintedFloat at Triton kernel launches (needed for
+    # gpt-oss and other models that stash tainted scalars on backend impls).
+    _patch_triton_jit()
+
+
 def uninstall_hooks():
     """Restore original tensor creation functions and dispatch."""
     torch.zeros = _original_zeros
@@ -2591,6 +2813,7 @@ def uninstall_hooks():
     torch.matmul = _original_torch_matmul
     torch.Tensor.matmul = _original_tensor_matmul
     torch.nn.functional.linear = _original_torch_linear
+    torch.nn.functional.pad = _original_torch_pad
     torch.einsum = _original_torch_einsum
 
     # Restore einops operations
@@ -2613,10 +2836,12 @@ def uninstall_hooks():
     
     # Remove __torch_function__ hook (restore default behavior which might be None or strict)
     # TaintedTensor doesn't define it by default, so we can delete it or set to None?
-    # Actually, Tensor subclasses don't start with __torch_function__ usually, 
+    # Actually, Tensor subclasses don't start with __torch_function__ usually,
     # but we should check if TaintedTensor had one. It likely didn't.
     if hasattr(TaintedTensor, '__torch_function__'):
         del TaintedTensor.__torch_function__
+
+    _unpatch_triton_jit()
 
     unpatch_int_in_modules()
     unpatch_module_call()

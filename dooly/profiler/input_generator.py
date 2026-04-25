@@ -19,6 +19,34 @@ def is_attention_operation(module: ModuleInfo) -> bool:
     return False
 
 
+def classify_op(module: ModuleInfo) -> str:
+    """Return the op's profile class:
+
+        'attention'  -> 4-D AttentionBatchConfig sweep (num_tokens, batch_size,
+                        kv_cache_size, prefill_chunk_size)
+        'moe'        -> 1-D num_tokens sweep (FusedMoE, SharedFusedMoE, ...)
+        'mamba'      -> reserved for state-space layers; user must define
+        'ssm'        -> reserved
+        'stateless'  -> default num_tokens / num_requests sweep (linear, rms_norm,
+                        embedding, rotary, silu, argmax, ...)
+
+    Extend by adding a branch here + a matching `_prepare_*_inputs` method in
+    InputGenerator.
+    """
+    name = module.module_name or ""
+    if is_attention_operation(module):
+        return "attention"
+    for tok in ("FusedMoE", "SharedFusedMoE", "MoE"):
+        if tok in name:
+            return "moe"
+    for tok in ("Mamba", "MambaMixer"):
+        if tok in name:
+            return "mamba"
+    if "SSM" in name:
+        return "ssm"
+    return "stateless"
+
+
 
 class InputGenerator:
     # for a given ModuleInfo, generate the inputs needed to profile
@@ -263,88 +291,132 @@ class InputGenerator:
         return generate_vidur_num_tokens(max_size=self.max_num_token)
 
     def prepare_inputs(self, mode: str, use_batch_config: bool = None) -> Union[List[AttentionBatchConfig], List[Dict[str, int]]]:
+        """Generate workload configurations for profiling.
+
+        Dispatches by op class. Add a new class by extending `classify_op()`
+        and implementing a matching `_prepare_<class>_inputs` method here.
+
+        Back-compat: if `use_batch_config` is passed explicitly, honor it
+        (True -> attention path, False -> stateless path) so existing callers
+        that bypass classification (e.g. profiler's raw-op path) keep working.
         """
-        Generate workload configurations for profiling.
+        if use_batch_config is True:
+            return self._prepare_attention_inputs(mode)
+        if use_batch_config is False:
+            return self._prepare_stateless_inputs(mode)
 
-        For attention operations: Returns List[AttentionBatchConfig]
-        For non-attention operations: Returns List[Dict] with keys 'num_tokens', 'num_requests'
+        # Auto-classify
+        op_class = classify_op(self.module)
+
+        if op_class == "attention":
+            return self._prepare_attention_inputs(mode)
+        if op_class == "moe":
+            return self._prepare_moe_inputs(mode)
+        if op_class == "mamba":
+            return self._prepare_mamba_inputs(mode)
+        if op_class == "ssm":
+            return self._prepare_ssm_inputs(mode)
+        return self._prepare_stateless_inputs(mode)
+
+    # ------------------------------------------------------------------
+    # Per-class input generators. Each returns either List[AttentionBatchConfig]
+    # or List[Dict[str, int]]. Downstream code already handles both.
+    # ------------------------------------------------------------------
+
+    def _prepare_attention_inputs(self, mode: str) -> List[AttentionBatchConfig]:
+        if mode != "vidur":
+            raise NotImplementedError(f"Mode {mode} is not implemented yet")
+        self.batches = generate_vidur_inputs(
+            max_seq_len=self.max_num_token,
+            min_batch_size=1,
+            max_batch_size=self.max_num_request,
+            profile_only_prefill=False,
+            profile_only_decode=False,
+        )
+        return self.batches
+
+    def _prepare_moe_inputs(self, mode: str) -> List[Dict[str, int]]:
+        """1-D sweep over num_tokens. MoE latency is empirically a function of
+        num_tokens only — kv_cache_size and prefill_chunk_size don't matter.
         """
-        if use_batch_config is None:
-            use_batch_config = is_attention_operation(self.module)
+        num_tokens_sweep = self._generate_num_tokens_sweep()
+        self.batches = [
+            {"num_tokens": n, "num_requests": 1}
+            for n in num_tokens_sweep
+        ]
+        return self.batches
 
-        if use_batch_config:
-            # Attention operations use AttentionBatchConfig
-            if mode == "vidur":
-                self.batches = generate_vidur_inputs(
-                    max_seq_len=self.max_num_token,
-                    min_batch_size=1,
-                    max_batch_size=self.max_num_request,
-                    profile_only_prefill=False,
-                    profile_only_decode=False
-                )
-            else:
-                raise NotImplementedError(f"Mode {mode} is not implemented yet")
-            return self.batches
+    def _prepare_mamba_inputs(self, mode: str) -> List[Dict[str, int]]:
+        """Reserved for Mamba / SSD state-space layers.
 
-        else:
-            # Non-attention operations: generate sweep values for num_tokens and num_requests
-            num_tokens_sweep = self._generate_num_tokens_sweep()
-            num_requests_sweep = self._generate_num_requests_sweep()
+        Mamba depends on (num_tokens, batch_size, prefill_chunk_size, is_prefill)
+        — 3-D. Fill in when the first Mamba-based model is evaluated.
+        """
+        raise NotImplementedError(
+            "Mamba profile space not yet defined. Extend _prepare_mamba_inputs "
+            "with the (num_tokens, batch_size, prefill_chunk_size, is_prefill) "
+            "sweep appropriate for your SSM implementation."
+        )
 
-            # Check which dimension types are present in inputs
-            has_num_tokens_dim = any(
-                inp.get_toks_dim() for inp in self.module.inputs if inp.type == "Tensor"
-            )
-            has_num_requests_dim = any(
-                inp.get_reqs_dim() for inp in self.module.inputs if inp.type == "Tensor"
-            )
+    def _prepare_ssm_inputs(self, mode: str) -> List[Dict[str, int]]:
+        """Reserved for generic state-space models that don't reuse Mamba's path."""
+        raise NotImplementedError(
+            "SSM profile space not yet defined. Extend _prepare_ssm_inputs "
+            "with the sweep appropriate for your state-space layer."
+        )
 
-            # Also check for MIX dimensions that contain NUM_TOKENS or NUM_REQUESTS
-            # (including MAX_NUM_TOKS and MAX_NUM_REQS variants)
-            for inp in self.module.inputs:
-                if inp.type == "Tensor" and inp.dimension_components:
-                    for dim_idx in inp.get_mix_dims():
-                        components = inp.dimension_components[dim_idx]
-                        if components:
-                            for taint_name in components.keys():
-                                if 'NUM_TOK' in taint_name:  # Matches NUM_TOKS, NUM_TOK, MAX_NUM_TOKS
-                                    has_num_tokens_dim = True
-                                if 'NUM_REQ' in taint_name:  # Matches NUM_REQS, NUM_REQ, MAX_NUM_REQS
-                                    has_num_requests_dim = True
+    def _prepare_stateless_inputs(self, mode: str) -> List[Dict[str, int]]:
+        """Default path for shape-driven ops (linear, rms_norm, rotary, silu,
+        embedding, argmax, to.dtype, ...). Sweeps over num_tokens and/or
+        num_requests depending on what dimension roles the tracer recorded.
+        """
+        num_tokens_sweep = self._generate_num_tokens_sweep()
+        num_requests_sweep = self._generate_num_requests_sweep()
 
-            workload_configs = []
+        # Check which dimension types are present in inputs
+        has_num_tokens_dim = any(
+            inp.get_toks_dim() for inp in self.module.inputs if inp.type == "Tensor"
+        )
+        has_num_requests_dim = any(
+            inp.get_reqs_dim() for inp in self.module.inputs if inp.type == "Tensor"
+        )
 
-            if has_num_tokens_dim and has_num_requests_dim:
-                # Generate combinations of both (could be expensive, limit combinations)
-                # Use a subset to avoid explosion
-                for num_tokens in num_tokens_sweep:
-                    for num_requests in num_requests_sweep:
-                        # Skip invalid combinations where num_tokens < num_requests
-                        if num_tokens >= num_requests:
-                            workload_configs.append({
-                                'num_tokens': num_tokens,
-                                'num_requests': num_requests
-                            })
-            elif has_num_tokens_dim:
-                # Only sweep num_tokens
-                for num_tokens in num_tokens_sweep:
-                    workload_configs.append({
-                        'num_tokens': num_tokens,
-                        'num_requests': 1  # Default
-                    })
-            elif has_num_requests_dim:
-                # Only sweep num_requests
+        # MIX dimensions containing NUM_TOKENS or NUM_REQUESTS (incl. MAX_* variants)
+        for inp in self.module.inputs:
+            if inp.type == "Tensor" and inp.dimension_components:
+                for dim_idx in inp.get_mix_dims():
+                    components = inp.dimension_components[dim_idx]
+                    if components:
+                        for taint_name in components.keys():
+                            if 'NUM_TOK' in taint_name:
+                                has_num_tokens_dim = True
+                            if 'NUM_REQ' in taint_name:
+                                has_num_requests_dim = True
+
+        workload_configs = []
+
+        if has_num_tokens_dim and has_num_requests_dim:
+            for num_tokens in num_tokens_sweep:
                 for num_requests in num_requests_sweep:
-                    workload_configs.append({
-                        'num_tokens': num_requests,  # Default to same value
-                        'num_requests': num_requests
-                    })
-            else:
-                # No workload dimensions, just use default values
+                    if num_tokens >= num_requests:
+                        workload_configs.append({
+                            'num_tokens': num_tokens,
+                            'num_requests': num_requests,
+                        })
+        elif has_num_tokens_dim:
+            for num_tokens in num_tokens_sweep:
                 workload_configs.append({
-                    'num_tokens': 1,
-                    'num_requests': 1
+                    'num_tokens': num_tokens,
+                    'num_requests': 1,
                 })
+        elif has_num_requests_dim:
+            for num_requests in num_requests_sweep:
+                workload_configs.append({
+                    'num_tokens': num_requests,
+                    'num_requests': num_requests,
+                })
+        else:
+            workload_configs.append({'num_tokens': 1, 'num_requests': 1})
 
-            self.batches = workload_configs
-            return self.batches    
+        self.batches = workload_configs
+        return self.batches

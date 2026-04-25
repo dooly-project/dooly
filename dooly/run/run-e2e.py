@@ -41,7 +41,7 @@ def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attent
     return result.returncode == 0
 
 
-def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: str, dtype: str, attention_backend: str, max_batch_size: int, max_seq_len: int, gpu: int, db_path: str | None = None):
+def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: str, dtype: str, attention_backend: str, max_batch_size: int, max_seq_len: int, gpu: int, db_path: str | None = None, profile_comm: bool = False):
     """Run the profiler as a subprocess."""
     profiler_script = os.path.join(os.path.dirname(__file__), "run-profiler.py")
     cmd = [
@@ -58,6 +58,8 @@ def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: 
     ]
     if db_path:
         cmd.extend(["--db-path", db_path])
+    if profile_comm:
+        cmd.append("--profile-comm")
     print(f"[E2E] Running profiler: {' '.join(cmd)}")
     result = subprocess.run(cmd, check=True)
     return result.returncode == 0
@@ -77,6 +79,8 @@ def main():
     parser.add_argument("--workspace-dir", type=str, default="vllm_traces_tp", help="Directory to save trace and profile")
     parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
     parser.add_argument("--db-path", type=str, default=None, help="Path to SQLite database for persistent storage and deduplication")
+    parser.add_argument("--profile-comm", action="store_true",
+                        help="Also profile collective operations (only meaningful when TP>1).")
     args = parser.parse_args()
 
     workspace_path = args.workspace_dir
@@ -139,6 +143,7 @@ def main():
             max_seq_len=args.max_seq_len,
             db_path=args.db_path,
             gpu=args.gpu,
+            profile_comm=args.profile_comm,
         )
 
     print("\n[E2E] Workflow complete!")

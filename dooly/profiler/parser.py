@@ -385,7 +385,16 @@ class HierarchicalTraceParser:
             if cat == 'user_annotation' and name.startswith('MODULE:'):
                 # Module scope annotation emitted by _module_call_wrapper in hooks.py.
                 # Replaces python_function nn.Module: events when with_stack=False.
-                # Name format: "MODULE: ClassName IN:[...] DTYPES:[...] KWARGS:[...]"
+                # Name format:
+                #   "MODULE: ClassName IN:[...] DTYPES:[...] KWARGS:[...] STATE:<hex>"
+                # STATE:<hex> is an optional trailer that hashes the module
+                # instance's primitive attrs (e.g. sliding_window). We pull it
+                # off first so it doesn't leak into downstream IN/DTYPES/KWARGS
+                # slices, and stash it on the event's args for the signature
+                # builder to consume.
+                if ' STATE:' in name:
+                    name, _, _state_part = name.rpartition(' STATE:')
+                    args['state_hash'] = _state_part.strip()
                 clean_name = name.split(' IN:')[0].replace('MODULE: ', '').strip()
                 event_cat = 'module'
                 event_name = clean_name
@@ -837,6 +846,44 @@ class HierarchicalTraceParser:
 
             if not is_redundant:
                 canonical_anchors[anchor_id] = anchor
+
+        # --- DEBUG: expose anchor landscape ---
+        from collections import Counter as _DbgCounter
+        _dbg_raw = _DbgCounter(
+            f"{ev.cat}:{ev.name}" for ev in anchor_events.values()
+        )
+        _dbg_can = _DbgCounter(
+            f"{ev.cat}:{ev.name}" for ev in canonical_anchors.values()
+        )
+        print(f"[DEBUG-ANCHORS] raw_anchors={len(anchor_events)}, "
+              f"canonical={len(canonical_anchors)}")
+        print("[DEBUG-ANCHORS] raw anchor name counts (top 30):")
+        for k, v in _dbg_raw.most_common(30):
+            print(f"    {v:5d}  {k}")
+        print("[DEBUG-ANCHORS] canonical anchor name counts:")
+        for k, v in sorted(_dbg_can.items(), key=lambda kv: -kv[1]):
+            print(f"    {v:5d}  {k}")
+
+        # Report kernels whose walk never landed on a tainted ancestor
+        _orphans = _DbgCounter()
+        for kernel in self.kernels:
+            start_node = kernel.parent
+            if start_node is None:
+                _orphans["<no_parent>"] += 1
+                continue
+            anc = self.find_nearest_tainted_ancestor(start_node)
+            if anc is None:
+                # walk up to find what non-tainted parent chain looks like
+                chain_names = []
+                cur = start_node
+                while cur is not None and len(chain_names) < 6:
+                    chain_names.append(f"{cur.cat}:{cur.name}")
+                    cur = cur.parent
+                _orphans[" -> ".join(chain_names[:3])] += 1
+        print(f"[DEBUG-ORPHANS] kernels without tainted ancestor (top 15):")
+        for k, v in _orphans.most_common(15):
+            print(f"    {v:5d}  {k}")
+        # --- END DEBUG ---
 
         # 3. Build OperationHierarchy for each canonical anchor
         results: List[OperationHierarchy] = []

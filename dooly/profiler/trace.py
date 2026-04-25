@@ -37,6 +37,21 @@ class TraceLoader:
         }
 
     @staticmethod
+    def get_taint_registry(trace_data: Dict[str, Any]) -> Dict[int, str]:
+        """Extract the TAINT_REGISTRY snapshot that run-tracer.py stored at
+        the trace's top level. Maps dimension value -> taint name
+        (e.g. 5 -> "NUM_REQS"). Returns {} for traces captured before this
+        instrumentation (resolver will fall back to its legacy defaults)."""
+        raw = trace_data.get("dooly_taint_registry", {}) or {}
+        out: Dict[int, str] = {}
+        for v, t in raw.items():
+            try:
+                out[int(v)] = str(t)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    @staticmethod
     def save_to_json(data: Any, json_path: str) -> None:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -45,6 +60,10 @@ class TraceLoader:
 class TraceParser:
     def __init__(self, loader: Optional[TraceLoader] = None) -> None:
         self.loader = loader or TraceLoader()
+        # Taint registry captured at trace time (value -> taint name).
+        # Populated by parse_trace(); read by callers (e.g. run-profiler.py)
+        # that need to pass it down to the resolver.
+        self.taint_registry: Dict[int, str] = {}
 
     def parse_trace(
         self,
@@ -53,7 +72,7 @@ class TraceParser:
         verbose: bool = False,
         metadata_path: str | None = None,
     ) -> List[ModuleInfo]:
-        
+
         try:
             trace_data = self.loader.load_trace(trace_path)
         except FileNotFoundError:
@@ -61,6 +80,12 @@ class TraceParser:
             return []
 
         trace_events = self.loader.get_trace_events(trace_data)
+        self.taint_registry = self.loader.get_taint_registry(trace_data)
+        if self.taint_registry:
+            print(f"[TraceParser] Loaded taint_registry ({len(self.taint_registry)} entries) from trace")
+        else:
+            print(f"[TraceParser] No dooly_taint_registry key in trace (older format); "
+                  f"resolver will fall back to tensor-axis heuristics")
 
         profile_metadata = {}
         module_infos = self.extract_module_infos(
@@ -117,22 +142,39 @@ class TraceParser:
         backend = profile_metadata.get("backend", "")
         dtype = profile_metadata.get("dtype", "bfloat16")
 
+        # --- DEBUG-TRACE: per-reason drop counters + per-op tallies ---
+        from collections import Counter as _TCounter
+        _drops = _TCounter()
+        _drop_by_op = {
+            "no_taint": _TCounter(),
+            "no_inputs": _TCounter(),
+            "taint_extract_failed": _TCounter(),
+            "comm_no_params": _TCounter(),
+            "comm_no_dims": _TCounter(),
+            "comm_empty_inputs": _TCounter(),
+        }
+        _accepted_by_op = _TCounter()
+        # --- END DEBUG-TRACE ---
 
         for hierarchy in operation_hierarchies:
-            
+
             module_name, op_name, inputs, is_module, is_collective = "", "", [], False, False
             
             if hierarchy.anchor.cat == 'comm':
-                module_name = hierarchy.nearest_module_name  
+                module_name = hierarchy.nearest_module_name
                 comm_event = hierarchy.anchor
-                op_name = comm_event.name 
+                op_name = comm_event.name
 
                 if not comm_event.params:
+                    _drops["comm_no_params"] += 1
+                    _drop_by_op["comm_no_params"][op_name] += 1
                     continue
 
                 # Parse dims from comm event's taint string
                 dims_lists = comm_event.get_dims_from_taint_string(comm_event.params)
                 if not dims_lists:
+                    _drops["comm_no_dims"] += 1
+                    _drop_by_op["comm_no_dims"][op_name] += 1
                     continue
 
                 # Extract inputs
@@ -145,11 +187,14 @@ class TraceParser:
                     )
                 except Exception as e:
                     print(f"⚠ Input extraction failed for {op_name}: {e}")
+                    _drops["comm_extract_failed"] += 1
                     continue
 
                 if not inputs:
+                    _drops["comm_empty_inputs"] += 1
+                    _drop_by_op["comm_empty_inputs"][op_name] += 1
                     continue
-                
+
                 is_collective = True
 
             else: 
@@ -176,10 +221,11 @@ class TraceParser:
                 # Debug module anchors with comm ops (to understand why input extraction fails)
                 if hierarchy.comm_ops:
                     first_comm = hierarchy.comm_ops[0]
-                    print(f"[DEBUG] Module {anchor_name} has comm: {first_comm.name}, module_taint={matching_taint[:50] if matching_taint else None}, shapes={shapes[:2] if shapes else []}")
+                    print(f"[DEBUG] Module {op_name} has comm: {first_comm.name}, module_taint={matching_taint[:50] if matching_taint else None}, shapes={shapes[:2] if shapes else []}")
 
                 if matching_taint is None:
-                    print(f"⚠ No taint for {anchor_name}, skipping")
+                    _drops["no_taint"] += 1
+                    _drop_by_op["no_taint"][op_name] += 1
                     continue
 
                 # Try taint-based extraction
@@ -193,16 +239,29 @@ class TraceParser:
                             concrete_inputs=concrete_inputs
                         )
                     except Exception as e:
-                        print(f"⚠ Taint-based extraction failed for {anchor_name}: {e}")
+                        print(f"⚠ Taint-based extraction failed for {op_name}: {e}")
+                        _drops["taint_extract_failed"] += 1
+                        _drop_by_op["taint_extract_failed"][op_name] += 1
                         inputs = []
 
                 # Skip if no inputs extracted
                 if not inputs:
                     if not hierarchy.comm_ops:
-                        print(f"⚠ No inputs extracted for {anchor_name}, skipping")
+                        _drops["no_inputs"] += 1
+                        _drop_by_op["no_inputs"][op_name] += 1
                     continue
 
-            # Create ModuleInfo with hierarchy reference for full ancestry navigation
+            # Create ModuleInfo with hierarchy reference for full ancestry navigation.
+            # state_hash comes from the MODULE annotation's STATE: trailer
+            # (captured by _module_call_wrapper in hooks.py, stashed on the
+            # event's args by parser.py). Only populated for modules — raw
+            # ops don't carry it.
+            state_hash = ""
+            if is_module:
+                # hierarchy.operation_args is the anchor event's args dict;
+                # the parser put 'state_hash' there when it stripped STATE:
+                # off the MODULE annotation name.
+                state_hash = (hierarchy.operation_args or {}).get("state_hash", "") or ""
             info = ModuleInfo(
                 module_name=module_name,
                 operation_name=op_name,
@@ -212,12 +271,30 @@ class TraceParser:
                 is_module=is_module,
                 is_collective_op=is_collective,
                 hierarchy=hierarchy,
+                state_hash=state_hash,
             )
 
             # Add module_info to anchor event
             hierarchy.anchor.module_info = info
+            _accepted_by_op[op_name] += 1
 
             module_infos.append(info)
+
+        # --- DEBUG-TRACE summary ---
+        print(f"[DEBUG-TRACE] total_hierarchies={len(operation_hierarchies)}  "
+              f"accepted={sum(_accepted_by_op.values())}  "
+              f"drops_total={sum(_drops.values())}")
+        print(f"[DEBUG-TRACE] drops by reason: {dict(_drops)}")
+        print(f"[DEBUG-TRACE] accepted by op (top 12):")
+        for n, c in _accepted_by_op.most_common(12):
+            print(f"    {c:5d}  {n}")
+        for reason, tally in _drop_by_op.items():
+            if not tally:
+                continue
+            print(f"[DEBUG-TRACE] dropped ({reason}) top 12:")
+            for n, c in tally.most_common(12):
+                print(f"    {c:5d}  {n}")
+        # --- END DEBUG-TRACE ---
 
         # print(f"Processed {comm_count} communication operations")
         print(f"Deduplicating module infos...")
@@ -356,12 +433,31 @@ class TraceParser:
                     getattr(nearest_module, 'descendant_kernels', frozenset())
                 ))
 
+            # Module-state discriminator. Tells apart instances whose kernel
+            # symbols are identical but whose runtime-branching config
+            # differs (e.g. FA2/Triton Attention layers with sliding_window=None
+            # vs sliding_window=4096 — same kernel binary, different runtime
+            # arg). _extract_module_state_hash in the taintracer produces the
+            # hex digest.
+            #
+            # For MODULE anchors (is_module=True), use the module's own hash.
+            # For raw-op anchors (e.g. vllm::unified_kv_cache_update), inherit
+            # from the nearest containing module so two raw ops living under
+            # differently-configured parents land in separate groups.
+            own_state_hash = info.state_hash or ""
+            parent_state_hash = ""
+            if nearest_module is not None:
+                parent_args = getattr(nearest_module, 'args', {}) or {}
+                parent_state_hash = parent_args.get('state_hash', '') or ''
+            state_hash = own_state_hash or parent_state_hash
+
             signature = (
                 base_name,
                 info.operation_name,
                 model_params_tuple,
                 kernel_tuple,
                 module_kernel_tuple,
+                state_hash,
             )
 
             # dictionary of lists that group module infos by signature
@@ -374,6 +470,7 @@ class TraceParser:
             _model_params_tuple,
             _kernel_tuple,
             _module_kernel_tuple,
+            _state_hash,
         ), infos in groups.items():
             # use the first info as template since all have same signature
             template = infos[0]
@@ -397,6 +494,10 @@ class TraceParser:
                 hierarchy=template.hierarchy,
                 is_collective_op=template.is_collective_op,
                 count = count,  # track how many were deduplicated into this one
+                # State hash carries over from template; members of a dedup
+                # group share the same module-instance state by construction
+                # since state_hash participates in the grouping key.
+                state_hash=template.state_hash,
             )
 
             # Add module_info to anchor event

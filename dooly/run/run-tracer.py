@@ -186,6 +186,44 @@ if __name__ == "__main__":
         enable_taint_tracking()
         print("\n[Tracer] Taint tracking ENABLED for actual generation")
 
+        def dooly_trace_handler(dir_name: str, model_name: str, tp: int):
+            """torch.profiler handler that writes to a predictable filename
+            ``{model_name}_{tp}_dooly_trace.json`` and appends the
+            TAINT_REGISTRY snapshot as a top-level key. Mirrors the pattern
+            of torch.profiler.tensorboard_trace_handler.
+
+            The handler runs after the profile context exits, at which point
+            TAINT_REGISTRY is fully populated by the preceding generate()
+            call, so the snapshot is complete.
+            """
+            import json as _json
+
+            safe_model = model_name.replace("/", "_")
+            file_name = f"{safe_model}_{tp}_dooly_trace.json"
+
+            def handler_fn(prof) -> None:
+                if not os.path.isdir(dir_name):
+                    try:
+                        os.makedirs(dir_name, exist_ok=True)
+                    except Exception as e:
+                        raise RuntimeError(f"Can't create directory: {dir_name}") from e
+                trace_path = os.path.join(dir_name, file_name)
+                prof.export_chrome_trace(trace_path)
+
+                # Inject the taint registry as a top-level key.
+                with open(trace_path, "r") as f:
+                    data = _json.load(f)
+                data["dooly_taint_registry"] = {
+                    str(v): str(t) for v, t in TAINT_REGISTRY.items()
+                    if not isinstance(t, dict)
+                }
+                with open(trace_path, "w") as f:
+                    _json.dump(data, f)
+                print(f"[Tracer] Wrote trace + taint registry "
+                      f"({len(data['dooly_taint_registry'])} entries) to {trace_path}")
+
+            return handler_fn
+
         with torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -193,7 +231,7 @@ if __name__ == "__main__":
             ],
             # with_stack=True,
             record_shapes=True,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.trace_dir)
+            on_trace_ready=dooly_trace_handler(args.trace_dir, args.model, args.tensor_parallel_size),
         ) as prof:
             llm.generate([args.prompts, args.prompts, args.prompts,args.prompts, args.prompts], sampling_params=sampling_params)
 
