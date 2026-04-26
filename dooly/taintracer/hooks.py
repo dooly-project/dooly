@@ -769,6 +769,7 @@ def _wrap_view_reshape(original_fn, fn_name):
     """
     from .types import DimTaint, TaintedInt, TaintedFloat, Taint
     from .registry import register_taint, lookup_taint
+    from . import is_taint_tracking_enabled
 
     @functools.wraps(original_fn)
     def wrapper(self, *shape):
@@ -792,7 +793,16 @@ def _wrap_view_reshape(original_fn, fn_name):
 
         try:
             result = original_fn(self, *shape)
-            
+
+            # If taint tracking is disabled (during init / warmup / dummy_run),
+            # skip the shape-analysis path entirely. This prevents warmup-only
+            # tensor shapes (e.g. vLLM's _dummy_run trial num_tokens) from
+            # leaving phantom entries in the global registry that later collide
+            # with real workload values (Qwen3-30B-A3B + FLASHINFER + B=16
+            # was the original symptom: 16 → None registered during warmup).
+            if not is_taint_tracking_enabled():
+                return result
+
             # print(f"[DEBUG @ _wrap_view_reshape] {fn_name} ( {self.shape}, {shape} ) -> {result.shape}")
 
             # if result.shape[1] == 9216 or result.shape[1] == 18432:

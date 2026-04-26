@@ -31,6 +31,7 @@ parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B",
 parser.add_argument("--tp", "--tensor_parallel_size", type=int, default=1, dest="tensor_parallel_size", help="Fake tensor parallel size (weights sharded but run on 1 GPU)")
 parser.add_argument("--dtype", type=str, default="bfloat16", help="Model dtype")
 parser.add_argument("--prompts", type=str, default="Hello, how are you? I am fine, and ", help="Prompt to run")
+parser.add_argument("--batch-size", type=int, default=5, help="Number of identical prompts to send in a single generate() call")
 parser.add_argument("--max-tokens", type=int, default=1, help="Max tokens to generate")
 parser.add_argument("--trace_dir", type=str, default="./vllm_traces_tp", help="Directory to save trace")
 parser.add_argument("--gpu", type=int, default=0, help="GPU device index to use")
@@ -169,7 +170,7 @@ if __name__ == "__main__":
             attention_backend=args.attention_backend,
             max_model_len=max_model_len,
             trust_remote_code=True,
-            max_num_batched_tokens=269,
+            max_num_batched_tokens=521,
             max_num_seqs=263
         )
 
@@ -233,7 +234,7 @@ if __name__ == "__main__":
             record_shapes=True,
             on_trace_ready=dooly_trace_handler(args.trace_dir, args.model, args.tensor_parallel_size),
         ) as prof:
-            llm.generate([args.prompts, args.prompts, args.prompts,args.prompts, args.prompts], sampling_params=sampling_params)
+            llm.generate([args.prompts] * args.batch_size, sampling_params=sampling_params)
 
         print(f"[Tracer] Done tracing {args.model}, output saved to {args.trace_dir}")
 
