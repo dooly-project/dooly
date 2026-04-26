@@ -2753,8 +2753,25 @@ def install_hooks(int_patch_modules=()):
         torch.full = _wrap_factory_output(torch._original_full)
         torch.as_tensor = _wrap_factory_output(torch._original_as_tensor)
         torch.from_numpy = _wrap_factory_output(torch._original_from_numpy)
-        
-                
+
+        # DeviceContext.__torch_function__ checks `func in _device_constructors()`.
+        # Our wrappers call the originals directly, so `func` is the pre-patch
+        # object. If _device_constructors() was cached after patching it would
+        # only contain the wrappers, missing the originals.  Mutate the set now
+        # so both are present regardless of cache timing.
+        from torch.utils._device import _device_constructors as _dc
+        _dc().update({
+            _original_zeros,
+            _original_ones,
+            _original_empty,
+            _original_randn,
+            _original_rand,
+            _original_arange,
+            torch._original_tensor,
+            torch._original_full,
+            torch._original_as_tensor,
+        })
+
         # to speed up init process
         torch.Tensor.uniform_ = lambda self, *args, **kwargs: self
 

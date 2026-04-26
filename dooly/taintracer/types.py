@@ -319,12 +319,6 @@ class TaintedInt(int):
         instance = int.__new__(cls, _int_val(value))
         instance._taint = Taint(taint) if isinstance(taint, str) else taint
 
-        # actual_value = int(instance)
-        # if actual_value == 4 and instance._taint is None:
-        #     import traceback
-        #     print(f"\n[TAINTEDINT CREATE DEBUG] Creating TaintedInt(4, None)")
-        #     print(f"  Traceback:")
-        #     traceback.print_stack(limit=15)
 
         # Register tainted values only when tracking is enabled
         # This prevents false collisions during warm-up/dummy runs
