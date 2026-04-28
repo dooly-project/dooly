@@ -37,37 +37,37 @@ class RunConfig:
 
 DEFAULT_CONFIGS: List[RunConfig] = [
     RunConfig(
-        model="Qwen/Qwen3-4B",
-        tp=1,
-        backend="FLASHINFER",
-        cache_dir="./cache/tp1/Qwen/Qwen3-4B/",
-        topology="mew1",
-        db_path="./profiler/database/dooly-mew1.db",
-    ),
-    RunConfig(
         model="meta-llama/Llama-3.1-8B",
         tp=1,
         backend="FLASHINFER",
-        cache_dir="./cache/tp1/FLASHINFER/meta-llama/Llama-3.1-8B/",
+        cache_dir="/home/jkim38/dooly/cache/meta-llama/Llama-3.1-8B/",
         topology="mew1",
-        db_path="./profiler/database/dooly-mew1.db",
+        db_path="/home/jkim38/dooly/profiler/database/rtx-sharegpt-eval.db",
+    ),
+    RunConfig(
+        model="Qwen/Qwen3-30B-A3B",
+        tp=1,
+        backend="FLASHINFER",
+        cache_dir="/home/jkim38/dooly/cache/Qwen/Qwen3-30B-A3B",
+        topology="mew1",
+        db_path="/home/jkim38/dooly/profiler/database/rtx-sharegpt-eval.db",
     ),
     RunConfig(
         model="Qwen/Qwen3-32B",
-        tp=2,
+        tp=1,
         backend="FLASHINFER",
-        cache_dir="./cache/tp2/Qwen/Qwen3-32B/",
+        cache_dir="/home/jkim38/dooly/cache/Qwen/Qwen3-32B/",
         topology="mew1",
-        db_path="./profiler/database/dooly-mew1.db",
+        db_path="/home/jkim38/dooly/profiler/database/rtx-sharegpt-eval.db",
     ),
-    RunConfig(
-        model="meta-llama/Llama-3.1-70B",
-        tp=4,
-        backend="FLASHINFER",
-        cache_dir="./cache/tp4/meta-llama/Llama-3.1-70B/",
-        topology="mew1",
-        db_path="./profiler/database/dooly-mew1.db",
-    ),
+    # RunConfig(
+    #     model="meta-llama/Llama-3.1-70B",
+    #     tp=4,
+    #     backend="FLASHINFER",
+    #     cache_dir="./cache/tp4/meta-llama/Llama-3.1-70B/",
+    #     topology="mew1",
+    #     db_path="./profiler/database/dooly-mew1.db",
+    # ),
 ]
 
 
@@ -225,9 +225,9 @@ def filter_configs(configs: List[RunConfig], only_models: Optional[List[str]]) -
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True,
-                        help="Path to the JSONL dataset (e.g. ./dataset/openchat-1.0rps.jsonl)")
+                        help="Path to the JSONL dataset (e.g. ./dataset/openchat-0.5rps.jsonl)")
     parser.add_argument("--run-name", required=True,
-                        help="Subdir name under --results-root (e.g. openchat-1.0rps)")
+                        help="Subdir name under --results-root (e.g. openchat-0.5rps)")
     parser.add_argument("--results-root", default="./comparison",
                         help="Root directory for per-run outputs (default: ./comparison)")
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)

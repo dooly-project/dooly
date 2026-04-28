@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """
-Script to run batch predictor and vLLM direct measurements across multiple configurations.
+Long-context sweep comparison runner.
+
+For each (model, backend, scenario) tuple, generates a batch config and runs
+both Dooly's batch predictor and vLLM's direct measurement, producing a
+side-by-side dataset suitable for the §7 long-context evaluation figures
+(TTFT vs input length, per-step decode latency vs KV-cache size).
+
+Sweep dimensions (edit MODELS / BACKENDS / lengths at the top):
+  models   : meta-llama/Llama-3.1-8B, CohereLabs/c4ai-command-r7b-12-2024
+  backends : FLASH_ATTN, TRITON_ATTN  (add FLASHINFER if desired)
+  prefill  : 512, 1024, 2048, 4096, 8192, 16384  (input length)
+  decode   : 1024, 2048, 4096, 8192, 16384       (KV-cache size for single decode step)
+
+The 4K boundary is intentionally crossed so Command-R7B's interleaved
+sliding-window attention (window=4096) plateau emerges in the curves.
 """
 
 import os
@@ -11,18 +25,101 @@ import shutil
 from pathlib import Path
 from typing import List, Dict
 
+
+# ---------------------------------------------------------------------------
+# Sweep configuration
+# ---------------------------------------------------------------------------
+
+MODELS = [
+    "meta-llama/Llama-3.1-8B",
+    "CohereLabs/c4ai-command-r7b-12-2024",
+]
+
+BACKENDS = ["FLASHINFER", "FLASH_ATTN", "TRITON_ATTN"]  # add "FLASHINFER" if including it
+
+# Log-spaced lengths spanning the SWA boundary (4K).
+PREFILL_LENGTHS = [512, 1024, 2048, 4096]
+DECODE_KV_SIZES = []
+# PREFILL_LENGTHS = [512, 1024, 2048, 4096, 8192, 16384]
+# DECODE_KV_SIZES = [1024, 2048, 4096, 8192, 16384]
+
+# Per-run knobs
+WARMUP = 0
+ITERATIONS = 1        # take median across iterations for noise reduction
+MAX_MODEL_LEN = 32768  # must exceed the largest scenario length
+MAX_NUM_SEQS = 256
+GPU_MEMORY = 0.9
+
+DB_PATH = "/home/jkim38/dooly/profiler/database/dooly-ipu0.db"
+CACHE_ROOT = "/home/jkim38/dooly/cache/tp1"   # cache layout: {CACHE_ROOT}/{model}
+RESULTS_DIR = "./results/longctx_sweep"
+CONFIGS_DIR = "./batch_configs/longctx_sweep"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def safe_name(model: str) -> str:
+    """Replace path separators so model names are filesystem-safe."""
+    return model.replace("/", "__")
+
+
+def cache_dir_for(model: str, backend: str) -> str:
+    """Cache layout: {CACHE_ROOT}/{model}/{backend}/"""
+    return os.path.join(CACHE_ROOT, model, backend)
+
+
+def build_scenarios() -> List[Dict]:
+    """Construct the scenario list shared across all (model, backend) pairs."""
+    scenarios: List[Dict] = []
+    for length in PREFILL_LENGTHS:
+        scenarios.append({
+            "name": f"prefill_{length}",
+            "description": f"Single prefill batch, input_len={length}",
+            "prefill_requests": [{"tokens": length, "kv_cache": 0}],
+            "decode_requests": [],
+        })
+    for kv in DECODE_KV_SIZES:
+        scenarios.append({
+            "name": f"decode_kv_{kv}",
+            "description": f"Single decode step at KV={kv}",
+            "prefill_requests": [],
+            "decode_requests": [{"tokens": 1, "kv_cache": kv}],
+        })
+    return scenarios
+
+
+def write_config(model: str, backend: str, scenario: Dict, configs_dir: str) -> str:
+    """Write one batch-config JSON for a (model, backend, scenario) tuple."""
+    config_path = os.path.join(
+        configs_dir,
+        f"{safe_name(model)}__{backend}__{scenario['name']}.json",
+    )
+    config_data = {
+        "description": f"{model} | {backend} | {scenario['description']}",
+        "model": model,
+        "backend": backend,
+        "tensor_parallel_size": 1,
+        "prefill_requests": scenario["prefill_requests"],
+        "decode_requests": scenario["decode_requests"],
+    }
+    with open(config_path, "w") as f:
+        json.dump(config_data, f, indent=2)
+    return config_path
+
+
 def run_command(cmd: List[str], description: str) -> bool:
-    """Run a command and return success status."""
-    print(f"\n{'='*80}")
+    """Run a command and return success status (stdout/stderr tail on failure)."""
+    print(f"\n{'=' * 80}")
     print(f"Running: {description}")
     print(f"Command: {' '.join(cmd)}")
-    print(f"{'='*80}")
-
+    print(f"{'=' * 80}")
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         print("✓ Success")
         if result.stdout:
-            print("STDOUT:", result.stdout[-500:])  # Show last 500 chars
+            print("STDOUT:", result.stdout[-500:])
         return True
     except subprocess.CalledProcessError as e:
         print(f"✗ Failed with exit code {e.returncode}")
@@ -32,178 +129,118 @@ def run_command(cmd: List[str], description: str) -> bool:
             print("STDERR:", e.stderr[-500:])
         return False
 
-def generate_batch_configs(output_dir: str) -> List[str]:
-    """Generate different batch configuration files."""
-    configs = []
 
-    # Different batch scenarios
-    scenarios = [
-        {
-            "name": "small_prefill_256",
-            "description": "Small prefill batch",
-            "prefill_requests": [
-                {"tokens": 256, "kv_cache": 0},
-            ],
-            "decode_requests": []
-        },
-        {
-            "name": "small_prefill_512",
-            "description": "Small prefill batch",
-            "prefill_requests": [
-                {"tokens": 512, "kv_cache": 0},
-            ],
-            "decode_requests": []
-        },
-        {
-            "name": "small_prefill_1024",
-            "description": "Small prefill batch",
-            "prefill_requests": [
-                {"tokens": 1024, "kv_cache": 0},
-            ],
-            "decode_requests": []
-        },
-        {
-            "name": "small_prefill_2048",
-            "description": "Small prefill batch",
-            "prefill_requests": [
-                {"tokens": 2048, "kv_cache": 0},
-            ],
-            "decode_requests": []
-        },
-        {
-            "name": "small_prefill_4096",
-            "description": "Small prefill batch",
-            "prefill_requests": [
-                {"tokens": 4096, "kv_cache": 0},
-            ],
-            "decode_requests": []
-        },
-    ]
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    for scenario in scenarios:
-        config_path = os.path.join(output_dir, f"batch_{scenario['name']}.json")
-        config_data = {
-            "description": scenario["description"],
-            "model": "mistralai/Ministral-8B-Instruct-2410",
-            "backend": "FLASHINFER",
-            "tensor_parallel_size": 1,
-            "prefill_requests": scenario["prefill_requests"],
-            "decode_requests": scenario["decode_requests"]
-        }
-
-        with open(config_path, 'w') as f:
-            json.dump(config_data, f, indent=2)
-
-        configs.append(config_path)
-        print(f"Generated config: {config_path}")
-
-    return configs
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    # Configuration
-    CACHE_DIR = "./cache/tp1/mistralai/Ministral-8B-Instruct-2410/"
-    DB_PATH = "/home/jkim38/dooly/profiler/database/dooly-test.db"
-    RESULTS_DIR = "./results/"
-    CONFIGS_DIR = "./batch_configs/"
-    WARMUP = 3
-    ITERATIONS = 1
-
-    print("Batch Comparison Runner")
+    print("Long-context sweep comparison runner")
     print("=" * 80)
+    print(f"  models  : {MODELS}")
+    print(f"  backends: {BACKENDS}")
+    print(f"  prefill : {PREFILL_LENGTHS}")
+    print(f"  decode  : {DECODE_KV_SIZES}")
+    print(f"  iters   : warmup={WARMUP}, measurement={ITERATIONS}")
 
-    # Create output directories
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(CONFIGS_DIR, exist_ok=True)
 
-    # Clean up vLLM profiles directory to prevent reading stale traces
-    VLLM_PROFILES_DIR = "./vllm_profiles/"
-    if os.path.exists(VLLM_PROFILES_DIR):
-        shutil.rmtree(VLLM_PROFILES_DIR)
-        print(f"Cleaned up {VLLM_PROFILES_DIR} directory to prevent stale trace reads")
+    # Clean stale vLLM trace artefacts so subsequent reads aren't polluted.
+    vllm_profiles_dir = "./vllm_profiles/"
+    if os.path.exists(vllm_profiles_dir):
+        shutil.rmtree(vllm_profiles_dir)
+        print(f"Cleaned {vllm_profiles_dir} (stale traces).")
 
-    # Generate batch configurations
-    print("\n1. Generating batch configurations...")
-    config_files = generate_batch_configs(CONFIGS_DIR)
+    scenarios = build_scenarios()
+    print(f"\n1. Built {len(scenarios)} scenarios "
+          f"({len(PREFILL_LENGTHS)} prefill + {len(DECODE_KV_SIZES)} decode).")
 
-    # Run comparisons for each configuration
-    print(f"\n2. Running comparisons for {len(config_files)} configurations...")
+    total_runs = len(MODELS) * len(BACKENDS) * len(scenarios)
+    print(f"2. Will execute {total_runs} (model × backend × scenario) runs.\n")
 
     results_summary = []
+    run_idx = 0
+    for model in MODELS:
+        for backend in BACKENDS:
+            cache_dir = cache_dir_for(model, backend)
+            if not os.path.exists(cache_dir):
+                print(f"⚠️  Cache dir missing for ({model}, {backend}): {cache_dir}")
+                print(f"    Skipping all runs for this pair. Profile it first via "
+                      f"`python -m simulator.estimator --model {model} --backend {backend} ...`")
+                continue
 
-    for config_file in config_files:
-        config_name = Path(config_file).stem
-        print(f"\n{'='*80}")
-        print(f"Processing: {config_name}")
-        print(f"Config: {config_file}")
-        print(f"{'='*80}")
+            for scenario in scenarios:
+                run_idx += 1
+                tag = f"{safe_name(model)}__{backend}__{scenario['name']}"
+                print(f"\n[{run_idx}/{total_runs}] {tag}")
 
-        # Output file names
-        dooly_output = os.path.join(RESULTS_DIR, f"dooly_{config_name}.json")
-        vllm_output = os.path.join(RESULTS_DIR, f"vllm_{config_name}.json")
+                config_file = write_config(model, backend, scenario, CONFIGS_DIR)
+                dooly_output = os.path.join(RESULTS_DIR, f"dooly_{tag}.json")
+                vllm_output_name = f"vllm_{tag}.json"
+                vllm_output = os.path.join(RESULTS_DIR, vllm_output_name)
 
-        # Run Dooly batch predictor
-        dooly_cmd = [
-            sys.executable, "-m", "simulator.benchmark.batch_predictor",
-            "--batch-config", config_file,
-            "--cache-dir", CACHE_DIR,
-            "--db-path", DB_PATH,
-            "--json-output", dooly_output,
-        ]
+                # Dooly prediction
+                dooly_cmd = [
+                    sys.executable, "-m", "simulator.benchmark.batch_predictor",
+                    "--batch-config", config_file,
+                    "--cache-dir", cache_dir,
+                    "--db-path", DB_PATH,
+                    "--json-output", dooly_output,
+                ]
+                dooly_success = run_command(dooly_cmd, f"Dooly: {tag}")
 
-        dooly_success = run_command(dooly_cmd, f"Dooly prediction for {config_name}")
+                # vLLM measurement
+                vllm_cmd = [
+                    sys.executable, "-m", "simulator.benchmark.measure_vllm_direct",
+                    "--batch-config", config_file,
+                    "--warmup", str(WARMUP),
+                    "--iterations", str(ITERATIONS),
+                    "--max-model-len", str(MAX_MODEL_LEN),
+                    "--max-num-seqs", str(MAX_NUM_SEQS),
+                    "--gpu-memory", str(GPU_MEMORY),
+                    "--out-dir", RESULTS_DIR,
+                    "--output", vllm_output_name,
+                ]
+                vllm_success = run_command(vllm_cmd, f"vLLM: {tag}")
 
-        # Run vLLM direct measurement
-        vllm_cmd = [
-            sys.executable, "-m", "simulator.benchmark.measure_vllm_direct",
-            "--batch-config", config_file,
-            "--warmup", str(WARMUP),
-            "--iterations", str(ITERATIONS),
-            "--max-model-len", "8192",
-            "--max-num-seqs", "256",
-            "--gpu-memory", "0.9",
-            "--out-dir", RESULTS_DIR,
-            "--output", f"vllm_{config_name}.json"
-        ]
+                results_summary.append({
+                    "tag": tag,
+                    "model": model,
+                    "backend": backend,
+                    "scenario": scenario["name"],
+                    "config_file": config_file,
+                    "dooly_output": dooly_output if dooly_success else None,
+                    "vllm_output": vllm_output if vllm_success else None,
+                    "dooly_success": dooly_success,
+                    "vllm_success": vllm_success,
+                })
 
-        vllm_success = run_command(vllm_cmd, f"vLLM measurement for {config_name}")
-
-        # Track results
-        result_entry = {
-            "config": config_name,
-            "config_file": config_file,
-            "dooly_output": dooly_output if dooly_success else None,
-            "vllm_output": vllm_output if vllm_success else None,
-            "dooly_success": dooly_success,
-            "vllm_success": vllm_success
-        }
-        results_summary.append(result_entry)
-
-    # Generate summary
-    print(f"\n{'='*80}")
+    # Final summary
+    print(f"\n{'=' * 80}")
     print("SUMMARY")
-    print(f"{'='*80}")
-
+    print(f"{'=' * 80}")
     successful_pairs = 0
-    for result in results_summary:
-        status = "✓" if result["dooly_success"] and result["vllm_success"] else "✗"
-        print(f"{status} {result['config']}: Dooly={'✓' if result['dooly_success'] else '✗'}, vLLM={'✓' if result['vllm_success'] else '✗'}")
-        if result["dooly_success"] and result["vllm_success"]:
+    for r in results_summary:
+        d = "✓" if r["dooly_success"] else "✗"
+        v = "✓" if r["vllm_success"] else "✗"
+        status = "✓" if r["dooly_success"] and r["vllm_success"] else "✗"
+        print(f"  {status} {r['tag']:<80s}  Dooly={d}  vLLM={v}")
+        if r["dooly_success"] and r["vllm_success"]:
             successful_pairs += 1
 
     print(f"\nSuccessful pairs: {successful_pairs}/{len(results_summary)}")
 
-    # Save summary
     summary_file = os.path.join(RESULTS_DIR, "comparison_summary.json")
-    with open(summary_file, 'w') as f:
+    with open(summary_file, "w") as f:
         json.dump(results_summary, f, indent=2)
     print(f"Summary saved to: {summary_file}")
 
-    # Suggest next steps
     if successful_pairs > 0:
         print(f"\nNext steps:")
-        print(f"1. Compare results: python -m simulator.benchmark.compare_json <dooly_file> <vllm_file>")
-        print(f"2. Analyze all results in: {RESULTS_DIR}")
+        print(f"  1. Aggregate per-(model, backend) into the line plots described in §7.")
+        print(f"  2. All raw outputs are under: {RESULTS_DIR}")
+
 
 if __name__ == "__main__":
     main()

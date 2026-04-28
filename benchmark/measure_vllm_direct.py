@@ -1,3 +1,4 @@
+import re
 import sys
 import time
 import json
@@ -5,21 +6,16 @@ from pathlib import Path
 from typing import List, Dict, Tuple
 import numpy as np
 
+# vLLM annotates each forward pass on the GPU as
+#   execute_context_<n_prefill_seqs>(<n_prefill_tokens>)_generation_<n_decode_seqs>(<n_decode_tokens>)
+# A step is a prefill iff <n_prefill_tokens> > 0; otherwise it's a decode.
+# Capturing groups: (n_prefill_seqs, n_prefill_tokens, n_decode_seqs, n_decode_tokens)
+_EXECUTE_CONTEXT_RE = re.compile(
+    r'execute_context_(\d+)\((\d+)\)_generation_(\d+)\((\d+)\)'
+)
+
 try:
     import torch
-    # Disable torch.compile / Dynamo globally before vLLM imports so the
-    # measurement side matches the profiler-side trace, which is captured
-    # under taintracer.hooks.install_hooks — that utility sets the same flag
-    # for its own reasons (tainted-tensor dispatch is incompatible with
-    # Dynamo). Without this, real vLLM runs modules like GemmaRMSNorm through
-    # a fused Triton kernel (e.g. triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0)
-    # while the profiler recorded the 10 individual aten kernels, so the
-    # simulator's predicted-latency sum wouldn't correspond to the measured
-    # single-kernel cost. Keeping this flag aligned preserves apples-to-
-    # apples comparison between simulator predictions and direct measurement.
-    import torch._dynamo
-    torch._dynamo.config.disable = False
-
     from vllm import LLM, SamplingParams
     from vllm.benchmarks.serve import calculate_metrics, BenchmarkMetrics
     from vllm.benchmarks.datasets import SampleRequest
@@ -224,16 +220,65 @@ def measure_batch_request(
     # Use GPU timing data from execute_model_stats
     execute_model_stats = gpu_times.get('execute_model_details', [])
 
+    # Helper for the per-stat-list median that we use in several places.
+    def _med(stats, key):
+        return float(np.median([s[key] for s in stats])) if stats else None
+
+    # Default field values (overwritten below if we have any execute_model_stats).
+    prefill_latency = decode_latency = first_decode_latency = None
+    n_prefill_steps = n_decode_steps = 0
+
     if execute_model_stats:
-        # Use the timing data from exec_stats
-        gpu_latency = np.median([stat['computation_kernel_time_ms'] for stat in execute_model_stats])
-        comm_latency = np.median([stat['communication_kernel_time_ms'] for stat in execute_model_stats])
-        all_reduce_latency = np.median([stat['communication']['all_reduce']['total_ms'] for stat in execute_model_stats])
-        all_reduce_count = np.median([stat['communication']['all_reduce']['count'] for stat in execute_model_stats])
-        per_all_reduce_latency = np.median([stat['communication']['all_reduce']['median_ms'] for stat in execute_model_stats])
-        all_gather_latency = np.median([stat['communication']['all_gather']['total_ms'] for stat in execute_model_stats])
-        all_gather_count = np.median([stat['communication']['all_gather']['count'] for stat in execute_model_stats])
-        per_all_gather_latency = np.median([stat['communication']['all_gather']['median_ms'] for stat in execute_model_stats]) 
+        # Sort chronologically so "first decode after prefill" is well-defined.
+        sorted_stats = sorted(execute_model_stats, key=lambda s: s.get('ts', 0))
+
+        # Partition by prefill/decode using the annotation classification.
+        # If `is_prefill` is None (regex didn't match — older vLLM annotation
+        # format), fall back to the historic "median of all" behavior so old
+        # traces still produce a usable number.
+        prefill_stats = [s for s in sorted_stats if s.get('is_prefill') is True]
+        decode_stats  = [s for s in sorted_stats if s.get('is_prefill') is False]
+        unknown_stats = [s for s in sorted_stats if s.get('is_prefill') is None]
+
+        n_prefill_steps = len(prefill_stats)
+        n_decode_steps  = len(decode_stats)
+
+        prefill_latency = _med(prefill_stats, 'computation_kernel_time_ms')
+        decode_latency  = _med(decode_stats,  'computation_kernel_time_ms')
+
+        # The first decode step in chronological order — its KV cache equals
+        # exactly the prefill prompt length (no growth yet). This is the value
+        # that matches db_predictor's "decode at KV=K exactly" prediction.
+        if decode_stats:
+            first_decode_latency = (decode_stats[0]['computation_kernel_time_ms']
+                                    + decode_stats[0]['communication_kernel_time_ms'])
+
+        # Pick the workload-appropriate aggregate.
+        # - Decode-mode trace (any decode steps present): use the first decode
+        #   so the comparison to db_predictor lands at the configured KV.
+        # - Prefill-only trace: median of prefills (typically just one per iter).
+        # - Unknown classification: fall back to the historic "median of all"
+        #   so old traces still produce a usable number.
+        if decode_stats:
+            # Communication latency for the same first-decode step.
+            comm_latency = decode_stats[0]['communication_kernel_time_ms']
+            gpu_latency  = decode_stats[0]['computation_kernel_time_ms']
+        elif prefill_stats:
+            gpu_latency  = prefill_latency
+            comm_latency = _med(prefill_stats, 'communication_kernel_time_ms') or 0.0
+        else:
+            # Unknown — fall back to old behavior across all stats.
+            gpu_latency  = _med(sorted_stats, 'computation_kernel_time_ms') or 0.0
+            comm_latency = _med(sorted_stats, 'communication_kernel_time_ms') or 0.0
+
+        # Comm-aggregate fields stay as medians across all events (these are
+        # diagnostic rather than the headline number).
+        all_reduce_latency      = float(np.median([s['communication']['all_reduce']['total_ms']  for s in execute_model_stats]))
+        all_reduce_count        = float(np.median([s['communication']['all_reduce']['count']     for s in execute_model_stats]))
+        per_all_reduce_latency  = float(np.median([s['communication']['all_reduce']['median_ms'] for s in execute_model_stats]))
+        all_gather_latency      = float(np.median([s['communication']['all_gather']['total_ms']  for s in execute_model_stats]))
+        all_gather_count        = float(np.median([s['communication']['all_gather']['count']     for s in execute_model_stats]))
+        per_all_gather_latency  = float(np.median([s['communication']['all_gather']['median_ms'] for s in execute_model_stats]))
         total_latency = gpu_latency + comm_latency
     else:
         # Fallback to end-to-end measurement
@@ -260,8 +305,23 @@ def measure_batch_request(
         'per_all_gather_latency_ms': per_all_gather_latency,
         'batch_size': num_prefills,
         'total_tokens': sum(prompt_lens),
-        'num_prefill_requests': num_prefills,
-        'num_decode_requests': 0,
+        # Counts come from the trace classification — these reflect what
+        # actually executed on the GPU, not the input config's request lists.
+        'num_prefill_steps': n_prefill_steps,
+        'num_decode_steps':  n_decode_steps,
+        # Per-workload latencies. `prefill_latency_ms` is the median across
+        # all prefill steps in this trace; `decode_latency_ms` is the median
+        # across all decode steps; `first_decode_latency_ms` is the very
+        # first decode step (KV cache = configured prompt length, no growth)
+        # — this is the value that matches db_predictor's prediction at
+        # `kv_cache=K` exactly.
+        'prefill_latency_ms':      prefill_latency,
+        'decode_latency_ms':       decode_latency,
+        'first_decode_latency_ms': first_decode_latency,
+        # Backward-compat fields (kept so older readers don't break, but the
+        # values now reflect the trace, not the config).
+        'num_prefill_requests': n_prefill_steps,
+        'num_decode_requests':  n_decode_steps,
     }
 
     if result['total_tokens'] > 0:
@@ -649,11 +709,30 @@ def analyze_execute_model_from_trace(trace_path: str) -> Dict:
                     
             elif cat == 'gpu_user_annotation':
                 if 'execute_context' in name:
+                    # Parse out prefill vs decode classification from the
+                    # annotation name (vLLM emits this format on every
+                    # forward pass — see _EXECUTE_CONTEXT_RE definition).
+                    m = _EXECUTE_CONTEXT_RE.search(name)
+                    if m:
+                        n_prefill_seqs   = int(m.group(1))
+                        n_prefill_tokens = int(m.group(2))
+                        n_decode_seqs    = int(m.group(3))
+                        n_decode_tokens  = int(m.group(4))
+                        is_prefill       = n_prefill_tokens > 0
+                    else:
+                        n_prefill_seqs = n_prefill_tokens = 0
+                        n_decode_seqs  = n_decode_tokens  = 0
+                        is_prefill     = None  # unknown
                     execute_context_events.append({
                         'name': name,
                         'ts': ts,
                         'dur': event.get('dur', 0),
-                        'type': cat
+                        'type': cat,
+                        'is_prefill':       is_prefill,
+                        'n_prefill_seqs':   n_prefill_seqs,
+                        'n_prefill_tokens': n_prefill_tokens,
+                        'n_decode_seqs':    n_decode_seqs,
+                        'n_decode_tokens':  n_decode_tokens,
                     })
                     
                     
@@ -716,6 +795,12 @@ def analyze_execute_model_from_trace(trace_path: str) -> Dict:
                 'computation_kernel_time_ms': (total_kernel_time_us - total_comm_kernel_time_us) / 1000,
                 'communication_kernel_time_ms': total_comm_kernel_time_us / 1000,
                 'kernel_count': len(kernels_within),
+                'is_prefill':       exec_model.get('is_prefill'),
+                'n_prefill_seqs':   exec_model.get('n_prefill_seqs', 0),
+                'n_prefill_tokens': exec_model.get('n_prefill_tokens', 0),
+                'n_decode_seqs':    exec_model.get('n_decode_seqs', 0),
+                'n_decode_tokens':  exec_model.get('n_decode_tokens', 0),
+                'ts':               exec_model['ts'],
                 'communication': {
                     'all_gather': {
                         'count': len(comm_kernels['all_gather']),
@@ -874,9 +959,6 @@ def main():
     backend = config.get('backend', args.attention_backend)
     tp = config.get('tensor_parallel_size', args.tensor_parallel_size)
 
-    from vllm.config import CompilationConfig
-    from vllm.config.compilation import CompilationMode, CUDAGraphMode
-    
     llm = LLM(
         model=model,
         dtype="bfloat16",  # Ensure consistent dtype with Dooly
@@ -887,7 +969,7 @@ def main():
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_model_len,
         load_format="dummy",
-        enforce_eager=True,
+        enforce_eager=False,
         enable_prefix_caching=False,
         # compilation_config=CompilationConfig(
         #     mode=CompilationMode.NONE,

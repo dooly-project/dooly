@@ -30,16 +30,24 @@ class Request:
     max_tokens: int
     arrival_time: float
 
-def generate_vllm_requests_from_instance( 
+def generate_vllm_requests_from_instance(
     llm: LLM,
     num_requests: int,
     arrival_rate: float,
     input_len: int,
     output_len: int,
     range_ratio: float = 0.0,
+    fixed_output_len: int | None = None,
     seed: int = 42,
 ) -> Tuple[List[Request], List[SampleRequest]]:
+    """Generate requests with vLLM's RandomDataset.
 
+    If ``fixed_output_len`` is provided, every request's expected output
+    length is overridden to that value after generation, while the input
+    length still varies according to ``range_ratio``. This is useful when
+    you want to vary input length only and hold output length constant
+    (e.g., long-context simulator validation).
+    """
     tokenizer = llm.get_tokenizer()
 
     # Create vLLM's RandomDataset
@@ -47,7 +55,10 @@ def generate_vllm_requests_from_instance(
 
     print(f"Generating {num_requests} requests with vLLM RandomDataset...")
     print(f"  Input length: {input_len} (range_ratio={range_ratio})")
-    print(f"  Output length: {output_len} (range_ratio={range_ratio})")
+    if fixed_output_len is not None:
+        print(f"  Output length: {fixed_output_len} (fixed; range_ratio ignored for output)")
+    else:
+        print(f"  Output length: {output_len} (range_ratio={range_ratio})")
     print(f"  Seed: {seed}")
 
     # Generate requests using vLLM's method
@@ -60,6 +71,11 @@ def generate_vllm_requests_from_instance(
         range_ratio=range_ratio,
         request_id_prefix="req_",
     )
+
+    # Override output length if a fixed value is requested
+    if fixed_output_len is not None:
+        for req in vllm_requests:
+            req.expected_output_len = fixed_output_len
 
     print(f"Generated {len(vllm_requests)} requests")
 
@@ -502,29 +518,33 @@ def export_vllm_dataset_jsonl(
 
 
 if __name__ == "__main__":
-    # Test the generator
-    # dooly_reqs, vllm_reqs = generate_vllm_requests(
-    #     model="meta-llama/Llama-3.1-8B",
-    #     num_requests=10,
-    #     arrival_rate=5.0,
-    #     input_len=1024,
-    #     output_len=128,
-    #     range_ratio=0.5,
-    #     seed=42,
-    # )
-
+    # Long-context synthetic dataset for §7 evaluation:
+    #   500 requests, input ~2048-8192 tokens, output fixed at 128, RPS=0.5
+    OUTPUT_PATH = "/home/jkim38/dooly/dataset/longctx_2k-8k_rps0.5_out128.jsonl"
 
     llm = LLM(model="meta-llama/Llama-3.1-8B", load_format="dummy", enforce_eager=True)
 
-    dooly_reqs, vllm_reqs = generate_sharegpt_requests_from_instance(llm, 100, 1.0, "/home/jkim38/dooly/dataset/ShareGPT_V3_unfiltered_cleaned_split.json", 1024, 2048)
+    dooly_reqs, vllm_reqs = generate_vllm_requests_from_instance(
+        llm=llm,
+        num_requests=500,
+        arrival_rate=0.5,
+        input_len=5120,             # midpoint of 2K-8K
+        output_len=128,             # consumed by RandomDataset; overridden below
+        range_ratio=0.6,            # input ~ [2048, 8192]
+        fixed_output_len=128,       # every request capped at exactly 128 output tokens
+        seed=42,
+    )
 
-    print("\nSample DoolySim request:")
-    print(f"  ID: {dooly_reqs[0].request_id}")
-    print(f"  Prompt tokens: {len(dooly_reqs[0].prompt_token_ids)}")
-    print(f"  Max tokens: {dooly_reqs[0].max_tokens}")
-    print(f"  Arrival time: {dooly_reqs[0].arrival_time:.3f}s")
+    arrival_times = [r.arrival_time for r in dooly_reqs]
+    export_vllm_dataset_jsonl(vllm_reqs, arrival_times, OUTPUT_PATH)
 
-    print("\nSample vLLM request:")
-    print(f"  ID: {vllm_reqs[0].request_id}")
-    print(f"  Prompt length: {vllm_reqs[0].prompt_len}")
-    print(f"  Expected output: {vllm_reqs[0].expected_output_len}")
+    prompt_lens = [r.prompt_len for r in vllm_reqs]
+    output_lens = sorted(set(r.expected_output_len for r in vllm_reqs))
+    span = arrival_times[-1] if arrival_times else 0.0
+    print()
+    print(f"Dataset summary ({OUTPUT_PATH}):")
+    print(f"  requests       : {len(vllm_reqs)}")
+    print(f"  input tokens   : min={min(prompt_lens)}, max={max(prompt_lens)}, "
+          f"mean={sum(prompt_lens)/len(prompt_lens):.0f}")
+    print(f"  output tokens  : {output_lens} (single value expected)")
+    print(f"  arrival span   : {span:.1f} s  (effective RPS={len(vllm_reqs)/span:.2f})")
