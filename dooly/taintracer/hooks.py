@@ -21,6 +21,11 @@ __all__ = [
 # Captured originals (before any hooks replace them)
 # ---------------------------------------------------------------------------
 
+# torch.compile (captured before any patching). Patched in install_hooks()
+# with a wrapper that handles TaintedTensor inputs without going through
+# dynamo (which can't trace TaintedTensor's __torch_dispatch__).
+_original_torch_compile = torch.compile
+
 # Tensor creation hooks
 _original_zeros = torch.zeros
 _original_ones = torch.ones
@@ -2652,6 +2657,144 @@ def _wrap_einsum(original_fn):
 
 
 # ---------------------------------------------------------------------------
+# torch.compile wrapper — taint-aware
+# ---------------------------------------------------------------------------
+#
+# Problem: TaintedTensor's custom __torch_dispatch__ is incompatible with
+# torch.dynamo tracing, so @torch.compile-decorated functions (e.g.
+# Cohere's layer_norm_func, GemmaRMSNorm._forward_static_*) crash when called
+# with TaintedTensor inputs. The previous mitigation was to disable dynamo
+# entirely (`torch._dynamo.config.disable = True`), which forced compiled
+# functions to run in eager mode — but each constituent ATen op still went
+# through TaintedTensor.__torch_dispatch__, decomposing the function into
+# many primitive ops that the tracer captured separately.
+#
+# Fix: wrap torch.compile so that when its produced callable is invoked with
+# TaintedTensor inputs, we (1) collect input shapes + taints, (2) unwrap to
+# plain tensors and call the original function with custom dispatch disabled
+# (treating the function body as a single black box — no per-op decomposition),
+# (3) apply propagate_taints (shape-matching rules) to compute output taints,
+# (4) re-wrap outputs as TaintedTensors. When the wrapped callable is invoked
+# with non-tainted inputs, we delegate to the real torch.compile path so
+# dynamo can do its normal optimization work.
+
+def _make_taint_aware_compiled(original_fn, original_compiled_fn):
+    """Return a callable that handles TaintedTensor inputs without dynamo.
+
+    For TaintedTensor inputs: bypass compilation, run original_fn as a black
+    box on plain tensors, apply shape-based taint propagation to outputs.
+    For non-tainted inputs: delegate to torch.compile's compiled wrapper.
+    """
+    @functools.wraps(original_fn)
+    def wrapped(*call_args, **call_kwargs):
+        from .propagation import propagate_taints
+
+        input_infos = []
+        shape_strs = []
+        dtype_strs = []
+        has_tainted = False
+
+        def collect(obj):
+            nonlocal has_tainted
+            if isinstance(obj, TaintedTensor):
+                has_tainted = True
+                shape = tuple(torch.Tensor.size(obj))
+                input_infos.append((shape, obj._dim_taints))
+                shape_strs.append(obj.taint_str_with_history())
+                dtype_strs.append(str(obj.dtype))
+            elif isinstance(obj, torch.Tensor):
+                shape = tuple(torch.Tensor.size(obj))
+                input_infos.append((shape, tuple(None for _ in range(len(shape)))))
+                shape_strs.append("[" + ", ".join(f"?({d})" for d in shape) + "]")
+                dtype_strs.append(str(obj.dtype))
+            elif isinstance(obj, (list, tuple)):
+                for x in obj:
+                    collect(x)
+            elif isinstance(obj, dict):
+                for x in obj.values():
+                    collect(x)
+
+        collect(call_args)
+        collect(call_kwargs)
+
+        if not has_tainted:
+            # Pure plain-tensor path — let torch.compile do its thing.
+            return original_compiled_fn(*call_args, **call_kwargs)
+
+        # TaintedTensor inputs present. Unwrap, run original (uncompiled) fn
+        # with our custom dispatch disabled so its body executes as a single
+        # black box (no per-op TaintedTensor decomposition).
+        def unwrap(x):
+            if isinstance(x, TaintedTensor):
+                with torch._C._DisableTorchDispatch():
+                    return x.detach()
+            elif isinstance(x, (list, tuple)):
+                return type(x)(unwrap(i) for i in x)
+            elif isinstance(x, dict):
+                return {k: unwrap(v) for k, v in x.items()}
+            return x
+
+        plain_args = unwrap(call_args)
+        plain_kwargs = unwrap(call_kwargs)
+
+        # Emit a COMPILE: marker. The trace parser stacks 'compile' events into
+        # the kernel parent chain and treats them as self-tainted anchors, so
+        # kernels inside this scope land on the function as their profiling
+        # target — matching what the resolver needs to call back into the real
+        # torch.compile-decorated module (e.g. Cohere's layer_norm_func via
+        # its containing LayerNorm).
+        fn_name = getattr(original_fn, "__name__", "compiled_fn")
+        in_str = " | ".join(shape_strs) if shape_strs else "no_inputs"
+        annotated_name = f"COMPILE: {fn_name} IN:[{in_str}]"
+        if dtype_strs:
+            annotated_name += f" DTYPES:[{', '.join(dtype_strs)}]"
+
+        with record_function(annotated_name):
+            with torch._C._DisableTorchDispatch():
+                out = original_fn(*plain_args, **plain_kwargs)
+
+        # Apply shape-based taint propagation to each output tensor.
+        def wrap_output(x):
+            if isinstance(x, torch.Tensor) and not isinstance(x, TaintedTensor):
+                out_shape = tuple(x.shape)
+                try:
+                    out_taints = propagate_taints(input_infos, out_shape)
+                except Exception:
+                    # Conservative fallback: leave outputs un-tainted if
+                    # shape propagation hits an unexpected case (e.g., a
+                    # dimension-collision raise inside propagate_taints).
+                    out_taints = tuple(None for _ in range(len(out_shape)))
+                return TaintedTensor(x, out_taints)
+            elif isinstance(x, (list, tuple)):
+                return type(x)(wrap_output(i) for i in x)
+            elif isinstance(x, dict):
+                return {k: wrap_output(v) for k, v in x.items()}
+            return x
+
+        return wrap_output(out)
+
+    # Stash references for debugging / introspection.
+    wrapped._taint_aware_original_fn = original_fn
+    wrapped._taint_aware_compiled_fn = original_compiled_fn
+    return wrapped
+
+
+def _patched_torch_compile(model=None, *args, **kwargs):
+    """Drop-in replacement for torch.compile that produces taint-aware
+    callables. Supports decorator (with or without args) and direct usage."""
+    if model is None:
+        # Decorator-with-args form: @torch.compile(mode=..., backend=...)
+        def decorator(fn):
+            compiled = _original_torch_compile(fn, *args, **kwargs)
+            return _make_taint_aware_compiled(fn, compiled)
+        return decorator
+
+    # Direct call: torch.compile(fn, ...)  OR  @torch.compile (no args)
+    compiled = _original_torch_compile(model, *args, **kwargs)
+    return _make_taint_aware_compiled(model, compiled)
+
+
+# ---------------------------------------------------------------------------
 # Install / Uninstall
 # ---------------------------------------------------------------------------
 
@@ -2659,10 +2802,19 @@ def install_hooks(int_patch_modules=()):
     """Install hooks on tensor creation functions and enable profiler integration."""
     import os
 
-    # Disable torch.dynamo - TaintedTensor's custom __torch_dispatch__ is incompatible
-    # with dynamo tracing. This makes @torch.compile decorated functions run in eager mode.
-    import torch._dynamo
-    torch._dynamo.config.disable = True
+    # Replace torch.compile with a taint-aware wrapper. TaintedTensor's
+    # __torch_dispatch__ is incompatible with dynamo's tracing, so when a
+    # compiled callable is invoked with TaintedTensor inputs we bypass
+    # compilation, run the original function as a single black box, and
+    # apply shape-based taint propagation on outputs (see propagation.py).
+    # Plain-tensor calls still go through the normal torch.compile path.
+    _disable_compile_wrapper = os.environ.get("DISABLE_TAINT_COMPILE_WRAPPER", "0") == "1"
+    if _disable_compile_wrapper:
+        # Legacy behaviour: globally disable dynamo. Compiled functions run
+        # in eager mode and decompose into per-op TaintedTensor dispatch.
+        importlib.import_module("torch._dynamo").config.disable = True
+    else:
+        torch.compile = _patched_torch_compile
 
     _disable_factory_wrappers = os.environ.get("DISABLE_FACTORY_WRAPPERS", "0") == "1"
 
@@ -2792,6 +2944,7 @@ def install_hooks(int_patch_modules=()):
 
 def uninstall_hooks():
     """Restore original tensor creation functions and dispatch."""
+    torch.compile = _original_torch_compile
     torch.zeros = _original_zeros
     torch.ones = _original_ones
     torch.empty = _original_empty

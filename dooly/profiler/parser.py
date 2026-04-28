@@ -187,8 +187,19 @@ class OperationHierarchy:
 
     @property
     def is_module(self) -> bool:
-        """Check if this is a module."""
-        return self.anchor.cat == 'module'
+        """Check if this anchor should be resolved as an nn.Module callable.
+
+        Includes 'compile' anchors — they don't *are* modules, but the
+        resolver needs to look up their containing nn.Module (the class that
+        holds the @torch.compile-decorated function) and call its forward,
+        which internally invokes the real compiled fn.
+        """
+        return self.anchor.cat in ('module', 'compile')
+
+    @property
+    def is_compile(self) -> bool:
+        """True if the anchor is a torch.compile scope (cat='compile')."""
+        return self.anchor.cat == 'compile'
 
     def get_taint_string(self) -> Optional[str]:
         """Get the first taint's full name with params (for input extraction)."""
@@ -258,10 +269,10 @@ class HierarchicalTraceParser:
         # 1. Group by Thread
         thread_events = defaultdict(list)
         for event in self.events:
-            # We only stack CPU-side events (modules, ops, comm)
+            # We only stack CPU-side events (modules, compile-scopes, ops, comm)
             # Taints are excluded as per user request
             # Kernels are on GPU/different thread, handled separately
-            if event.cat in ('module', 'cpu_op', 'comm'):
+            if event.cat in ('module', 'compile', 'cpu_op', 'comm'):
             # if event.cat in ('module', 'cpu_op'):
                 # Use a combined key for pid/tid
                 key = (event.pid, event.tid)
@@ -360,7 +371,7 @@ class HierarchicalTraceParser:
 
         # Pass 2: Prune children that aren't marked (single pass, in-place)
         for event in self.events:
-            if event.cat in ('module', 'cpu_op', 'comm'):
+            if event.cat in ('module', 'compile', 'cpu_op', 'comm'):
                 # Filter children in-place (only one dict rebuild per node)
                 event.children = {
                     k: v for k, v in event.children.items()
@@ -420,6 +431,29 @@ class HierarchicalTraceParser:
                     # Extract just the DTYPES part (before KWARGS if present)
                     if ' KWARGS:' in dtypes_section:
                         dtypes_section = dtypes_section.split(' KWARGS:')[0]
+                    args['Input type'] = list(
+                        dtypes_section.replace('[', '').replace(']', '').split(', ')
+                    )
+            elif cat == 'user_annotation' and name.startswith('COMPILE:'):
+                # torch.compile-decorated function scope. Emitted by
+                # _make_taint_aware_compiled in hooks.py wrapping the call to
+                # the original Python fn under _DisableTorchDispatch — so its
+                # internal aten ops have no per-op taint and would otherwise
+                # leave their kernels orphaned. Treat the COMPILE event itself
+                # as a self-tainted anchor (cat='compile', stacked into the
+                # tree) so kernel walks land here.
+                # Name format: "COMPILE: <fn_name> IN:[...] DTYPES:[...]"
+                clean_name = name.split(' IN:')[0].replace('COMPILE: ', '').strip()
+                event_cat = 'compile'
+                event_name = clean_name
+                if ' IN:' in name:
+                    in_section = name.split(' IN:')[1]
+                    if ' DTYPES:' in in_section:
+                        event_param = in_section.split(' DTYPES:')[0]
+                    else:
+                        event_param = in_section
+                if ' DTYPES:' in name:
+                    dtypes_section = name.split(' DTYPES:')[1]
                     args['Input type'] = list(
                         dtypes_section.replace('[', '').replace(']', '').split(', ')
                     )
@@ -499,7 +533,20 @@ class HierarchicalTraceParser:
 
             # Categorize events
             if event_cat == 'module':
+                # Populate Input Dims from the MODULE annotation's own IN
+                # section. Without this, modules with no separately-emitted
+                # matching taint event (e.g. modules above a torch.compile
+                # scope where __torch_dispatch__ is bypassed) have no shape
+                # info — the trace.py compile-anchor handler reads from this.
+                if event_param:
+                    event.args['Input Dims'] = event.get_dims_from_taint_string(event_param)
                 self.modules.append(event)
+            elif event_cat == 'compile':
+                # Compile events are self-tainted: populate Input Dims from
+                # their own params now so the trace.py anchor handler can read
+                # shapes the same way it does for cpu_op anchors.
+                if event_param:
+                    event.args['Input Dims'] = event.get_dims_from_taint_string(event_param)
             elif event_cat == 'comm':
                 # print(f"[DEBUG] Adding comm event: {event}")
                 self.comm_ops.append(event)
@@ -613,26 +660,32 @@ class HierarchicalTraceParser:
     def find_nearest_tainted_ancestor(self, event: Event) -> Optional[Event]:
         """
         Walk up the parent hierarchy to find the nearest ancestor that has associated taints.
-        
+
         Args:
             event: The starting event (usually a kernel or leaf CPU op)
-            
+
         Returns:
             The nearest tainted ancestor Event, or None if no tainted ancestor is found.
         """
         current = event
         # print(f"DEBUG: Searching ancestor for {event.name}")
         while current is not None:
+            # 'compile' scopes (from torch.compile-decorated fns wrapped in
+            # hooks.py) are self-tainted: their own params hold the taint
+            # signature, no separate taint event is emitted by design (the
+            # whole point is to skip per-op dispatch inside the compiled fn).
+            if current.cat == 'compile' and current.params:
+                return current
             # We treat 'cpu_op' and 'module' as valid candidates for having taints.
             if current.cat in ('cpu_op', 'module'):
                 taints = self.find_associated_taints(current)
                 if taints:
                     # print(f"DEBUG: Found tainted ancestor {current.name} for {event.name}")
                     return current
-            
+
             # Move up
             current = current.parent
-            
+
         return None
 
     def get_profiling_ops(self) -> List[Dict]:

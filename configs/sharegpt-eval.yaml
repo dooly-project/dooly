@@ -1,0 +1,25 @@
+# ----- pairs to profile (priority over `models:` + `backends:` if both present) -----
+pairs:
+  - [meta-llama/Llama-3.1-8B, FLASHINFER]
+  # - [meta-llama/Llama-3.1-8B,             FLASH_ATTN]
+  # - [meta-llama/Llama-3.1-8B,             TRITON_ATTN]
+  - [Qwen/Qwen3-30B-A3B, FLASHINFER]
+  - [Qwen/Qwen3-32B, FLASHINFER]
+  # - [CohereLabs/c4ai-command-r7b-12-2024, FLASH_ATTN]
+  # - [CohereLabs/c4ai-command-r7b-12-2024, TRITON_ATTN]
+
+# ----- output paths -----
+paths:
+  db_path:       /home/jkim38/dooly/profiler/database/rtx-sharegpt-eval.db
+  workspace_dir: /home/jkim38/dooly/profiler/workspaces/rtx-sharegpt-eval/
+
+# ----- sweep space passed to run-e2e (per-pair) -----
+sweep:
+  max_batch_size: 32
+  max_seq_len:    16384
+  tp:             1
+
+# ----- GPU placement -----
+gpus:
+  num_gpus: 1
+  # gpu_ids: "0,1"      # uncomment to pin to specific GPUs (overrides num_gpus)
