@@ -362,6 +362,113 @@ def _print_summary(
             )
 
 
+def _draw_one_metric(
+    ax,
+    metric: str,
+    config_dirs: List[str],
+    sources: List[str],
+    use_batch: bool,
+    style: str,
+    batch_view: str,
+    smooth_window: int,
+) -> List[str]:
+    """Dispatch to the right drawer for one metric; return plotted config dirs."""
+    if metric in BATCH_METRICS:
+        if batch_view == 'cdf':
+            return _draw_batch_cdf_on_ax(ax, config_dirs, metric, sources)
+        return _draw_batch_on_ax(ax, config_dirs, metric, sources, smooth_window)
+    pcts, plotted_configs = _draw_cdf_on_ax(
+        ax, config_dirs, metric, sources, use_batch, style,
+    )
+    if plotted_configs:
+        _print_summary(metric, pcts, plotted_configs, sources)
+    return plotted_configs
+
+
+def _build_legend_handles(
+    config_dirs: List[str],
+    plotted_configs: List[str],
+    sources: List[str],
+    use_batch: bool,
+    config_labels: Dict[str, str],
+) -> List[Line2D]:
+    config_handles = [
+        Line2D(
+            [0], [0],
+            color=CONFIG_COLORS[config_dirs.index(c) % len(CONFIG_COLORS)],
+            linewidth=3,
+            label=config_labels.get(c)
+                  or read_config_model_name(c, use_batch)
+                  or os.path.basename(c.rstrip('/')).upper(),
+        )
+        for c in plotted_configs
+    ]
+    source_handles = [
+        Line2D(
+            [0], [0], color='black', linestyle=SOURCE_LINESTYLES[s],
+            linewidth=3, label=SOURCE_LABELS[s],
+        )
+        for s in sources
+    ]
+    return config_handles + source_handles
+
+
+def _save_split_outputs(
+    split_dir: str,
+    metrics: List[str],
+    config_dirs: List[str],
+    sources: List[str],
+    use_batch: bool,
+    style: str,
+    batch_view: str,
+    smooth_window: int,
+    config_labels: Dict[str, str],
+) -> None:
+    """Save each subplot and the legend as separate PDFs in split_dir."""
+    os.makedirs(split_dir, exist_ok=True)
+    all_plotted_configs: List[str] = []
+    any_plotted = False
+
+    for i, m in enumerate(metrics, start=1):
+        fig, ax = plt.subplots(1, 1, figsize=(5, 4))
+        plotted_configs = _draw_one_metric(
+            ax, m, config_dirs, sources, use_batch, style,
+            batch_view, smooth_window,
+        )
+        if plotted_configs:
+            any_plotted = True
+            for c in plotted_configs:
+                if c not in all_plotted_configs:
+                    all_plotted_configs.append(c)
+
+        plt.tight_layout(pad=0.6)
+        out_path = os.path.join(split_dir, f'plot{i}.pdf')
+        fig.savefig(out_path, bbox_inches='tight', pad_inches=0.05)
+        fig.savefig(out_path.replace('.pdf', '.png'), dpi=300,
+                    bbox_inches='tight', pad_inches=0.05)
+        plt.close(fig)
+        print(f"✓ Saved {out_path}")
+
+    if not any_plotted:
+        print("ERROR: no data plotted")
+        sys.exit(1)
+
+    handles = _build_legend_handles(
+        config_dirs, all_plotted_configs, sources, use_batch, config_labels,
+    )
+    legend_fig = plt.figure(figsize=(max(6, 1.6 * len(handles)), 0.5))
+    legend_fig.legend(
+        handles=handles, loc='center', ncol=len(handles),
+        frameon=False, fontsize=15,
+    )
+    legend_path = os.path.join(split_dir, 'legend.pdf')
+    legend_fig.savefig(legend_path, bbox_inches='tight', pad_inches=0.05)
+    legend_fig.savefig(legend_path.replace('.pdf', '.png'), dpi=300,
+                       bbox_inches='tight', pad_inches=0.05)
+    plt.close(legend_fig)
+    print(f"✓ Saved {legend_path}")
+
+
 def plot_configs_cdf(
     config_dirs: List[str],
     metric: str,
@@ -373,6 +480,7 @@ def plot_configs_cdf(
     batch_view: str = 'temporal',
     smooth_window: int = 1,
     config_labels: Optional[Dict[str, str]] = None,
+    split_output: Optional[str] = None,
 ) -> None:
     config_labels = config_labels or {}
     plt.style.use('seaborn-v0_8-whitegrid')
@@ -385,28 +493,24 @@ def plot_configs_cdf(
         metrics = ['ttft', 'itl', 'batch_size']
     else:
         metrics = [metric]
+
+    if split_output:
+        _save_split_outputs(
+            split_output, metrics, config_dirs, sources, use_batch,
+            style, batch_view, smooth_window, config_labels,
+        )
+        return
+
     ncols = len(metrics)
     fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4), squeeze=False)
 
     any_plotted = False
     all_plotted_configs: List[str] = []
     for ax, m in zip(axes[0], metrics):
-        if m in BATCH_METRICS:
-            if batch_view == 'cdf':
-                plotted_configs = _draw_batch_cdf_on_ax(
-                    ax, config_dirs, m, sources,
-                )
-            else:
-                plotted_configs = _draw_batch_on_ax(
-                    ax, config_dirs, m, sources, smooth_window,
-                )
-        else:
-            pcts, plotted_configs = _draw_cdf_on_ax(
-                ax, config_dirs, m, sources, use_batch, style,
-            )
-            if plotted_configs:
-                _print_summary(m, pcts, plotted_configs, sources)
-
+        plotted_configs = _draw_one_metric(
+            ax, m, config_dirs, sources, use_batch, style,
+            batch_view, smooth_window,
+        )
         if plotted_configs:
             any_plotted = True
             for c in plotted_configs:
@@ -418,25 +522,9 @@ def plot_configs_cdf(
         sys.exit(1)
 
     # Combined horizontal legend at the top: colors = configs, styles = sources.
-    config_handles = [
-        Line2D(
-            [0], [0],
-            color=CONFIG_COLORS[config_dirs.index(c) % len(CONFIG_COLORS)],
-            linewidth=3,
-            label=config_labels.get(c)
-                  or read_config_model_name(c, use_batch)
-                  or os.path.basename(c.rstrip('/')).upper(),
-        )
-        for c in all_plotted_configs
-    ]
-    source_handles = [
-        Line2D(
-            [0], [0], color='black', linestyle=SOURCE_LINESTYLES[s],
-            linewidth=3, label=SOURCE_LABELS[s],
-        )
-        for s in sources
-    ]
-    handles = config_handles + source_handles
+    handles = _build_legend_handles(
+        config_dirs, all_plotted_configs, sources, use_batch, config_labels,
+    )
     fig.legend(
         handles=handles, loc='upper center', ncol=len(handles),
         bbox_to_anchor=(0.5, 1.005), frameon=False, fontsize=15,
@@ -537,6 +625,13 @@ def main() -> None:
         help="Use *_batch_*.json files instead of the streaming results",
     )
     parser.add_argument("--output", "-o", help="Output image path (e.g. cdf.png)")
+    parser.add_argument(
+        "--split-output",
+        help=(
+            "Directory to save each subplot and the legend as separate PDFs "
+            "(legend.pdf, plot1.pdf, plot2.pdf, ...). Use for paper subfigures."
+        ),
+    )
     parser.add_argument("--title", help="Custom plot title")
     parser.add_argument(
         "--style", choices=['smooth', 'stepped', 'markers'], default='smooth',
@@ -604,6 +699,7 @@ def main() -> None:
         batch_view=args.batch_view,
         smooth_window=max(1, args.smooth),
         config_labels=labels_map,
+        split_output=args.split_output,
     )
 
 
