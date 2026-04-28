@@ -204,6 +204,25 @@ class TraceParser:
                 op_name = hierarchy.operation_name        # anchor.name
                 anchor_args = hierarchy.operation_args        # anchor.args
                 is_module = hierarchy.is_module
+
+                # Compile anchors: the anchor's name is the wrapped function
+                # (e.g. "layer_norm_func"), but the resolver imports modules
+                # by class name AND the profiler will call the wrapping
+                # nn.Module's __call__ — whose signature differs from the
+                # compiled fn's (e.g. LayerNorm(hidden_states, residual) vs
+                # layer_norm_func(hidden_states, weight, eps)). Switch both
+                # the lookup name and the input-extraction source to the
+                # nearest MODULE event so the profiler gets the right shapes
+                # for the right call. The compile fn name remains accessible
+                # via hierarchy.anchor.name for diagnostics.
+                if hierarchy.is_compile and hierarchy.nearest_module is not None:
+                    op_name = module_name
+                    anchor_args = hierarchy.nearest_module.args
+                    # Use the module's params as the taint string source
+                    # (overrides hierarchy.get_taint_string() below).
+                    _compile_taint_override = hierarchy.nearest_module.params
+                else:
+                    _compile_taint_override = None
                 
                 if len(hierarchy.comm_ops) > 0:
                     print(f"[DEBUG] Module {op_name} has {len(hierarchy.comm_ops)}, nearest_modul_name: {module_name}, comm ops: {[c.name for c in hierarchy.comm_ops]}, module_taint={hierarchy.get_taint_string()[:50] if hierarchy.get_taint_string() else None}, anchor_args={anchor_args if anchor_args else None}")
