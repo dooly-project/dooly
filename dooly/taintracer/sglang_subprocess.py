@@ -29,6 +29,7 @@ from .registry import register_taint
 from .types import TaintedInt, TaintedFloat, Taint
 from .tensor import TaintedTensor
 import traceback
+import torch
 
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
@@ -102,6 +103,10 @@ def patch_server_args(server_args):
                 if isinstance(value, int) and not isinstance(value, TaintedInt):
                     register_taint(value, Taint('NUM_TOKS'))
                     return TaintedInt(value, 'NUM_TOKS')
+            if name == 'input_ids':
+                if isinstance(value, torch.Tensor) and not isinstance(value, TaintedTensor):
+                    register_taint(len(value), Taint('NUM_TOKS'))
+                    return TaintedTensor(value, [Taint('NUM_TOKS')])
             return value
 
         ScheduleBatch.__getattribute__ = patched_scheduler_output_getattribute
@@ -159,11 +164,11 @@ def tainted_run_scheduler_process(
     # 2. Re-install tensor factory hooks, custom-op hooks, and int()
     #    patches for the rotary-embedding layer.
     # ------------------------------------------------------------------
-    install_hooks(
-        int_patch_modules=[
-            "sglang.srt.layers.rotary_embedding",
-        ]
-    )
+    # install_hooks(
+    #     int_patch_modules=[
+    #         "sglang.srt.layers.rotary_embedding",
+    #     ]
+    # )
 
     # ------------------------------------------------------------------
     # 3. Patch DummyModelLoader.load_model so that:

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import pdb
 from typing import Optional
 import torch
 
@@ -348,6 +349,9 @@ class TaintedInt(int):
         return int.__repr__(self)
     def __format__(self, spec):
         return int.__format__(self, spec)
+
+    def __int__(self):
+        return self
 
     def __getnewargs_ex__(self):
         return ((int.__int__(self),), {"taint": getattr(self, "_taint", None)})

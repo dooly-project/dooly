@@ -75,7 +75,12 @@ if "TAINT_REGISTRY_DUMP_BASE" not in os.environ:
 patch_autoconfig()
 # patch_common_attention_metadata()
 # patch_input_buffers()
-install_hooks()
+install_hooks(int_patch_modules=[
+    "sglang.multimodal_gen.runtime.models.encoders.llama",
+    "sglang.srt.models.llama",
+    "sglang.srt.layers.rotary_embedding.base",
+    "sglang.srt.layers.rotary_embedding.factory",
+])
 
 # # Patch DummyModelLoader to force CUDA move
 # # (dummy models are loaded into CPU for some reason when tainting is enabled)
@@ -167,7 +172,7 @@ if __name__ == "__main__":
     #         pass
 
         from dooly.taintracer.sglang_subprocess import (
-        tainted_run_scheduler_process, TaintedEngine
+        TaintedEngine
         )
         # from sglang import Engine
 
@@ -182,7 +187,7 @@ if __name__ == "__main__":
                 "CPU",
                 "GPU",
             ], with_stack=False, record_shapes=True, )
-        sampling_params={"max_new_tokens": 1, "temperature": 0.0}
+        sampling_params={"max_new_tokens": 0, "temperature": 0.0}
         outputs = llm.generate(prompt=prompts, sampling_params=sampling_params)
         llm.stop_profile()
         print(f"output: {outputs}")
