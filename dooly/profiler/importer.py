@@ -2,7 +2,7 @@ import importlib
 import inspect
 from typing import Dict, List, Any, Callable, Optional, Set
 import os
-import torch, vllm, torch._C, vllm._C
+import torch, torch._C
 import torch.nn.functional as F
 
 class OpImporter:
@@ -48,7 +48,7 @@ class OpImporter:
         """Get all operations that require forward context."""
         return self._context_required_ops.copy()
 
-    def _try_import_vllm_custom_op(self, op_name: str) -> bool:
+    def _try_import_sglang_custom_op(self, op_name: str) -> bool:
         """
         Dynamically find and import the vLLM module that contains a custom op.
         Searches vLLM's model_executor.layers directory structure.
@@ -58,7 +58,7 @@ class OpImporter:
         self._imported_vllm_ops.add(op_name)
 
         try:
-            import vllm.model_executor.layers as layers_pkg
+            import sglang.srt.layers as layers_pkg
         except ImportError:
             return False
 

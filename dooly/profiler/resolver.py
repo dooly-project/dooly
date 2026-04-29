@@ -18,7 +18,7 @@ from dooly.profiler.finput import extract_inputs_from_taint
 from dooly.profiler.input_generator import InputGenerator, AttentionBatchConfig
 from dooly.profiler.parser import Event, OperationHierarchy
 from dooly.profiler.importer import OpImporter
-from dooly.profiler.vllm_layer_profiler import make_dict, VLLMLayerProfiler
+from dooly.profiler.sglang_layer_profiler import make_dict, SgLangLayerProfiler
 
 
 def _dim_is_tokens(dim) -> bool:
@@ -81,7 +81,7 @@ class ModuleResolver:
 
     def __init__(
         self,
-        vlp: VLLMLayerProfiler,               # VLLMLayerProfiler instance (has .model)
+        vlp: SgLangLayerProfiler,               # VLLMLayerProfiler instance (has .model)
         importer: OpImporter,
         dtype: torch.dtype = torch.bfloat16,
         max_batch_size: int = 4,
@@ -804,7 +804,7 @@ class ModuleResolver:
 def main():
     import argparse, json
     from dooly.profiler.trace import TraceParser
-    from dooly.profiler.vllm_layer_profiler import VLLMLayerProfiler, make_dict
+    from dooly.profiler.sglang_layer_profiler import SgLangLayerProfiler, make_dict
     from dooly.profiler.importer import OpImporter
 
     parser = argparse.ArgumentParser(description="Test module path disambiguation with real model")
@@ -825,7 +825,7 @@ def main():
 
     # 2. Load vLLM model
     print(f"\nLoading model: {args.model}")
-    vlp = VLLMLayerProfiler(
+    vlp = SgLangLayerProfiler(
         model_name=args.model,
         dtype=args.dtype,
         enforce_eager=True,

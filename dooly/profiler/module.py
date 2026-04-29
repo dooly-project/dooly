@@ -106,6 +106,7 @@ class ModuleInfo:
         Extracts MODEL_CONFIG dimensions and scalar values as semantic params from ProfileInput.
         """
         # Extract MODEL_CONFIG dimension values and scalars from ProfileInput
+
         params_dict = {}
         for i, inp in enumerate(self.inputs):
             if inp.type == "Tensor":
@@ -115,7 +116,10 @@ class ModuleInfo:
                     if dim_type == DimensionType.MODEL_CONFIG:
                         # Use a generic name for MODEL_CONFIG dimensions
                         param_name = f"input{i}_dim{j}"
-                        params_dict[param_name] = dim_val
+                        if (type(dim_val) is int):
+                            params_dict[param_name] = dim_val
+                        else:
+                            params_dict[param_name] = tuple(dim_val)
             elif inp.type == "Scalar" and inp.scalar_value:
                 # Extract scalar value
                 param_name = f"input{i}_scalar"

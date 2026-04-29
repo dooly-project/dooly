@@ -4,6 +4,7 @@ Trace loading and parsing utilities for vLLM profiler traces.
 
 import json
 from collections import defaultdict
+import pdb
 from typing import Any, Dict, List, Optional
 
 from dooly.profiler.module import ModuleInfo

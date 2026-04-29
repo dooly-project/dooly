@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
 def resolve_model(model, dtype, attention_backend, max_seq_len, result_queue, gpu):
     from dooly.profiler.importer import OpImporter
     from dooly.profiler.resolver import ModuleResolver
-    from dooly.profiler.vllm_layer_profiler import VLLMLayerProfiler
+    from dooly.profiler.sglang_layer_profiler import SgLangLayerProfiler
     
     importer=OpImporter()
 
@@ -105,7 +105,7 @@ def resolve_model(model, dtype, attention_backend, max_seq_len, result_queue, gp
         max_model_len = max_seq_len
         print(f"[RESOLVER] Using max_model_len={max_model_len} from user config")
 
-    vlp = VLLMLayerProfiler(
+    vlp = SgLangLayerProfiler(
         model_name=model.name,
         dtype=str(model.dtype).split(".")[-1],
         enforce_eager=True,
