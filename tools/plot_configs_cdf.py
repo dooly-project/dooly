@@ -34,7 +34,7 @@ METRIC_NAMES = {
 
 # Batch-trace metrics: user-facing key -> (JSON field, y-axis label)
 BATCH_METRICS = {
-    'batch_size': ('batch_size', 'Scheduled Request Count'),
+    'batch_size': ('batch_size', 'Scheduled Requests    '),
     'running': ('running_count', 'Running requests'),
     'waiting': ('waiting_count', 'Waiting requests'),
     'tokens': ('total_tokens_scheduled', 'Tokens scheduled / step'),
@@ -122,6 +122,7 @@ def _draw_cdf_on_ax(
                 continue
 
             x, y = compute_cdf(values)
+            x = x / 1000.0  # ms -> s for x-axis display
             p50 = float(np.percentile(values, 50))
             p95 = float(np.percentile(values, 95))
             p99 = float(np.percentile(values, 99))
@@ -152,13 +153,13 @@ def _draw_cdf_on_ax(
                 plotted_configs.append(config)
 
     metric_name = METRIC_NAMES.get(metric, metric.upper())
-    ax.set_xlabel(f'{metric_name} (ms)', fontsize=15, fontweight='semibold')
-    ax.set_ylabel('CDF', fontsize=15, fontweight='semibold')
+    ax.set_xlabel(f'{metric_name} (s)', fontsize=22, fontweight='semibold')
+    ax.set_ylabel('CDF', fontsize=22, fontweight='semibold')
     ax.grid(True, alpha=0.25, linestyle='--', linewidth=1)
     ax.set_axisbelow(True)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.1f}'))
     ax.set_ylim(0, 1.0)
-    ax.tick_params(axis='both', labelsize=15)
+    ax.tick_params(axis='both', labelsize=22)
     ax.margins(x=0.01)
 
     # ITL spans ~2 orders of magnitude across models, so a linear axis leaves
@@ -175,8 +176,8 @@ def _draw_cdf_on_ax(
         ax.xaxis.set_major_formatter(ScalarFormatter())
         ax.xaxis.set_minor_formatter(plt.NullFormatter())
         if p99_values:
-            # ax.set_xlim(left=5.0, right=max(p99_values) * 1.1)
-            ax.set_xlim(left=5.0)
+            # ax.set_xlim(left=0.005, right=max(p99_values) / 1000.0 * 1.1)
+            ax.set_xlim(left=0.005)
 
     for percentile in [0.5, 0.95, 0.99]:
         ax.axhline(y=percentile, color='gray', linestyle=':',
@@ -269,11 +270,11 @@ def _draw_batch_on_ax(
             if config not in plotted_configs:
                 plotted_configs.append(config)
 
-    ax.set_xlabel('Time Since First Dispatch (s)', fontsize=15, fontweight='semibold')
-    ax.set_ylabel(y_label, fontsize=15, fontweight='semibold')
+    ax.set_xlabel('Time Since First Dispatch (s)', fontsize=22, fontweight='semibold')
+    ax.set_ylabel(y_label, fontsize=18, fontweight='semibold')
     ax.grid(True, alpha=0.25, linestyle='--', linewidth=1)
     ax.set_axisbelow(True)
-    ax.tick_params(axis='both', labelsize=15)
+    ax.tick_params(axis='both', labelsize=22)
     ax.margins(x=0.01)
     ax.set_ylim(bottom=0)
 
@@ -327,13 +328,13 @@ def _draw_batch_cdf_on_ax(
             if config not in plotted_configs:
                 plotted_configs.append(config)
 
-    ax.set_xlabel(value_label, fontsize=15, fontweight='semibold')
-    ax.set_ylabel('CDF', fontsize=15, fontweight='semibold')
+    ax.set_xlabel(value_label, fontsize=22, fontweight='semibold')
+    ax.set_ylabel('CDF', fontsize=22, fontweight='semibold')
     ax.grid(True, alpha=0.25, linestyle='--', linewidth=1)
     ax.set_axisbelow(True)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.1f}'))
     ax.set_ylim(0, 1.0)
-    ax.tick_params(axis='both', labelsize=15)
+    ax.tick_params(axis='both', labelsize=22)
     ax.margins(x=0.01)
 
     for percentile in [0.5, 0.95, 0.99]:
@@ -395,8 +396,10 @@ def _build_legend_handles(
     config_handles = [
         Line2D(
             [0], [0],
-            color=CONFIG_COLORS[config_dirs.index(c) % len(CONFIG_COLORS)],
-            linewidth=3,
+            marker='o', linestyle='None',
+            markerfacecolor=CONFIG_COLORS[config_dirs.index(c) % len(CONFIG_COLORS)],
+            markeredgecolor=CONFIG_COLORS[config_dirs.index(c) % len(CONFIG_COLORS)],
+            markersize=12,
             label=config_labels.get(c)
                   or read_config_model_name(c, use_batch)
                   or os.path.basename(c.rstrip('/')).upper(),
@@ -430,7 +433,7 @@ def _save_split_outputs(
     any_plotted = False
 
     for i, m in enumerate(metrics, start=1):
-        fig, ax = plt.subplots(1, 1, figsize=(5, 4))
+        fig, ax = plt.subplots(1, 1, figsize=(5, 3))
         plotted_configs = _draw_one_metric(
             ax, m, config_dirs, sources, use_batch, style,
             batch_view, smooth_window,
@@ -459,7 +462,9 @@ def _save_split_outputs(
     legend_fig = plt.figure(figsize=(max(6, 1.6 * len(handles)), 0.5))
     legend_fig.legend(
         handles=handles, loc='center', ncol=len(handles),
-        frameon=False, fontsize=15,
+        frameon=False, fontsize=24,
+        handlelength=1.2, handletextpad=0.1, columnspacing=0.4,
+        borderaxespad=0.2,
     )
     legend_path = os.path.join(split_dir, 'legend.pdf')
     legend_fig.savefig(legend_path, bbox_inches='tight', pad_inches=0.05)
@@ -527,7 +532,9 @@ def plot_configs_cdf(
     )
     fig.legend(
         handles=handles, loc='upper center', ncol=len(handles),
-        bbox_to_anchor=(0.5, 1.005), frameon=False, fontsize=15,
+        bbox_to_anchor=(0.5, 1.005), frameon=False, fontsize=24,
+        handlelength=1.2, handletextpad=0.3, columnspacing=0.6,
+        borderaxespad=0.2,
     )
 
     plt.tight_layout(pad=0.6, rect=(0, 0, 1, 0.93))
