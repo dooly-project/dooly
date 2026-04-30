@@ -137,6 +137,7 @@ class TraceParser:
 
         print("Extracting module to operation mapping...")
         operation_hierarchies: List[OperationHierarchy] = hierarchical_parser.extract_module_to_operation_mapping()
+        print(f"[DEBUG] operation hierarchies: {operation_hierarchies}")
 
         print("Making module infos from operation hierarchies...")
         profile_metadata = profile_metadata or {}

@@ -8,20 +8,19 @@ from time import time
 # run-profiler.py -> run/ -> dooly/ -> dooly (repo root)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-# Parse --tp and --gpu early BEFORE importing vLLM / torch / CUDA.
-# - VLLM_FAKE_TP: vllm_layer_profiler.py applies fake TP patches at module load.
+# Parse --tp and --gpu early BEFORE importing SGLang / torch / CUDA.
+# - DOOLY_FAKE_TP: sglang_layer_profiler.py applies fake TP patches at module load.
 # - CUDA_VISIBLE_DEVICES: must be set before any CUDA init so the main process
 #   (which runs _profile_raw_ops directly) and every spawned child / subprocess
-#   (resolve_model, _profile_vllm_modules_subprocess, run_comm_profiler) inherit
-#   the same GPU selection. Otherwise --gpu only reaches VLLMLayerProfiler and
-#   the main process + comm worker silently fall back to GPU 0.
+#   (resolve_model, run_comm_profiler) inherit the same GPU selection.
+#   Otherwise --gpu only reaches SgLangLayerProfiler and the main process +
+#   comm worker silently fall back to GPU 0.
 _pre_parser = argparse.ArgumentParser(add_help=False)
 _pre_parser.add_argument("--tp", type=int, default=1)
 _pre_parser.add_argument("--gpu", type=str, default="0,1,2,3")
 _pre_args, _ = _pre_parser.parse_known_args()
-os.environ["VLLM_FAKE_TP"] = str(_pre_args.tp)
+os.environ["DOOLY_FAKE_TP"] = str(_pre_args.tp)
 os.environ["CUDA_VISIBLE_DEVICES"] = _pre_args.gpu
-os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import torch
 import multiprocessing as mp
@@ -49,10 +48,10 @@ def parse_args() -> argparse.Namespace:
         "--traces",
         nargs="+",
         default=[
-            "./utns_sim/data/vllm_profile/profiler_traces/llama-trace.json",
-            "./utns_sim/data/vllm_profile/profiler_traces/mistral-trace.json",
-            "./utns_sim/data/vllm_profile/profiler_traces/qwen-trace.json",
-            "./utns_sim/data/vllm_profile/profiler_traces/deepseek-trace.json",
+            "./utns_sim/data/sglang_profile/profiler_traces/llama-trace.json",
+            "./utns_sim/data/sglang_profile/profiler_traces/mistral-trace.json",
+            "./utns_sim/data/sglang_profile/profiler_traces/qwen-trace.json",
+            "./utns_sim/data/sglang_profile/profiler_traces/deepseek-trace.json",
         ],
     )
     parser.add_argument(
@@ -62,9 +61,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--profile-output",
-        default="./vllm_profile/per-model-profile.csv",
+        default="./sglang_profile/per-model-profile.csv",
     )
-    parser.add_argument("--attention-backend", default="FLASHINFER")
+    parser.add_argument("--attention-backend", default="flashinfer")
     parser.add_argument("--workload-mode", default="vidur")
     parser.add_argument("--max-batch-size", type=int, default=5)
     parser.add_argument("--max-seq-len", type=int, default=128)
@@ -125,7 +124,7 @@ def resolve_model(model, dtype, attention_backend, max_seq_len, result_queue, gp
 
     result_queue.put([(module, None) for module, _ in resolved_ops])    
 
-    print("\nClosing vLLM instance...")
+    print("\nClosing SGLang instance...")
     vlp.close()
     print(f"=== Resolution complete for {model.name} ({dtype}) ({attention_backend}) ===\n")
 
@@ -139,7 +138,7 @@ def run_comm_profiler(models, dtype_str, tp_size, db_path, overwrite, profile_me
     print(f"Launching comm profiler via subprocess (REAL TP={tp_size})")
     print(f"Profile method: {profile_method.upper()}")
     print(f"CUDA Graph: {'ENABLED' if use_cuda_graph else 'DISABLED'}")
-    print(f"Clean environment WITHOUT VLLM_FAKE_TP")
+    print(f"Clean environment WITHOUT DOOLY_FAKE_TP")
     print(f"{'='*60}\n")
 
     # Extract collective ops from first model
@@ -151,9 +150,9 @@ def run_comm_profiler(models, dtype_str, tp_size, db_path, overwrite, profile_me
         pickle.dump(collective_ops, f)
         collective_ops_path = f.name
 
-    # Create clean environment WITHOUT VLLM_FAKE_TP
+    # Create clean environment WITHOUT DOOLY_FAKE_TP
     clean_env = os.environ.copy()
-    clean_env.pop('VLLM_FAKE_TP', None)
+    clean_env.pop('DOOLY_FAKE_TP', None)
 
     try:
         # Choose worker based on profile method

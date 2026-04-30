@@ -15,11 +15,11 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
     Worker function for comm profiling with selectable profiling method.
     """
     # DEBUG: Verify no fake TP
-    fake_tp_val = os.environ.get('VLLM_FAKE_TP', 'NOT SET')
-    print(f"[WORKER] VLLM_FAKE_TP: {fake_tp_val}")
+    fake_tp_val = os.environ.get('DOOLY_FAKE_TP', 'NOT SET')
+    print(f"[WORKER] DOOLY_FAKE_TP: {fake_tp_val}")
 
     if fake_tp_val != 'NOT SET':
-        raise RuntimeError(f"VLLM_FAKE_TP is still set to {fake_tp_val}! Cannot profile comm ops with fake TP.")
+        raise RuntimeError(f"DOOLY_FAKE_TP is still set to {fake_tp_val}! Cannot profile comm ops with fake TP.")
 
     # Initialize LLM to set up distributed environment
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"

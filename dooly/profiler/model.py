@@ -4,7 +4,7 @@ import json
 
 from dooly.profiler.module import ModuleInfo, ModuleComparator
 from dooly.profiler.trace import TraceParser
-from vllm.transformers_utils.config import get_config
+from sglang.srt.utils.hf_transformers_utils import get_config
 
 class ModelInfo:
     def __init__(

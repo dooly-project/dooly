@@ -1,4 +1,5 @@
 import os
+import pdb
 import socket
 import sqlite3
 import json
@@ -12,7 +13,6 @@ import traceback
 from typing import Dict, List, Any, Optional, Union, Callable, Tuple
 from collections import defaultdict
 from tqdm import tqdm
-from vllm.distributed import parallel_state
 import multiprocessing as mp
 
 def find_free_port() -> int:
@@ -22,10 +22,8 @@ def find_free_port() -> int:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         return s.getsockname()[1]
 
-from dooly.profiler.vllm_layer_profiler import VLLMLayerProfiler, make_dict 
+from dooly.profiler.sglang_layer_profiler import SgLangLayerProfiler, make_dict
 from dooly.profiler.model import ModelInfo as ProfileModel
-from vllm.config import set_current_vllm_config
-from vllm.forward_context import set_forward_context
 from dooly.profiler.importer import OpImporter
 from dooly.profiler.module import ModuleInfo
 from dooly.profiler.input_generator import InputGenerator 
@@ -35,35 +33,40 @@ from dooly.profiler.utils.generate_batch import AttentionBatchConfig
 
 def wrap_list_args(op_packet, op_name: str, inputs: List) -> List:
     """Wrap inputs that should be lists according to PyTorch schema."""
-    from torch._ops import OpOverloadPacket
+    from torch._ops import OpOverloadPacket, OpOverload
 
-    if not isinstance(op_packet, OpOverloadPacket):
-        return inputs
-
-    # Get specific overload — same best-match logic as prepare_op_args.
-    overload_name = op_name.split('.')[-1] if '.' in op_name else None
-    if overload_name and hasattr(op_packet, overload_name):
-        op_overload = getattr(op_packet, overload_name)
-    else:
-        best_overload = None
-        best_score = float('inf')
-        for attr_name in dir(op_packet):
-            try:
-                candidate = getattr(op_packet, attr_name)
-                if not hasattr(candidate, '_schema'):
+    if isinstance(op_packet, OpOverload):
+        op_overload = op_packet
+    elif isinstance(op_packet, OpOverloadPacket):
+        overload_name = op_name.split('.')[-1] if '.' in op_name else None
+        if overload_name and hasattr(op_packet, overload_name):
+            op_overload = getattr(op_packet, overload_name)
+        else:
+            best_overload = None
+            best_score = float('inf')
+            for attr_name in dir(op_packet):
+                try:
+                    candidate = getattr(op_packet, attr_name)
+                    if not hasattr(candidate, '_schema'):
+                        continue
+                    positional_count = sum(
+                        1 for a in candidate._schema.arguments if not a.kwarg_only
+                    )
+                    score = abs(positional_count - len(inputs))
+                    if score < best_score:
+                        best_score = score
+                        best_overload = candidate
+                except Exception:
                     continue
-                positional_count = sum(
-                    1 for a in candidate._schema.arguments if not a.kwarg_only
-                )
-                score = abs(positional_count - len(inputs))
-                if score < best_score:
-                    best_score = score
-                    best_overload = candidate
-            except Exception:
-                continue
-        if best_overload is None:
-            return inputs
-        op_overload = best_overload
+            if best_overload is None:
+                default = getattr(op_packet, 'default', None)
+                if default is not None and hasattr(default, '_schema'):
+                    best_overload = default
+            if best_overload is None:
+                return inputs
+            op_overload = best_overload
+    else:
+        return inputs
 
     schema = op_overload._schema
     wrapped = list(inputs)
@@ -88,43 +91,53 @@ def prepare_op_args(op_packet, op_name: str, inputs: List) -> Tuple[List, Dict]:
     Returns:
         Tuple of (positional_args, keyword_args)
     """
-    from torch._ops import OpOverloadPacket
+    from torch._ops import OpOverloadPacket, OpOverload
 
-    if not isinstance(op_packet, OpOverloadPacket):
-        return inputs, {}
+    # If we already have a specific overload (e.g. from a torch.library custom
+    # op that returns OpOverload instead of OpOverloadPacket), use it directly.
+    if isinstance(op_packet, OpOverload):
+        op_overload = op_packet
+    elif isinstance(op_packet, OpOverloadPacket):
+        # Get specific overload (e.g., aten::add.Tensor).
+        # When the op name includes an explicit overload suffix (e.g. "aten::mean.dim"),
+        # use it directly.  When there is no suffix (e.g. "aten::mean"), try every
+        # available overload and pick the one whose number of positional (non-kwarg-only)
+        # arguments best matches the number of inputs we have.  This prevents
+        # misrouting inputs through the wrong schema (e.g. feeding [-1] into dtype).
+        overload_name = op_name.split('.')[-1] if '.' in op_name else None
 
-    # Get specific overload (e.g., aten::add.Tensor).
-    # When the op name includes an explicit overload suffix (e.g. "aten::mean.dim"),
-    # use it directly.  When there is no suffix (e.g. "aten::mean"), try every
-    # available overload and pick the one whose number of positional (non-kwarg-only)
-    # arguments best matches the number of inputs we have.  This prevents
-    # misrouting inputs through the wrong schema (e.g. feeding [-1] into dtype).
-    overload_name = op_name.split('.')[-1] if '.' in op_name else None
-
-    if overload_name and hasattr(op_packet, overload_name):
-        op_overload = getattr(op_packet, overload_name)
-    else:
-        # No explicit overload; score every overload by how closely its
-        # positional-arg count matches len(inputs).
-        best_overload = None
-        best_score = float('inf')
-        for attr_name in dir(op_packet):
-            try:
-                candidate = getattr(op_packet, attr_name)
-                if not hasattr(candidate, '_schema'):
+        if overload_name and hasattr(op_packet, overload_name):
+            op_overload = getattr(op_packet, overload_name)
+        else:
+            # No explicit overload; score every overload by how closely its
+            # positional-arg count matches len(inputs).
+            best_overload = None
+            best_score = float('inf')
+            for attr_name in dir(op_packet):
+                try:
+                    candidate = getattr(op_packet, attr_name)
+                    if not hasattr(candidate, '_schema'):
+                        continue
+                    positional_count = sum(
+                        1 for a in candidate._schema.arguments if not a.kwarg_only
+                    )
+                    score = abs(positional_count - len(inputs))
+                    if score < best_score:
+                        best_score = score
+                        best_overload = candidate
+                except Exception:
                     continue
-                positional_count = sum(
-                    1 for a in candidate._schema.arguments if not a.kwarg_only
-                )
-                score = abs(positional_count - len(inputs))
-                if score < best_score:
-                    best_score = score
-                    best_overload = candidate
-            except Exception:
-                continue
-        if best_overload is None:
-            return inputs, {}
-        op_overload = best_overload
+            # Fallback: some custom ops (e.g. torch.library-registered SGLang ops)
+            # don't expose overloads via dir() — try .default directly.
+            if best_overload is None:
+                default = getattr(op_packet, 'default', None)
+                if default is not None and hasattr(default, '_schema'):
+                    best_overload = default
+            if best_overload is None:
+                return inputs, {}
+            op_overload = best_overload
+    else:
+        return inputs, {}
 
     schema = op_overload._schema
     positional_args = []
@@ -142,6 +155,7 @@ def prepare_op_args(op_packet, op_name: str, inputs: List) -> Tuple[List, Dict]:
             value = [value]
 
         # Separate keyword-only arguments
+        # This ensures that args past the '*' in the declaration do not pass as positional
         if arg.kwarg_only:
             keyword_args[arg.name] = value
         else:
@@ -245,7 +259,7 @@ class Profiler:
             "random_pages": True,
         }
 
-        self.attention_profiler: Optional[VLLMLayerProfiler] = None
+        self.attention_profiler: Optional[SgLangLayerProfiler] = None
         self._global_kv_cache: Optional[torch.Tensor] = None
         self._global_kv_cache_spec: Optional[Tuple[int, int, int, int]] = None
 
@@ -613,34 +627,33 @@ class Profiler:
 
             print(f"\n[PROFILER] Profiling at TP={self.tp_config}")
 
-            # Partition modules into raw ops vs vLLM modules
+            # Partition modules into raw ops vs SGLang modules
             # to_profile_resolved contains 4-tuples: (module, callable, sig_hash, sig_json)
             raw_ops = [(m, c, h, j) for m, c, h, j in model.to_profile_resolved if not m.is_module]
-            vllm_modules = [(m, c, h, j) for m, c, h, j in model.to_profile_resolved if m.is_module]
+            sglang_modules = [(m, c, h, j) for m, c, h, j in model.to_profile_resolved if m.is_module]
 
-            # Phase 1: Profile raw ops in main process (no vLLM needed - maximum GPU memory)
+            # Phase 1: Profile raw ops in main process (no SGLang needed - maximum GPU memory)
             if raw_ops:
-                print(f"\n[PROFILER] Phase 1: Profiling {len(raw_ops)} raw ops (no vLLM)")
+                print(f"\n[PROFILER] Phase 1: Profiling {len(raw_ops)} raw ops (no SGLang)")
                 raw_results = self._profile_raw_ops(model, raw_ops)
                 all_results.extend(raw_results)
 
-            # Phase 2: Profile vLLM modules in subprocess (needs vLLM context)
-            if vllm_modules:
-                print(f"\n[PROFILER] Phase 2: Profiling {len(vllm_modules)} vLLM modules")
-                # Debug: Check VLLM_FAKE_TP before spawning subprocess
+            # Phase 2: Profile SGLang modules in subprocess (needs SGLang context)
+            if sglang_modules:
+                print(f"\n[PROFILER] Phase 2: Profiling {len(sglang_modules)} SGLang modules")
                 import os
-                fake_tp_parent = os.environ.get("VLLM_FAKE_TP", "Not Set")
-                print(f"[PROFILER PARENT] VLLM_FAKE_TP before subprocess: {fake_tp_parent}")
+                fake_tp_parent = os.environ.get("DOOLY_FAKE_TP", "Not Set")
+                print(f"[PROFILER PARENT] DOOLY_FAKE_TP before subprocess: {fake_tp_parent}")
 
                 p = mp.Process(
-                    target=self._profile_vllm_modules_subprocess,
-                    args=(model, vllm_modules, result_queue)
+                    target=self._profile_sglang_modules_subprocess,
+                    args=(model, sglang_modules, result_queue)
                 )
                 p.start()
 
                 # Get results BEFORE join to avoid deadlock
-                vllm_results = result_queue.get()
-                all_results.extend(vllm_results)
+                sglang_results = result_queue.get()
+                all_results.extend(sglang_results)
 
                 p.join()
 
@@ -658,7 +671,7 @@ class Profiler:
     ) -> List[Dict[str, Any]]:
         """Profile raw ops (is_module=False) in main process without vLLM.
 
-        Raw ops don't need VLLMLayerProfiler since they just call PyTorch/vLLM
+        Raw ops don't need SgLangLayerProfiler since they just call PyTorch
         ops directly via OpImporter. This gives them maximum GPU memory.
 
         Note: Callables are None from resolution phase (run-profiler.py line 89)
@@ -708,24 +721,23 @@ class Profiler:
         print(f"[PROFILER] Finished profiling {len(all_results)} raw op configs")
         return all_results
 
-    def _profile_vllm_modules_subprocess(
+    def _profile_sglang_modules_subprocess(
         self,
         model: ProfileModel,
-        vllm_modules: List[Tuple[ModuleInfo, Callable, str, str]],
+        sglang_modules: List[Tuple[ModuleInfo, Callable, str, str]],
         results: mp.Queue
     ):
-        """Profile vLLM modules (is_module=True) with full vLLM context.
+        """Profile SGLang modules (is_module=True) with full SGLang context.
 
         This runs in a subprocess to ensure GPU memory is fully freed when done.
         """
-        # Debug: Check if VLLM_FAKE_TP is set in subprocess
         import os
-        fake_tp = os.environ.get("VLLM_FAKE_TP", "Not Set")
-        print(f"\n[PROFILER SUBPROCESS] VLLM_FAKE_TP env var: {fake_tp}")
+        fake_tp = os.environ.get("DOOLY_FAKE_TP", "Not Set")
+        print(f"\n[PROFILER SUBPROCESS] DOOLY_FAKE_TP env var: {fake_tp}")
         print(f"[PROFILER SUBPROCESS] World config TP: {self.world_config.get('tp', 1)}")
 
-        # Initialize VLLMLayerProfiler
-        self.module_caller = VLLMLayerProfiler(
+        # Initialize SgLangLayerProfiler
+        self.module_caller = SgLangLayerProfiler(
             model_name=model.name,
             dtype=str(self.dtype).split(".")[-1],
             enforce_eager=True,
@@ -748,7 +760,7 @@ class Profiler:
         )
 
         resolved_modules = []
-        for module, _, sig_hash, sig_json in vllm_modules:
+        for module, _, sig_hash, sig_json in sglang_modules:
             callable_obj = resolver.try_import(module)
             resolved_modules.append((module, callable_obj, sig_hash, sig_json))
 
@@ -774,7 +786,7 @@ class Profiler:
             n_results = len(module_results) if module_results else 0
             self._append_timing(
                 model_name=model.name,
-                phase="vllm_module",
+                phase="sglang_module",
                 operation_name=module.operation_name,
                 module_name=module.module_name,
                 signature_hash=sig_hash,
@@ -1013,9 +1025,9 @@ class Profiler:
                 # Prepare inputs: wrap list args and separate keyword-only args
                 args, kwargs = prepare_op_args(callable_obj, module.operation_name, inputs)
 
-                forward_context = None
-                slot_mapping_dict = None
-                num_tokens_for_context = None
+                # SGLang: allocate KV cache slots and configure attn_backend once
+                # before the profiling loop; freed in the finally block below.
+                token_indices = None
 
                 if layer_name and isinstance(workload_config, AttentionBatchConfig):
                     batch_config = AttentionBatchConfig(
@@ -1025,42 +1037,21 @@ class Profiler:
                         is_prefill=workload_config.is_prefill,
                     )
                     try:
-                        result = self.module_caller.build_layer_metadata(layer_name, batch_config)
+                        result = self.module_caller.build_fake_forward_batch(batch_config)
                         if result is None:
-                            # Skip this config - exceeds available KV cache blocks
+                            # Skip this config - exceeds available KV cache capacity
                             continue
-                        layer_metadata, _ = result
-                        forward_context = {layer_name: layer_metadata}
-
-                        # Get slot_mapping from CommonAttentionMetadata for KV cache updates
-                        common_meta = self.module_caller._build_common_attention_metadata(batch_config, kv_cache_gid=0)
-                        if common_meta is not None:
-                            slot_mapping_dict = {layer_name: common_meta.slot_mapping}
-                            num_tokens_for_context = common_meta.num_actual_tokens
+                        _, token_indices = result
+                        # attn_backend is now configured; callable runs without a context manager
                     except Exception as e:
-                        # Metadata build failed — fall back to an empty forward_context
-                        # so vLLM's invariant holds (any module forward expects a
-                        # context set). Matches resolver.py behaviour.
-                        print(f"[PROFILER] Warning: Could not build metadata (ok for non-attention ops): {e}")
-                        forward_context = {layer_name: None}
-                        slot_mapping_dict = None
-                        num_tokens_for_context = None
-                elif layer_name:
-                    # Registered layer with a non-AttentionBatchConfig sweep (e.g.
-                    # MoE using the 1-D num_tokens dict path). Metadata isn't
-                    # applicable, but the module still calls get_forward_context()
-                    # internally and will raise without one. Provide an empty
-                    # context so the kernel can dispatch.
-                    forward_context = {layer_name: None}
+                        print(f"[PROFILER] Warning: Could not build batch metadata (ok for non-attention ops): {e}")
 
                 def run_callable():
-                    # Reconstruct kwargs from arg_name if present (for modules called with keyword args)
                     has_named = any(
                         getattr(pi, 'arg_name', None) is not None
                         for pi in module.inputs
                     )
                     if has_named and module.is_module:
-                        # Re-split: positional inputs have no arg_name
                         positional_tensors = [
                             tensor for pi, tensor in zip(module.inputs, inputs)
                             if getattr(pi, 'arg_name', None) is None
@@ -1074,44 +1065,7 @@ class Profiler:
                     else:
                         callable_obj(*args, **kwargs)
 
-                def run_callable_with_context():
-                    # Reconstruct kwargs from arg_name if present (for modules called with keyword args)
-                    has_named = any(
-                        getattr(pi, 'arg_name', None) is not None
-                        for pi in module.inputs
-                    )
-                    if has_named and module.is_module:
-                        # Re-split: positional inputs have no arg_name
-                        positional_tensors = [
-                            tensor for pi, tensor in zip(module.inputs, inputs)
-                            if getattr(pi, 'arg_name', None) is None
-                        ]
-                        kwarg_tensors = {
-                            pi.arg_name: tensor
-                            for pi, tensor in zip(module.inputs, inputs)
-                            if getattr(pi, 'arg_name', None) is not None
-                        }
-                        with set_current_vllm_config(self.module_caller.vllm_config):
-                            with set_forward_context(
-                                forward_context,
-                                self.module_caller.vllm_config,
-                                virtual_engine=0,
-                                num_tokens=num_tokens_for_context,
-                                slot_mapping=slot_mapping_dict
-                            ):
-                                callable_obj(*positional_tensors, **kwarg_tensors)
-                    else:
-                        with set_current_vllm_config(self.module_caller.vllm_config):
-                            with set_forward_context(
-                                forward_context,
-                                self.module_caller.vllm_config,
-                                virtual_engine=0,
-                                num_tokens=num_tokens_for_context,
-                                slot_mapping=slot_mapping_dict
-                            ):
-                                callable_obj(*args, **kwargs)
-
-                run_fn = run_callable_with_context if forward_context else run_callable
+                run_fn = run_callable
 
                 try:
                     # For Attention modules, use gpu_busy method for accurate timing
@@ -1157,9 +1111,12 @@ class Profiler:
                         print(f"[PROFILER] OOM for {module.module_name} with config {workload_params}, skipping...")
                     else:
                         print(f"[PROFILER] Error for {module.module_name}: {e}")
-                    # Clean up and continue
                     torch.cuda.empty_cache()
                     continue
+                finally:
+                    if token_indices is not None:
+                        self.module_caller._free_fake_batch(token_indices)
+                        token_indices = None
 
                 # Clean up after successful profiling
                 del inputs, args, kwargs
@@ -1543,24 +1500,27 @@ class Profiler:
         finally:
             conn.close()
 
-    def _init_vllm_distributed_environment(self) -> None:
+    def _init_distributed_environment(self) -> None:
+        from sglang.srt.distributed.parallel_state import (
+            init_distributed_environment,
+            initialize_model_parallel,
+        )
+
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(find_free_port())
         os.environ["WORLD_SIZE"] = "1"
         os.environ["RANK"] = "0"
         os.environ["LOCAL_RANK"] = "0"
-        os.environ["VLLM_USE_V1"] = "0"
 
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl", init_method="env://")
-
-        parallel_state.init_distributed_environment(
+        init_distributed_environment(
             world_size=1,
             rank=0,
             distributed_init_method="env://",
+            local_rank=0,
+            backend="nccl",
         )
 
-        parallel_state.initialize_model_parallel(
+        initialize_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
         )

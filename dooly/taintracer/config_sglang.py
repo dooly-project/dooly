@@ -333,7 +333,7 @@ def patch_autoconfig(verbose=False):
     @functools.wraps(_original_autoconfig_from_pretrained)
     def patched_autoconfig_from_pretrained(*args, **kwargs):
         raw_config = _original_autoconfig_from_pretrained(*args, **kwargs)
-        # pdb.set_trace()
+        # # pdb.set_trace()
         if verbose:
             print(f"[taintracer] AutoConfig.from_pretrained called: {type(raw_config).__name__}")
         return create_tainted_config(raw_config)
@@ -341,7 +341,7 @@ def patch_autoconfig(verbose=False):
     @classmethod
     def patched_pretrainedconfig_from_pretrained(cls, *args, **kwargs):
         func = _original_pretrainedconfig_from_pretrained.__func__
-        # pdb.set_trace()
+        # # pdb.set_trace()
         raw_config = func(cls, *args, **kwargs)
         if verbose:
             print(f"[taintracer] PretrainedConfig.from_pretrained called: {type(raw_config).__name__}")

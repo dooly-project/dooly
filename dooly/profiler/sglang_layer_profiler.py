@@ -29,8 +29,8 @@ from contextlib import contextmanager, nullcontext
 
 from dooly.profiler.utils.generate_batch import AttentionBatchConfig
 
-# Apply fake TP patches BEFORE importing vLLM so all modules see patched
-# parallel_state at import time. Set VLLM_FAKE_TP env var before importing
+# Apply fake TP patches BEFORE importing SGLang so all modules see patched
+# parallel_state at import time. Set DOOLY_FAKE_TP env var before importing
 # this module (e.g. in run-profiler.py via --tp flag).
 from dooly.profiler.utils.fake_tp_sglang import apply_fake_tp_patches_sglang, get_fake_tp_size
 
@@ -146,12 +146,45 @@ class SgLangLayerProfiler:
     # Don't need to do _get_actual_num_tokens -- formula used above is how allocator decies max num blocks
 
     def get_all_layer_names(self) -> List[str]:
-        """Get all layer names that need forward context, using attention_layers as the authoritative list."""
-        # get addres of attention layers to collect names of those modules
-        attn_set = set(id(m) for m in self.model_runner.attention_layers)
+        """Return module paths of all attention layers.
+
+        Mirrors the attention-layer collection loop from
+        ModelRunner.init_piecewise_cuda_graphs (which only runs when CUDA
+        graphs are enabled, so model_runner.attention_layers is unset here).
+        """
+        from sglang.srt.model_executor.model_runner import resolve_language_model
+
+        inner_model = resolve_language_model(self.model)  # e.g. LlamaModel
+        layers = getattr(inner_model, "layers", None)
+        if layers is None:
+            return []
+
+        attn_modules: set = set()
+        for layer in layers:
+            attn = None
+            if hasattr(layer, "self_attn"):
+                sa = layer.self_attn
+                attn = getattr(sa, "attn", None) or getattr(sa, "attn_mqa", None)
+            elif hasattr(layer, "attn"):
+                attn = layer.attn
+            elif hasattr(layer, "linear_attn"):
+                la = layer.linear_attn
+                attn = getattr(la, "attn", la)
+            elif hasattr(layer, "attention"):
+                ab = layer.attention
+                attn = getattr(ab, "attn", ab)
+            elif hasattr(layer, "mixer"):
+                mixer = layer.mixer
+                if hasattr(mixer, "attn"):
+                    attn = mixer.attn
+                elif hasattr(layer, "_forward_mamba"):
+                    attn = layer
+            if attn is not None:
+                attn_modules.add(attn)
+
         return [
             name for name, module in self.model.named_modules()
-            if id(module) in attn_set
+            if module in attn_modules
         ]
 
     def get_layer_name_by_index(self, layer_idx: int, layer_type: str = "attention") -> str:
@@ -362,7 +395,7 @@ def _run_profiler_in_subprocess(model_name: str, dtype: str, attn_backend: str):
 
     # Do your profiling work here...
 
-    print("\nClosing vLLM instance...")
+    print("\nClosing SGLang instance...")
     vlp.close()
     print(f"=== Run {model_name} ({dtype}) ({attn_backend}) complete ===\n")
 

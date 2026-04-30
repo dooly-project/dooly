@@ -81,7 +81,7 @@ class ModuleResolver:
 
     def __init__(
         self,
-        vlp: SgLangLayerProfiler,               # VLLMLayerProfiler instance (has .model)
+        vlp: SgLangLayerProfiler,
         importer: OpImporter,
         dtype: torch.dtype = torch.bfloat16,
         max_batch_size: int = 4,
@@ -423,8 +423,8 @@ class ModuleResolver:
         Uses a small workload to minimize overhead. Catches CUDA errors
         that would otherwise corrupt the GPU context.
 
-        For modules that require forward context (Attention, Mamba), uses
-        VLLMLayerProfiler's infrastructure to set up proper metadata.
+        For attention modules, uses SgLangLayerProfiler to allocate KV cache
+        slots and configure the attn_backend before the forward call.
 
         layer_name_override lets path disambiguation (kernel-match) drive the
         forward-context key. Without it, get_layer_name_by_module always
@@ -531,11 +531,15 @@ class ModuleResolver:
             from dooly.profiler.profiler import prepare_op_args
             args, kwargs = prepare_op_args(callable_obj, module.operation_name, inputs)
 
-            forward_context = None
-            slot_mapping_dict = None
-            num_tokens_for_context = None
+
+            # SGLang: for attention modules, allocate KV cache slots and
+            # configure attn_backend via build_fake_forward_batch once before
+            # the forward call. init_forward_metadata is called inside it, so
+            # no context manager is needed. When get_forward_context() is None,
+            # RadixAttention falls back to attn_backend.forward() directly.
+            # Raw ops and non-attention modules skip this block (layer_name=None).
+            token_indices = None
             if layer_name and isinstance(workload_batch, AttentionBatchConfig):
-                # print(f"[RESOLVER DEBUG] Setting up forward_context for layer: {layer_name}")
                 batch_config = AttentionBatchConfig(
                     batch_size=workload_batch.batch_size,
                     prefill_chunk_size=workload_batch.prefill_chunk_size,
@@ -543,43 +547,15 @@ class ModuleResolver:
                     is_prefill=workload_batch.is_prefill,
                 )
                 try:
-                    result = self.vlp.build_layer_metadata(layer_name, batch_config)
+                    result = self.vlp.build_fake_forward_batch(batch_config)
                     if result is None:
-                        # Skip this config - exceeds available KV cache blocks
                         print(f"[RESOLVER]   Skipping config (exceeds KV cache): {batch_config}")
                         return False
-                    layer_metadata, _ = result
-                    forward_context = {layer_name: layer_metadata}
-
-                    # Mirror profiler.py:920-923 — without slot_mapping +
-                    # num_actual_tokens in the forward context, vLLM's
-                    # unified_kv_cache_update silently skips
-                    # reshape_and_cache_flash_kernel and the attention kernel
-                    # dispatch can misroute (kernel-match sees nothing).
-                    common_meta = self.vlp._build_common_attention_metadata(batch_config, kv_cache_gid=0)
-                    if common_meta is not None:
-                        slot_mapping_dict = {layer_name: common_meta.slot_mapping}
-                        num_tokens_for_context = common_meta.num_actual_tokens
+                    _, token_indices = result
                 except Exception as e:
-                    # vLLM's invariant: forward_context must be *set* during any
-                    # module forward — even for ops that don't consume attention
-                    # metadata (MoE, Mamba, any op that calls get_forward_context
-                    # for batch-level state). Fall back to an empty context so
-                    # `get_forward_context()` finds something and doesn't raise
-                    # the "Forward context is not set" guard. Metadata content
-                    # stays empty; ops that actually need attention metadata
-                    # would fail further downstream with a clearer KeyError.
-                    print(f"[RESOLVER]   No metadata for {layer_name} "
+                    print(f"[RESOLVER]   No batch metadata for {layer_name} "
                           f"(ok for non-attention ops): {e}")
-                    forward_context = {layer_name: None}
-                    slot_mapping_dict = None
-                    num_tokens_for_context = None
-            else:
-                # No layer_name / not an AttentionBatchConfig workload: ops
-                # like aten::linear, aten::embedding, etc. don't read forward
-                # context, so leave it None to preserve existing behavior.
-                pass
-            
+
             def run_callable():
                 with torch.no_grad():
                     has_named = any(
@@ -587,7 +563,6 @@ class ModuleResolver:
                         for pi in module.inputs
                     )
                     if has_named and module.is_module:
-                        # Re-split: positional inputs have no arg_name
                         positional_tensors = [
                             tensor for pi, tensor in zip(module.inputs, inputs)
                             if getattr(pi, 'arg_name', None) is None
@@ -597,73 +572,19 @@ class ModuleResolver:
                             for pi, tensor in zip(module.inputs, inputs)
                             if getattr(pi, 'arg_name', None) is not None
                         }
-                        
-                        # print(f"[RESOLVER DEBUG] Calling {module.operation_name} with:")
-                        # print(f"[RESOLVER DEBUG]   Positional: {len(positional_tensors)} args")
-                        # print(f"[RESOLVER DEBUG]   Kwargs: {list(kwarg_tensors.keys())}")
-                        # for k, v in kwarg_tensors.items():
-                        #     if hasattr(v, 'shape'):
-                        #         print(f"[RESOLVER DEBUG]     {k}={v.shape}")
-                        
                         callable_obj(*positional_tensors, **kwarg_tensors)
                     else:
                         callable_obj(*args, **kwargs)
 
-            def run_callable_with_context():
-                from vllm.config import set_current_vllm_config
-                from vllm.forward_context import set_forward_context
-                with torch.no_grad():
-                    # Same kwarg reconstruction as run_callable()
-                    has_named = any(
-                        getattr(pi, 'arg_name', None) is not None
-                        for pi in module.inputs
-                    )
-                    if has_named and module.is_module:
-                        positional_tensors = [
-                            tensor for pi, tensor in zip(module.inputs, inputs)
-                            if getattr(pi, 'arg_name', None) is None
-                        ]
-                        kwarg_tensors = {
-                            pi.arg_name: tensor
-                            for pi, tensor in zip(module.inputs, inputs)
-                            if getattr(pi, 'arg_name', None) is not None
-                        }
-                        
-                        # print(f"[RESOLVER DEBUG] Calling {module.operation_name} WITH CONTEXT:")
-                        # print(f"[RESOLVER DEBUG]   Positional: {len(positional_tensors)} args")
-                        # print(f"[RESOLVER DEBUG]   Kwargs: {list(kwarg_tensors.keys())}")
-                        # for k, v in kwarg_tensors.items():
-                        #     if hasattr(v, 'shape'):
-                        #         # print(f"[RESOLVER DEBUG]     {k}={v.shape}")
-                        
-                        with set_current_vllm_config(self.vlp.vllm_config):
-                            with set_forward_context(
-                                forward_context,
-                                self.vlp.vllm_config,
-                                virtual_engine=0,
-                                num_tokens=num_tokens_for_context,
-                                slot_mapping=slot_mapping_dict,
-                            ):
-                                callable_obj(*positional_tensors, **kwarg_tensors)
-                    else:
-                        with set_current_vllm_config(self.vlp.vllm_config):
-                            with set_forward_context(
-                                forward_context,
-                                self.vlp.vllm_config,
-                                virtual_engine=0,
-                                num_tokens=num_tokens_for_context,
-                                slot_mapping=slot_mapping_dict,
-                            ):
-                                callable_obj(*args, **kwargs)
-
-            run_fn = run_callable_with_context if forward_context else run_callable
-
             # Single forward pass
-            run_fn()
-            
+            run_callable()
+
             torch.cuda.synchronize()
 
-            # Clean up
+            # Clean up KV cache slots allocated for attention batch setup
+            if token_indices is not None:
+                self.vlp._free_fake_batch(token_indices)
+                token_indices = None
             del inputs, args, kwargs
             torch.cuda.empty_cache()
 

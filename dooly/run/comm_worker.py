@@ -1,7 +1,7 @@
 """
 Worker module for communication profiling.
 CRITICAL: This module must NEVER be imported by run-profiler.py at module level,
-and must NOT set VLLM_FAKE_TP or import any modules that set it.
+and must NOT set DOOLY_FAKE_TP or import any modules that set it.
 """
 
 import os
@@ -18,13 +18,13 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
     Runs with REAL TP (no fake TP patches).
     """
     # DEBUG: Verify no fake TP
-    fake_tp_val = os.environ.get('VLLM_FAKE_TP', 'NOT SET')
-    print(f"[WORKER] VLLM_FAKE_TP: {fake_tp_val}")
+    fake_tp_val = os.environ.get('DOOLY_FAKE_TP', 'NOT SET')
+    print(f"[WORKER] DOOLY_FAKE_TP: {fake_tp_val}")
 
     if fake_tp_val != 'NOT SET':
-        raise RuntimeError(f"VLLM_FAKE_TP is still set to {fake_tp_val}! Cannot profile comm ops with fake TP.")
+        raise RuntimeError(f"DOOLY_FAKE_TP is still set to {fake_tp_val}! Cannot profile comm ops with fake TP.")
 
-    # Import comm_profiler (which doesn't set VLLM_FAKE_TP)
+    # Import comm_profiler (which doesn't set DOOLY_FAKE_TP)
     from dooly.run.comm_profiler import CommProfiler, CommProfilingConfig
 
     DTYPE_MAP = {
