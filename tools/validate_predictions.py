@@ -257,11 +257,11 @@ def main() -> int:
                          "each --kv-sizes value; 'both' does the union. "
                          "(default: prefill)")
     ap.add_argument("--lengths", type=int, nargs="+",
-                    default=[1024, 2048, 4096, 8192, 16384],
+                    default=[512, 1024, 2048, 4096, 8192, 16384],
                     help="Prefill sizes to validate (used when "
                          "--workload prefill or both).")
     ap.add_argument("--kv-sizes", type=int, nargs="+",
-                    default=[1024, 2048, 4096, 8192, 16384],
+                    default=[512, 1024, 2048, 4096, 8192, 16384],
                     help="Decode KV-cache sizes to validate (used when "
                          "--workload decode or both). Each entry sweeps a "
                          "single decode step at that pre-existing KV size.")

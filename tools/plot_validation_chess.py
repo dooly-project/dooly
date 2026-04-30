@@ -66,6 +66,15 @@ _MODEL_ALIASES: dict[str, str] = {
     "8b":      "Llama-3.1-8B",
 }
 
+_Y_AXIS_MAPPING ={
+    512: "512",
+    1024: "1K",
+    2048: "2K",
+    4096: "4K",
+    8192: "8K",
+    16384: "16K",
+}
+
 
 def model_short(name: str) -> str:
     n = name.split("/")[-1]
@@ -237,7 +246,8 @@ def plot_chess(data: dict, axis_values_by_workload: dict, output_dir: Path,
                combine_models: bool = True,
                model_order: list[str] | None = None,
                write_standalone_legend: bool = True,
-               no_figure_legend: bool = False) -> None:
+               no_figure_legend: bool = True,
+               source: str = "measured",) -> None:
     """Draw the chess heatmap.
 
     With ``combine_models=True`` (default), all models share a single panel
@@ -358,8 +368,8 @@ def plot_chess(data: dict, axis_values_by_workload: dict, output_dir: Path,
                 ax.set_axis_off()
                 ax.text(0.5, 0.5, f"no {workload} data\n(in summary)",
                         transform=ax.transAxes, ha="center", va="center",
-                        fontsize=12, color="#888888")
-                ax.set_title(f"({workload})", fontsize=14, pad=8)
+                        fontsize=20, color="#888888")
+                ax.set_title(f"({workload})", fontsize=20, pad=8)
                 continue
             per_model_panels = {
                 m: data[(workload, m)] for m in model_order
@@ -375,8 +385,8 @@ def plot_chess(data: dict, axis_values_by_workload: dict, output_dir: Path,
                 ax.set_axis_off()
                 ax.text(0.5, 0.5, f"no {workload} data\n(in summary)",
                         transform=ax.transAxes, ha="center", va="center",
-                        fontsize=12, color="#888888")
-                ax.set_title(f"{model}\n({workload})", fontsize=14, pad=8)
+                        fontsize=20, color="#888888")
+                ax.set_title(f"{model}\n({workload})", fontsize=20, pad=8)
                 continue
 
             mat, cols = build_matrix(data[(workload, model)], axis_values, sources)
@@ -411,13 +421,13 @@ def plot_chess(data: dict, axis_values_by_workload: dict, output_dir: Path,
                     )
                     ax.add_patch(rect)
                     ax.text(c, r, "★", ha="center", va="center",
-                            fontsize=16, fontweight="bold",
+                            fontsize=18, fontweight="bold",
                             color=BEST_COLOR, zorder=6)
                 else:
                     text_color = "white" if v > 22 else "#3a3a3a"
                     ax.text(c, r, f"{int(round(v))}%",
                             ha="center", va="center",
-                            fontsize=11, color=text_color, alpha=0.7)
+                            fontsize=18, color=text_color, alpha=0.7)
 
         # Winner-inversion arrows between adjacent rows
         for r in range(len(winner_cols) - 1):
@@ -459,16 +469,17 @@ def plot_chess(data: dict, axis_values_by_workload: dict, output_dir: Path,
         ax.set_xticks(range(n_cols))
         if combine_models:
             ax.set_xticklabels(
-                [_BACKEND_SHORT[c[2]] for c in cols], fontsize=14
+                [_BACKEND_SHORT[c[2]] for c in cols], fontsize=22
             )
         else:
             ax.set_xticklabels(
-                [_BACKEND_SHORT[c[1]] for c in cols], fontsize=14
+                [_BACKEND_SHORT[c[1]] for c in cols], fontsize=22
             )
         ax.set_yticks(range(n_rows))
         ax.set_yticklabels(
-            [_format_axis_label(workload, v) for v in axis_values],
-            fontsize=12,
+            [_Y_AXIS_MAPPING.get(v, _format_axis_label(workload, v))
+             for v in axis_values],
+            fontsize=22, 
         )
         ax.tick_params(length=0)
 
@@ -493,7 +504,7 @@ def plot_chess(data: dict, axis_values_by_workload: dict, output_dir: Path,
                     continue
                 center_col = m_idx * cols_per_model + (cols_per_model - 1) / 2
                 ax.text(center_col, -0.55, m, ha="center", va="bottom",
-                        fontsize=15, fontweight="bold", clip_on=False)
+                        fontsize=18, fontweight="bold", clip_on=False)
                 # If we also have multiple sources, label them under the model.
                 if len(sources) > 1:
                     for s_idx, src in enumerate(sources):
@@ -506,14 +517,14 @@ def plot_chess(data: dict, axis_values_by_workload: dict, output_dir: Path,
             for s_idx, src in enumerate(sources):
                 center_col = s_idx * group_w + (group_w - 1) / 2
                 ax.text(center_col, -0.95, _SOURCE_LABEL[src],
-                        ha="center", va="bottom", fontsize=12,
+                        ha="center", va="bottom", fontsize=18,
                         fontweight="bold", clip_on=False)
 
         # Y-label only on left-most panel.
-        # if idx == 0:
+        # if source == "measured":
         #     ax.set_ylabel(
         #         "Total Token Count",
-        #         fontsize=15, labelpad=1, fontweight="bold"
+        #         fontsize=20, labelpad=1, fontweight="bold"
         #     )
 
     # Workload-section labels above the panels (centered across each
@@ -561,13 +572,13 @@ def plot_chess(data: dict, axis_values_by_workload: dict, output_dir: Path,
     if not no_figure_legend:
         fig.legend(
             handles=legend_elements, loc="lower center",
-            bbox_to_anchor=(0.5, -0.02), ncol=2, fontsize=12,
-            frameon=True, fancybox=True, edgecolor="#cccccc",
+            bbox_to_anchor=(0.5, -0.02), ncol=2, fontsize=20,
+            frameon=False, fancybox=False, edgecolor="#cccccc",
             handlelength=2.2, columnspacing=1.5,
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_pdf = output_dir / "inversion_heatmap_v2.pdf"
+    out_pdf = output_dir / f"a100_{workloads[0]}_{source}.pdf"
     # out_png = output_dir / "inversion_heatmap_v2.png"
     fig.savefig(out_pdf, bbox_inches="tight", dpi=300)
     # fig.savefig(out_png, bbox_inches="tight", dpi=300)
@@ -591,7 +602,7 @@ def save_standalone_legend(legend_elements: list, output_dir: Path,
     fig_legend = plt.figure(figsize=(0.9 * len(legend_elements) + 1.6, 0.8))
     fig_legend.legend(
         handles=legend_elements, loc="center", ncol=ncol,
-        fontsize=fontsize, frameon=True, fancybox=True,
+        fontsize=20, frameon=False, fancybox=False,
         edgecolor="#cccccc", handlelength=2.2, columnspacing=1.5,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -711,7 +722,9 @@ def main() -> int:
                combine_models=not args.separate_models,
                model_order=args.model_order,
                write_standalone_legend=not args.no_standalone_legend,
-               no_figure_legend=args.no_figure_legend)
+               no_figure_legend=args.no_figure_legend,
+               source=args.source,
+               )
     return 0
 
 
