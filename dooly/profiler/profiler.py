@@ -29,6 +29,7 @@ from dooly.profiler.module import ModuleInfo
 from dooly.profiler.input_generator import InputGenerator 
 from dooly.profiler.resolver import ModuleResolver
 from dooly.profiler.utils.generate_batch import AttentionBatchConfig
+from dooly.profiler.call_utils import prepare_module_call_args
 
 
 def wrap_list_args(op_packet, op_name: str, inputs: List) -> List:
@@ -1027,6 +1028,7 @@ class Profiler:
 
                 # SGLang: allocate KV cache slots and configure attn_backend once
                 # before the profiling loop; freed in the finally block below.
+                fake_forward_batch = None
                 token_indices = None
 
                 if layer_name and isinstance(workload_config, AttentionBatchConfig):
@@ -1041,29 +1043,23 @@ class Profiler:
                         if result is None:
                             # Skip this config - exceeds available KV cache capacity
                             continue
-                        _, token_indices = result
+                        fake_forward_batch, token_indices = result
                         # attn_backend is now configured; callable runs without a context manager
                     except Exception as e:
-                        print(f"[PROFILER] Warning: Could not build batch metadata (ok for non-attention ops): {e}")
+                        print(f"[PROFILER] Warning: Could not build attention batch metadata "
+                              f"for {layer_name}: {e}")
+                        continue
+
+                if module.is_module:
+                    args, kwargs = prepare_module_call_args(
+                        callable_obj,
+                        module,
+                        inputs,
+                        injected_kwargs={"forward_batch": fake_forward_batch},
+                    )
 
                 def run_callable():
-                    has_named = any(
-                        getattr(pi, 'arg_name', None) is not None
-                        for pi in module.inputs
-                    )
-                    if has_named and module.is_module:
-                        positional_tensors = [
-                            tensor for pi, tensor in zip(module.inputs, inputs)
-                            if getattr(pi, 'arg_name', None) is None
-                        ]
-                        kwarg_tensors = {
-                            pi.arg_name: tensor
-                            for pi, tensor in zip(module.inputs, inputs)
-                            if getattr(pi, 'arg_name', None) is not None
-                        }
-                        callable_obj(*positional_tensors, **kwarg_tensors)
-                    else:
-                        callable_obj(*args, **kwargs)
+                    callable_obj(*args, **kwargs)
 
                 run_fn = run_callable
 

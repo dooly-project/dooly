@@ -325,14 +325,21 @@ class SgLangLayerProfiler:
             req_pool_indices=req_pool_indices_device.to(torch.int32),
             seq_lens=seq_lens_device.to(torch.int32),
             out_cache_loc=out_cache_loc,
-            seq_lens_cpu=seq_lens_cpu.tolist(),
+            seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=int(batch_size * total_seq_len),
             extend_prefix_lens=prefix_lens_device.to(torch.int32),
             extend_prefix_lens_cpu=[kv_cache_size] * batch_size,
+            extend_num_tokens=num_query_tokens if is_prefill else None,
             extend_seq_lens=extend_lens_device.to(torch.int32),
             extend_seq_lens_cpu=[num_new_tokens] * batch_size,
             encoder_lens=None,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
             spec_info=None,
+            num_token_non_padded=torch.tensor(
+                num_query_tokens, dtype=torch.int32, device=self.device
+            ),
+            num_token_non_padded_cpu=num_query_tokens,
             attn_backend=self.attn_backend,
         )
 

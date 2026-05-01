@@ -19,6 +19,7 @@ from dooly.profiler.input_generator import InputGenerator, AttentionBatchConfig
 from dooly.profiler.parser import Event, OperationHierarchy
 from dooly.profiler.importer import OpImporter
 from dooly.profiler.sglang_layer_profiler import make_dict, SgLangLayerProfiler
+from dooly.profiler.call_utils import prepare_module_call_args
 
 
 def _dim_is_tokens(dim) -> bool:
@@ -30,6 +31,35 @@ def _dim_is_tokens(dim) -> bool:
 def _dim_is_requests(dim) -> bool:
     name = getattr(dim, 'value', None) or str(dim)
     return 'NUM_REQ' in name.upper()
+
+
+def _is_kernel_match_noise(kernel_name: str) -> bool:
+    """Kernel symbols that are too incidental for resolver path matching."""
+    # PyTorch direct-copy elementwise kernels can appear in traced attention due
+    # to temporary casts/copies but disappear in an equivalent dummy replay.
+    # They do not identify a layer variant; FlashInfer/GEMM symbols do.
+    return "direct_copy" in kernel_name
+
+
+def _kernel_match_key(kernel_name: str) -> Optional[str]:
+    """Return a stable key for fallback kernel matching."""
+    if _is_kernel_match_noise(kernel_name):
+        return None
+    if "flashinfer::" in kernel_name and "Kernel<" in kernel_name:
+        # FlashInfer template traits can shift between the captured trace and
+        # resolver replay for the same attention family. Keep the operation
+        # family while dropping template arguments.
+        return kernel_name.split("<", 1)[0]
+    return kernel_name
+
+
+def _kernel_match_key_set(kernel_names) -> set:
+    keys = set()
+    for kernel_name in kernel_names:
+        key = _kernel_match_key(kernel_name)
+        if key:
+            keys.add(key)
+    return keys
 
 
 def _extract_num_tokens_from_inputs(inputs) -> Optional[int]:
@@ -269,18 +299,26 @@ class ModuleResolver:
         #   2. Ancestor-class filter: fallback used when kernel info is empty
         #      or matching fails (covers GemmaRMSNorm-style cases).
         #
-        # Target kernels come from the containing module's full descendant
-        # kernel set (annotated by the parser). This is critical when two
-        # sibling CPU ops launch distinct kernels inside the same module —
-        # e.g. unified_kv_cache_update and unified_attention_with_output
-        # both sit under Attention. Taking only the anchor's own kernels
-        # would leave kv_cache_update indistinguishable across SWA variants,
-        # because its reshape_and_cache_flash kernel is identical per layer.
+        # Module anchors should match against their own kernel surface. Using
+        # the nearest parent module pulls in QKV/O projection GEMMs (e.g. Qwen's
+        # ampere kernels) that a direct RadixAttention.forward() replay cannot
+        # launch. Raw op anchors keep the parent descendant set because sibling
+        # ops under Attention may need the containing module's full kernel set to
+        # disambiguate layer variants.
+        anchor = module.hierarchy.anchor if module.hierarchy else None
         nearest_module = module.hierarchy.nearest_module if module.hierarchy else None
-        if nearest_module is not None and getattr(nearest_module, 'descendant_kernels', None):
+        if module.is_module and anchor is not None and getattr(anchor, 'descendant_kernels', None):
+            target_kernels = tuple(sorted(anchor.descendant_kernels))
+        elif module.is_module:
+            target_kernels = tuple(sorted({k.name for k in module.kernels if k.name}))
+        elif nearest_module is not None and getattr(nearest_module, 'descendant_kernels', None):
             target_kernels = tuple(sorted(nearest_module.descendant_kernels))
         else:
             target_kernels = tuple(sorted({k.name for k in module.kernels if k.name}))
+        if module.is_module:
+            target_kernels = tuple(
+                k for k in target_kernels if not _is_kernel_match_noise(k)
+            )
 
         # State-hash pre-filter. For backends where the kernel symbol doesn't
         # encode every runtime-branching dim (FA2/Triton SWA: same kernel, but
@@ -359,8 +397,11 @@ class ModuleResolver:
         For each candidate path we get the submodule, run the standard resolver
         dummy pass under a CUDA profiler, and accept if the captured kernel
         name set is a superset of target_kernels (extra kernels from allocator
-        / reshape activity are fine).
+        / reshape activity are fine). If exact FlashInfer template symbols do
+        not line up, retry with stable kernel-family keys before reporting a
+        mismatch.
         """
+        captured_by_path = []
         for path in paths:
             try:
                 submodule = self.vlp.model.get_submodule(path)
@@ -369,14 +410,21 @@ class ModuleResolver:
             captured = self._capture_kernels(submodule, module, layer_name=path)
             if captured is None:
                 continue
-            
-            # print(captured)
-            # print(target_kernels)
-            # return None
+            captured_by_path.append((path, captured))
+
             if target_kernels.issubset(captured):
                 return path
-            # Log mismatch to help debugging without being too noisy.
-            missing = sorted(target_kernels - captured)
+
+        target_keys = _kernel_match_key_set(target_kernels)
+        if target_keys:
+            for path, captured in captured_by_path:
+                captured_keys = _kernel_match_key_set(captured)
+                if target_keys.issubset(captured_keys):
+                    return path
+
+        # Log final mismatch to help debugging without being too noisy.
+        for path, captured in captured_by_path:
+            missing = sorted(target_keys - _kernel_match_key_set(captured))
             if missing:
                 print(f"[RESOLVER]   path={path} missing {missing[0][:80]}...")
         return None
@@ -538,6 +586,7 @@ class ModuleResolver:
             # no context manager is needed. When get_forward_context() is None,
             # RadixAttention falls back to attn_backend.forward() directly.
             # Raw ops and non-attention modules skip this block (layer_name=None).
+            fake_forward_batch = None
             token_indices = None
             if layer_name and isinstance(workload_batch, AttentionBatchConfig):
                 batch_config = AttentionBatchConfig(
@@ -551,40 +600,35 @@ class ModuleResolver:
                     if result is None:
                         print(f"[RESOLVER]   Skipping config (exceeds KV cache): {batch_config}")
                         return False
-                    _, token_indices = result
+                    fake_forward_batch, token_indices = result
                 except Exception as e:
-                    print(f"[RESOLVER]   No batch metadata for {layer_name} "
-                          f"(ok for non-attention ops): {e}")
+                    print(f"[RESOLVER]   Could not build attention batch metadata "
+                          f"for {layer_name}: {e}")
+                    return False
+
+            if module.is_module:
+                args, kwargs = prepare_module_call_args(
+                    callable_obj,
+                    module,
+                    inputs,
+                    injected_kwargs={"forward_batch": fake_forward_batch},
+                )
 
             def run_callable():
                 with torch.no_grad():
-                    has_named = any(
-                        getattr(pi, 'arg_name', None) is not None
-                        for pi in module.inputs
-                    )
-                    if has_named and module.is_module:
-                        positional_tensors = [
-                            tensor for pi, tensor in zip(module.inputs, inputs)
-                            if getattr(pi, 'arg_name', None) is None
-                        ]
-                        kwarg_tensors = {
-                            pi.arg_name: tensor
-                            for pi, tensor in zip(module.inputs, inputs)
-                            if getattr(pi, 'arg_name', None) is not None
-                        }
-                        callable_obj(*positional_tensors, **kwarg_tensors)
-                    else:
-                        callable_obj(*args, **kwargs)
+                    callable_obj(*args, **kwargs)
 
-            # Single forward pass
-            run_callable()
+            try:
+                # Single forward pass
+                run_callable()
 
-            torch.cuda.synchronize()
-
-            # Clean up KV cache slots allocated for attention batch setup
-            if token_indices is not None:
-                self.vlp._free_fake_batch(token_indices)
-                token_indices = None
+                torch.cuda.synchronize()
+            finally:
+                # Clean up KV cache slots allocated for attention batch setup,
+                # including when the dummy call itself fails.
+                if token_indices is not None:
+                    self.vlp._free_fake_batch(token_indices)
+                    token_indices = None
             del inputs, args, kwargs
             torch.cuda.empty_cache()
 
