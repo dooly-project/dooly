@@ -614,9 +614,9 @@ class ModuleResolver:
                     injected_kwargs={"forward_batch": fake_forward_batch},
                 )
 
+            @torch.inference_mode()
             def run_callable():
-                with torch.no_grad():
-                    callable_obj(*args, **kwargs)
+                callable_obj(*args, **kwargs)
 
             try:
                 # Single forward pass

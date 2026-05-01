@@ -197,6 +197,8 @@ class Profiler:
         output_path: str,
         workload_mode: str = "vidur",
         attention_backend: str = "TRITON_ATTN",
+        flash_attn_version: int = 2,
+        quantization: Optional[str] = None,
         max_batch_size: int = 5,
         max_seq_len: int = 512,
         test_counts: int = 10,
@@ -242,6 +244,8 @@ class Profiler:
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self.attention_backend = attention_backend
+        self.flash_attn_version = flash_attn_version
+        self.quantization = quantization
 
         output_dir = str(Path(output_path).parent)
         Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -745,6 +749,8 @@ class Profiler:
             gpu_memory_utilization=0.9,
             max_model_len=self.max_model_len,
             attn_backend=self.attention_backend,
+            flash_attn_version=self.flash_attn_version,
+            quantization=self.quantization,
             gpu=self.gpu,
         )
 
@@ -859,15 +865,9 @@ class Profiler:
 
                 args, kwargs = prepare_op_args(callable_obj, module.operation_name, inputs)
 
-                def run_callable():
-                    # Debug: Print shapes for Attention profiling (non-context version)
-                    # if "Attention" in module.operation_name:
-                    #     print(f"\n[PROFILER] Profiling {module.operation_name} with shapes (no context):")
-                    #     for i, (pi, tensor) in enumerate(zip(module.inputs, inputs)):
-                    #         if hasattr(tensor, 'shape'):
-                    #             print(f"  Input {i}: {tensor.shape} (dtype={tensor.dtype})")
-                    #     print(f"  Config: batch_config={batch_config}")
 
+                @torch.inference_mode()
+                def run_callable():
                     # Reconstruct kwargs from arg_name if present (for modules called with keyword args)
                     has_named = any(
                         getattr(pi, 'arg_name', None) is not None
@@ -918,10 +918,10 @@ class Profiler:
                     results.append(result)
 
                 except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                    if "out of memory" in str(e).lower() or "CUDA" in str(e):
+                    if "out of memory" in str(e).lower():
                         print(f"[PROFILER] OOM for {module.operation_name}, skipping...")
                     else:
-                        print(f"[PROFILER] Error: {e}")
+                        print(f"[PROFILER] Error profiling {module.operation_name}: {e}")
                     torch.cuda.empty_cache()
                     continue
 
@@ -1058,6 +1058,7 @@ class Profiler:
                         injected_kwargs={"forward_batch": fake_forward_batch},
                     )
 
+                @torch.inference_mode()
                 def run_callable():
                     callable_obj(*args, **kwargs)
 

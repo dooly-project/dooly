@@ -696,14 +696,6 @@ def _wrap_factory_output(original_fn):
     def wrapper(*args, **kwargs):
         has_taint, taints = _extract_taints_from_args(args, kwargs)
 
-        # Debug: track creation of tensors with dimension 269
-        # if args and hasattr(args[0], '__iter__'):
-        #     try:
-        #         if 269 in args[0]:
-        #             print(f"[FACTORY DEBUG] Creating tensor with 269 in shape: args={args}, has_taint={has_taint}, taints={taints}", flush=True)
-        #     except:
-        #         pass
-
         plain_args = _unwrap_for_factory(args)
         plain_kwargs = _unwrap_for_factory(kwargs)
 
