@@ -44,8 +44,8 @@ import threading
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
-PY = "/home/jkim38/miniconda3/envs/dooly/bin/python"
-WORK = Path("/home/jkim38/dooly/profiler")
+PY = "/home/ubuntu/miniconda3/envs/dooly/bin/python"
+WORK = Path("/home/ubuntu/dooly/profiler")
 
 DEFAULT_DB = WORK / "database" / "dooly-eval.db"
 DEFAULT_WS = WORK / "workspaces" / "scenario_a"
@@ -349,6 +349,7 @@ def run_one(
     max_seq_len: int,
     tp: int,
     gpu: int,
+    quantization: str | None = None,
 ) -> int:
     safe = model.replace("/", "_")
     log_path = log_dir / f"{safe}__{backend}__gpu{gpu}.log"
@@ -364,6 +365,8 @@ def run_one(
         "--db-path", str(db),
         "--gpu", str(gpu),
     ]
+    if quantization:
+        cmd.extend(["--quantization", quantization])
     env = os.environ.copy()
     env["DOOLY_TIMING_SHARD"] = f"gpu{gpu}"
     with open(log_path, "w") as lf:
@@ -405,6 +408,7 @@ def worker_loop(
                 max_seq_len=args.max_seq_len,
                 tp=args.tp,
                 gpu=gpu,
+                quantization=args.quantization,
             )
             log_progress(progress, f"[gpu{gpu}] DONE: {model} {backend} exit={ec}")
         except Exception as e:
@@ -437,6 +441,11 @@ def main() -> int:
                          "Overrides --num-gpus. Length determines number of workers.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print which pairs would run/skip without launching.")
+    ap.add_argument("--quantization", type=str, default=None,
+                    choices=["fp8", "awq", "gptq"],
+                    help="Optional quantization scheme. 'fp8' requires Hopper+ (H100). "
+                         "Combined with load_format=dummy, vLLM initializes random "
+                         "quantized weights — no quantized checkpoint needed.")
 
     # ---- Pair source (priority: --config > --models/--backends > DEFAULT_PAIRS) ----
     ap.add_argument("--config", type=Path, default=None,

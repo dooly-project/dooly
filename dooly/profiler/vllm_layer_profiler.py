@@ -69,6 +69,8 @@ class VLLMLayerProfiler:
         gpu_memory_utilization: float = 0.9,
         max_model_len: int = 4096,
         attn_backend: str = "FLASHINFER",
+        flash_attn_version: int = 2,
+        quantization: Optional[str] = None,
         gpu: str = "0"
     ):
         """
@@ -80,6 +82,9 @@ class VLLMLayerProfiler:
             enforce_eager: Disable CUDA graphs for easier profiling
             gpu_memory_utilization: Fraction of GPU memory to use
             max_model_len: Maximum sequence length
+            quantization: Optional quantization scheme (e.g. "fp8", "awq", "gptq").
+                When set with load_format="dummy", vLLM initializes random
+                quantized weights — no need to download a quantized checkpoint.
         """
         self.model_name = model_name
         self.dtype = dtype
@@ -97,7 +102,7 @@ class VLLMLayerProfiler:
         self.tp_size = _FAKE_TP_SIZE
 
         # Let vLLM handle ALL setup
-        self.llm = LLM(
+        llm_kwargs = dict(
             model=model_name,
             dtype=dtype,
             enforce_eager=enforce_eager,
@@ -108,6 +113,11 @@ class VLLMLayerProfiler:
             tensor_parallel_size=1,  # Single process, fake TP patches handle sharding
             trust_remote_code=True,
         )
+        if attn_backend == "FLASH_ATTN":
+            llm_kwargs["attention_config"] = {"flash_attn_version": flash_attn_version}
+        if quantization:
+            llm_kwargs["quantization"] = quantization
+        self.llm = LLM(**llm_kwargs)
 
         # Extract internals
         self.model_runner = self.llm.llm_engine.model_executor.driver_worker.model_runner

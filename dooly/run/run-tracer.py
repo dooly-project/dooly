@@ -35,7 +35,9 @@ parser.add_argument("--batch-size", type=int, default=5, help="Number of identic
 parser.add_argument("--max-tokens", type=int, default=1, help="Max tokens to generate")
 parser.add_argument("--trace_dir", type=str, default="./vllm_traces_tp", help="Directory to save trace")
 parser.add_argument("--gpu", type=int, default=0, help="GPU device index to use")
-parser.add_argument("--attention-backend", type=str, default="FLASHINFER", help="Attention backend (FLASHINFER, FLASH_ATTN, XFORMERS)")
+parser.add_argument("--attention-backend", type=str, default="FLASH_ATTN", help="Attention backend (FLASHINFER, FLASH_ATTN, XFORMERS)")
+parser.add_argument("--flash-attn-version", type=int, default=2, choices=[2, 3, 4], help="Pin flash-attention version when --attention-backend=FLASH_ATTN. Without this, vLLM auto-picks FA3 on Hopper / FA4 on Blackwell.")
+parser.add_argument("--quantization", type=str, default=None, choices=["fp8", "awq", "gptq"], help="Optional quantization scheme. 'fp8' requires Hopper+ (H100). With load_format=dummy, vLLM initializes random quantized weights — no quantized checkpoint needed.")
 parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
 args = parser.parse_args()
 
@@ -71,6 +73,27 @@ install_hooks(
     ]
 )
 
+# Patch torch.nn.Parameter.__new__ so that when constructed from a
+# TaintedTensor, the data is unwrapped to a plain torch.Tensor before
+# delegating. This preserves the Parameter subclass identity (e.g.
+# vLLM's BasevLLMParameter / ModelWeightParameter), which carries
+# attributes like `weight_loader` via @property — those are unreachable
+# if the resulting object is downgraded to a plain TaintedTensor by
+# Parameter.__new__'s alt-path (data.detach().requires_grad_(rg)).
+_original_parameter_new = torch.nn.Parameter.__new__
+
+def _patched_parameter_new(cls, data=None, requires_grad=True):
+    from dooly.taintracer.tensor import TaintedTensor
+    if isinstance(data, TaintedTensor):
+        # Unwrap: get the plain Tensor view of the same storage, so that
+        # type(data) is torch.Tensor and Parameter.__new__ takes the
+        # _make_subclass(cls, ...) path that actually returns `cls`.
+        with torch._C._DisableTorchDispatch():
+            data = torch.Tensor._make_subclass(torch.Tensor, data, False)
+    return _original_parameter_new(cls, data=data, requires_grad=requires_grad)
+
+torch.nn.Parameter.__new__ = _patched_parameter_new
+
 # Patch DummyModelLoader to force CUDA move
 # (dummy models are loaded into CPU for some reason when tainting is enabled)
 try:
@@ -78,9 +101,33 @@ try:
     original_dummy_load_weights = DummyModelLoader.load_weights
 
     def patched_dummy_load_weights(self, model, model_config):
-        original_dummy_load_weights(self, model, model_config)
         if torch.cuda.is_available():
-            model.to("cuda")
+            # vLLM's FP8 / quantization paths capture `layer._load_device =
+            # torch.get_default_device()` at create_weights time, then later
+            # use it inside process_weights_after_loading to allocate the
+            # real (non-meta) weight. With our taint hooks active, that
+            # captured device can resolve to CPU even though vLLM wraps
+            # initialize_model in `with target_device:` — and a CPU weight
+            # then fails scaled_fp8_quant (CUDA-only). Pin it to cuda:0
+            # before dummy load so vLLM's per-layer materialize+quantize
+            # loop runs on CUDA (it frees the BF16 staging tensor after
+            # each layer, so this doesn't double-allocate).
+            cuda_dev = torch.device("cuda:0")
+            for module in model.modules():
+                if hasattr(module, "_load_device"):
+                    module._load_device = cuda_dev
+
+        original_dummy_load_weights(self, model, model_config)
+
+        if torch.cuda.is_available():
+            # Move CPU-placed dummy weights to CUDA (tainting sometimes
+            # leaves them on CPU). Leave meta tensors alone — vLLM's
+            # quantization init handles them in process_weights_after_loading.
+            def _convert(t):
+                if t.is_meta or t.device.type == "cuda":
+                    return t
+                return t.to("cuda")
+            model._apply(_convert)
 
     DummyModelLoader.load_weights = patched_dummy_load_weights
 except ImportError:
@@ -159,7 +206,7 @@ if __name__ == "__main__":
         except:
             pass
 
-        llm = LLM(
+        llm_kwargs = dict(
             model=args.model,
             tokenizer=args.tokenizer if args.tokenizer else args.model,
             dtype=args.dtype,
@@ -171,8 +218,14 @@ if __name__ == "__main__":
             max_model_len=max_model_len,
             trust_remote_code=True,
             max_num_batched_tokens=521,
-            max_num_seqs=263
+            max_num_seqs=263,
+            enable_return_routed_experts=True,
         )
+        if args.attention_backend == "FLASH_ATTN":
+            llm_kwargs["attention_config"] = {"flash_attn_version": args.flash_attn_version}
+        if args.quantization:
+            llm_kwargs["quantization"] = args.quantization
+        llm = LLM(**llm_kwargs)
 
         # Check weight shapes to verify sharding
         print(f"\n=== Checking weight shapes (should be divided by TP={FAKE_TP}) ===")
@@ -234,7 +287,25 @@ if __name__ == "__main__":
             record_shapes=True,
             on_trace_ready=dooly_trace_handler(args.trace_dir, args.model, args.tensor_parallel_size),
         ) as prof:
-            llm.generate([args.prompts] * args.batch_size, sampling_params=sampling_params)
+            tracer_request_outputs = llm.generate([args.prompts] * args.batch_size, sampling_params=sampling_params)
+
+        # Dump routed_experts dictated by enable_return_routed_experts=True so we
+        # can compare profile-time routing (dummy weights, dummy prompts) against
+        # streaming-time routing (dummy weights, real prompts) downstream.
+        try:
+            re_arrays = {}
+            for i, ro in enumerate(tracer_request_outputs):
+                re = getattr(ro, "routed_experts", None)
+                if re is not None:
+                    re_arrays[f"req_{i}"] = re
+            if re_arrays:
+                import numpy as _np
+                safe_model = args.model.replace("/", "_")
+                re_path = os.path.join(args.trace_dir, f"{safe_model}_{args.tensor_parallel_size}_routed_experts.npz")
+                _np.savez_compressed(re_path, **re_arrays)
+                print(f"[Tracer] Routed-experts dump: {re_path} ({len(re_arrays)} reqs)")
+        except Exception as _e:
+            print(f"[Tracer] Routed-experts dump failed: {_e}")
 
         print(f"[Tracer] Done tracing {args.model}, output saved to {args.trace_dir}")
 

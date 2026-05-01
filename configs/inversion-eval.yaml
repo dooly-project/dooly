@@ -9,8 +9,8 @@ pairs:
 
 # ----- output paths -----
 paths:
-  db_path:       /home/jkim38/dooly/profiler/database/rtx-sharegpt-eval.db
-  workspace_dir: /home/jkim38/dooly/profiler/workspaces/rtx-sharegpt-eval/
+  db_path:       /home/ubuntu/dooly/h100-workspace/database/h100-eval.db
+  workspace_dir: /home/ubuntu/dooly/h100-workspace/per-batch/
 
 # ----- sweep space passed to run-e2e (per-pair) -----
 sweep:
