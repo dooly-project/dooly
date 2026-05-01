@@ -581,7 +581,7 @@ class ModuleResolver:
                 pass
             
             def run_callable():
-                with torch.no_grad():
+                with torch.inference_mode():
                     has_named = any(
                         getattr(pi, 'arg_name', None) is not None
                         for pi in module.inputs
@@ -612,7 +612,7 @@ class ModuleResolver:
             def run_callable_with_context():
                 from vllm.config import set_current_vllm_config
                 from vllm.forward_context import set_forward_context
-                with torch.no_grad():
+                with torch.inference_mode():
                     # Same kwarg reconstruction as run_callable()
                     has_named = any(
                         getattr(pi, 'arg_name', None) is not None
