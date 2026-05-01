@@ -8,8 +8,9 @@ pairs:
   # H100 Experiments:
   # - [meta-llama/Llama-3.1-8B, FLASHINFER]
   # - [Qwen/Qwen3-32B, FLASHINFER]
+  - [Qwen/Qwen3-14B, FLASHINFER] # dense, bigger
   # - [mistralai/Mixtral-8x7B-Instruct-v0.1, FLASHINFER] # fp8 quantized moe
-  - [mistralai/Ministral-8B-Instruct-2410, FLASHINFER] # dense, interleaved heterogeneous 
+  # - [mistralai/Ministral-8B-Instruct-2410, FLASHINFER] # dense, interleaved heterogeneous 
 # ----- output paths -----
 paths:
   db_path:       /home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db
