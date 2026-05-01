@@ -1,17 +1,19 @@
 # ----- pairs to profile (priority over `models:` + `backends:` if both present) -----
 pairs:
-  - [meta-llama/Llama-3.1-8B, FLASHINFER]
-  # - [meta-llama/Llama-3.1-8B,             FLASH_ATTN]
-  # - [meta-llama/Llama-3.1-8B,             TRITON_ATTN]
-  - [Qwen/Qwen3-30B-A3B, FLASHINFER]
-  - [Qwen/Qwen3-32B, FLASHINFER]
-  # - [CohereLabs/c4ai-command-r7b-12-2024, FLASH_ATTN]
-  # - [CohereLabs/c4ai-command-r7b-12-2024, TRITON_ATTN]
-
+  # A100 Experiments:
+  # - [meta-llama/Llama-3.1-8B, FLASHINFER]
+  # - [Qwen/Qwen3-30B-A3B, FLASHINFER]
+  # - [Qwen/Qwen3-32B, FLASHINFER]
+  # - [CohereLabs/c4ai-command-r7b-12-2024, FLASHINFER]
+  # H100 Experiments:
+  # - [meta-llama/Llama-3.1-8B, FLASHINFER]
+  # - [Qwen/Qwen3-32B, FLASHINFER]
+  # - [mistralai/Mixtral-8x7B-Instruct-v0.1, FLASHINFER] # fp8 quantized moe
+  - [mistralai/Ministral-8B-Instruct-2410, FLASHINFER] # dense, interleaved heterogeneous 
 # ----- output paths -----
 paths:
-  db_path:       /home/jkim38/dooly/profiler/database/rtx-sharegpt-eval.db
-  workspace_dir: /home/jkim38/dooly/profiler/workspaces/rtx-sharegpt-eval/
+  db_path:       /home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db
+  workspace_dir: /home/ubuntu/dooly/h100-workspace/sharegpt/
 
 # ----- sweep space passed to run-e2e (per-pair) -----
 sweep:

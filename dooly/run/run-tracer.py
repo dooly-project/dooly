@@ -37,13 +37,9 @@ parser.add_argument("--prompts", type=str, default="Hello, how are you? I am fin
 parser.add_argument("--max-tokens", type=int, default=1, help="Max tokens to generate")
 parser.add_argument("--trace_dir", type=str, default="/home/jkim38/dooly/profiler/vllm_traces_tp", help="Directory to save trace")
 parser.add_argument("--gpu", type=int, default=0, help="GPU device index to use")
-# Accept either SGLang's native names ("flashinfer", "fa3", "fa4", "triton",
-# "torch_native", ...) or the legacy vLLM-style names (FLASHINFER, FLASH_ATTN,
-# TRITON_ATTN). Mapped below before passing to ServerArgs.
-parser.add_argument("--attention-backend", type=str, default="flashinfer",
-                    help="Attention backend. SGLang names: flashinfer, fa3, fa4, "
-                         "triton, torch_native. Legacy aliases: FLASHINFER, "
-                         "FLASH_ATTN (->fa3), TRITON_ATTN (->triton).")
+parser.add_argument("--attention-backend", type=str, default="fa3", help="Attention backend for SGLang. Accepts SGLang names like flashinfer/fa3/fa4/triton, plus legacy aliases like FLASHINFER/FLASH_ATTN/TRITON_ATTN.")
+parser.add_argument("--flash-attn-version", type=int, default=2, choices=[2, 3, 4], help="Only used when --attention-backend is a FlashAttention alias. Maps to SGLang fa3/fa4.")
+parser.add_argument("--quantization", type=str, default=None, choices=["fp8", "awq", "gptq"], help="Optional quantization scheme for SGLang dummy loading.")
 parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
 args = parser.parse_args()
 
@@ -52,12 +48,53 @@ import torch.profiler
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 os.environ["SGLANG_ENABLE_TORCH_INFERENCE_MODE"] = "1"
 
-_BACKEND_ALIASES = {
-    "FLASHINFER": "flashinfer",
-    "FLASH_ATTN": "fa3",
-    "TRITON_ATTN": "triton",
+_SGLANG_SUPPORTED_BACKENDS = {
+    "triton",
+    "torch_native",
+    "flex_attention",
+    "nsa",
+    "cutlass_mla",
+    "fa3",
+    "fa4",
+    "flashinfer",
+    "flashmla",
+    "trtllm_mla",
+    "trtllm_mha",
+    "dual_chunk_flash_attn",
+    "aiter",
+    "wave",
+    "intel_amx",
+    "ascend",
+    "intel_xpu",
 }
-sglang_attn_backend = _BACKEND_ALIASES.get(args.attention_backend, args.attention_backend)
+
+
+def _normalize_attention_backend(raw_backend: str, flash_attn_version: int) -> str:
+    normalized = raw_backend.strip()
+    upper = normalized.upper()
+    lower = normalized.lower()
+
+    if upper == "FLASHINFER":
+        return "flashinfer"
+    if upper == "TRITON_ATTN":
+        return "triton"
+    if upper == "FLASH_ATTN" or lower == "flash_attn":
+        return "fa4" if flash_attn_version == 4 else "fa3"
+
+    if lower in _SGLANG_SUPPORTED_BACKENDS:
+        return lower
+
+    raise ValueError(
+        f"Unsupported SGLang attention backend '{raw_backend}'. "
+        f"Use one of: {sorted(_SGLANG_SUPPORTED_BACKENDS)} "
+        "or legacy aliases FLASHINFER/FLASH_ATTN/TRITON_ATTN."
+    )
+
+
+sglang_attn_backend = _normalize_attention_backend(
+    args.attention_backend,
+    args.flash_attn_version,
+)
 print(f"[Tracer] SGLang attention_backend={sglang_attn_backend} "
       f"(from --attention-backend={args.attention_backend})")
 
@@ -93,20 +130,93 @@ patch_autoconfig()
 # patch_input_buffers()
 install_hooks()
 
-# # Patch DummyModelLoader to force CUDA move
-# # (dummy models are loaded into CPU for some reason when tainting is enabled)
-# try:
-#     from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
-#     original_dummy_load_weights = DummyModelLoader.load_weights
+# Patch torch.nn.Parameter.__new__ so that when constructed from a
+# TaintedTensor, the data is unwrapped to a plain torch.Tensor before
+# delegating. This preserves the Parameter subclass identity (e.g.
+# SGLang's parameter subclasses), which carries
+# attributes like `weight_loader` via @property — those are unreachable
+# if the resulting object is downgraded to a plain TaintedTensor by
+# Parameter.__new__'s alt-path (data.detach().requires_grad_(rg)).
+_original_parameter_new = torch.nn.Parameter.__new__
 
-#     def patched_dummy_load_weights(self, model, model_config):
-#         original_dummy_load_weights(self, model, model_config)
-#         if torch.cuda.is_available():
-#             model.to("cuda")
+def _patched_parameter_new(cls, data=None, requires_grad=True):
+    from dooly.taintracer.tensor import TaintedTensor
+    if isinstance(data, TaintedTensor):
+        # Unwrap: get the plain Tensor view of the same storage, so that
+        # type(data) is torch.Tensor and Parameter.__new__ takes the
+        # _make_subclass(cls, ...) path that actually returns `cls`.
+        with torch._C._DisableTorchDispatch():
+            data = torch.Tensor._make_subclass(torch.Tensor, data, False)
+    return _original_parameter_new(cls, data=data, requires_grad=requires_grad)
 
-#     DummyModelLoader.load_weights = patched_dummy_load_weights
-# except ImportError:
-#     print("[DebugPatch] Could not import DummyModelLoader")
+torch.nn.Parameter.__new__ = _patched_parameter_new
+
+# Patch SGLang's DummyModelLoader for taint-traced dummy loads.
+# The upstream SGLang dummy path initializes the model, runs quant-method
+# postprocessing, then fills weights with random values. Under taint hooks,
+# some modules can capture CPU as `_load_device`, which breaks CUDA-only
+# quant paths; and some dummy-initialized tensors can remain on CPU.
+try:
+    import sglang.srt.model_loader.loader as sglang_loader
+
+    DummyModelLoader = sglang_loader.DummyModelLoader
+    original_dummy_load_model = DummyModelLoader.load_model
+
+    def patched_dummy_load_model(self, *, model_config, device_config):
+        if sglang_loader.get_bool_env_var("SGL_CPU_QUANTIZATION"):
+            return sglang_loader.load_model_with_cpu_quantization(
+                self,
+                model_config=model_config,
+                device_config=device_config,
+            )
+
+        quant_config = sglang_loader._get_quantization_config(
+            model_config,
+            self.load_config,
+        )
+        target_device = torch.device(device_config.device)
+
+        with sglang_loader.set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = sglang_loader._initialize_model(
+                    model_config,
+                    self.load_config,
+                    quant_config,
+                )
+
+            if torch.cuda.is_available() and target_device.type == "cuda":
+                for module in model.modules():
+                    if hasattr(module, "_load_device"):
+                        module._load_device = target_device
+
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is None:
+                    continue
+                if (
+                    hasattr(module, "is_weights_quantized")
+                    and module.is_weights_quantized()
+                ):
+                    continue
+                quant_method.process_weights_after_loading(module)
+
+            sglang_loader.initialize_dummy_weights(model)
+
+            if torch.cuda.is_available() and target_device.type == "cuda":
+                def _convert(t):
+                    if t.is_meta or t.device == target_device:
+                        return t
+                    return t.to(target_device)
+
+                model._apply(_convert)
+
+            sglang_loader.post_load_weights(model, model_config)
+
+        return model.eval()
+
+    DummyModelLoader.load_model = patched_dummy_load_model
+except ImportError:
+    print("[DebugPatch] Could not import SGLang DummyModelLoader")
 
 # # Debug patch: Track num_tokens in _dummy_run
 # try:
@@ -183,9 +293,8 @@ if __name__ == "__main__":
     #         pass
 
         from dooly.taintracer.sglang_subprocess import (
-        tainted_run_scheduler_process, TaintedEngine
+            tainted_run_scheduler_process, TaintedEngine
         )
-        # from sglang import Engine
 
         # print(Engine.run_scheduler_process_func.__qualname__)
 
@@ -193,17 +302,25 @@ if __name__ == "__main__":
         os.environ["TORCH_TRACE_DIR"] = args.trace_dir
 
         prompts = [args.prompts] * 5
-        llm = TaintedEngine(
+        engine_kwargs = dict(
             model_path=args.model,
+            tokenizer_path=args.tokenizer if args.tokenizer else args.model,
+            dtype=args.dtype,
             attention_backend=sglang_attn_backend,
+            load_format="dummy",
+            trust_remote_code=True,
+            max_running_requests=263,
+            max_total_tokens=521,
+            context_length=max_model_len,
             enable_metrics=True,
             disable_cuda_graph=True,
             disable_piecewise_cuda_graph=True,
-            load_format="dummy",
             enable_tokenizer_batch_encode=True,
-            max_running_requests=263,
-            max_total_tokens=521,
         )
+        if args.quantization:
+            engine_kwargs["quantization"] = args.quantization
+
+        llm = TaintedEngine(**engine_kwargs)
         llm.start_profile(output_dir=args.trace_dir, activities=[
                 "CPU",
                 "GPU",
@@ -211,7 +328,6 @@ if __name__ == "__main__":
         sampling_params={"max_new_tokens": 0, "temperature": 0.0}
         outputs = llm.generate(prompt=prompts, sampling_params=sampling_params)
         llm.stop_profile()
-        print(f"output: {outputs}")
 
         # Sleep so children process dumping thread has time to write back to file
         time.sleep(5)

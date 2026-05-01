@@ -64,6 +64,13 @@ def parse_args() -> argparse.Namespace:
         default="./sglang_profile/per-model-profile.csv",
     )
     parser.add_argument("--attention-backend", default="flashinfer")
+    parser.add_argument("--flash-attn-version", type=int, default=2, choices=[2, 3, 4],
+                        help="Pin flash-attention version when --attention-backend=FLASH_ATTN. Without this, vLLM auto-picks FA3 on Hopper / FA4 on Blackwell.")
+    parser.add_argument("--quantization", type=str, default=None,
+                        choices=["fp8", "awq", "gptq"],
+                        help="Optional quantization scheme. 'fp8' requires Hopper+ (H100). "
+                             "Combined with load_format=dummy, vLLM initializes random "
+                             "quantized weights — no quantized checkpoint needed.")
     parser.add_argument("--workload-mode", default="vidur")
     parser.add_argument("--max-batch-size", type=int, default=5)
     parser.add_argument("--max-seq-len", type=int, default=128)
@@ -88,7 +95,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_model(model, dtype, attention_backend, max_seq_len, result_queue, gpu):
+def resolve_model(model, dtype, attention_backend, flash_attn_version, quantization, max_seq_len, result_queue, gpu):
     from dooly.profiler.importer import OpImporter
     from dooly.profiler.resolver import ModuleResolver
     from dooly.profiler.sglang_layer_profiler import SgLangLayerProfiler
@@ -111,6 +118,8 @@ def resolve_model(model, dtype, attention_backend, max_seq_len, result_queue, gp
         gpu_memory_utilization=0.9,
         max_model_len=max_model_len,
         attn_backend=attention_backend,
+        flash_attn_version=flash_attn_version,
+        quantization=quantization,
         gpu=gpu,
     )
     resolver = ModuleResolver(
@@ -214,7 +223,7 @@ def main() -> None:
 
     for i, model in enumerate(models):
         print(f"[RUNNER] Starting RESOLVER for {model.name}...")
-        p = mp.Process(target=resolve_model, args=(model, dtype, args.attention_backend, args.max_seq_len, result_queue, args.gpu))
+        p = mp.Process(target=resolve_model, args=(model, dtype, args.attention_backend, args.flash_attn_version, args.quantization, args.max_seq_len, result_queue, args.gpu))
         p.start()
         model.to_profile_resolved = result_queue.get()
         p.join()
@@ -244,6 +253,8 @@ def main() -> None:
         test_counts=args.test_counts,
         force_prefill_kernel=args.force_prefill_kernel,
         attention_backend=args.attention_backend,
+        flash_attn_version=args.flash_attn_version,
+        quantization=args.quantization,
         world_config={"tp": args.tp, "pp": 1},
         dtype=dtype,
         db_path=args.db_path,

@@ -4,9 +4,9 @@ import glob
 import argparse
 import subprocess
 
-os.environ["PATH"] = f"/usr/local/cuda-13.0/bin:{os.environ.get('PATH', '')}"
-os.environ["LD_LIBRARY_PATH"] = f"/usr/local/cuda-13.0/lib64:{os.path.join(sys.prefix, 'lib')}:{os.environ.get('LD_LIBRARY_PATH', '')}"
-os.environ["CUDA_HOME"] = "/usr/local/cuda-13.0/"
+os.environ["PATH"] = f"/usr/local/cuda-13.2/bin:{os.environ.get('PATH', '')}"
+os.environ["LD_LIBRARY_PATH"] = f"/usr/local/cuda-13.2/lib64:{os.path.join(sys.prefix, 'lib')}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+os.environ["CUDA_HOME"] = "/usr/local/cuda-13.2/"
 
 def model_to_dirname(model: str) -> str:
     """Convert model name to a safe directory name."""
@@ -25,7 +25,7 @@ _BACKEND_ALIASES = {
     "TRITON_ATTN": "triton",
 }
 
-def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attention_backend: str, tokenizer: str | None = None):
+def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attention_backend: str, tokenizer: str | None = None, quantization: str | None = None):
     """Run the tracer as a subprocess (required due to module-level patching)."""
     # SGLang tracer lives in a sibling directory: dooly/run-sglang/run-tracer.py
     tracer_script = os.path.join(
@@ -44,6 +44,8 @@ def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attent
     ]
     if tokenizer:
         cmd.extend(["--tokenizer", tokenizer])
+    if quantization:
+        cmd.extend(["--quantization", quantization])
     print(f"[E2E] Running tracer: {' '.join(cmd)}")
 
     result = subprocess.run(cmd, check=True)
@@ -51,7 +53,7 @@ def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attent
     return result.returncode == 0
 
 
-def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: str, dtype: str, attention_backend: str, max_batch_size: int, max_seq_len: int, gpu: int, db_path: str | None = None, profile_comm: bool = False):
+def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: str, dtype: str, attention_backend: str, max_batch_size: int, max_seq_len: int, gpu: int, db_path: str | None = None, profile_comm: bool = False, quantization: str | None = None):
     """Run the profiler as a subprocess."""
     profiler_script = os.path.join(os.path.dirname(__file__), "run-profiler.py")
     cmd = [
@@ -70,6 +72,8 @@ def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: 
         cmd.extend(["--db-path", db_path])
     if profile_comm:
         cmd.append("--profile-comm")
+    if quantization:
+        cmd.extend(["--quantization", quantization])
     print(f"[E2E] Running profiler: {' '.join(cmd)}")
     result = subprocess.run(cmd, check=True)
     return result.returncode == 0
@@ -94,6 +98,10 @@ def main():
     parser.add_argument("--db-path", type=str, default=None, help="Path to SQLite database for persistent storage and deduplication")
     parser.add_argument("--profile-comm", action="store_true",
                         help="Also profile collective operations (only meaningful when TP>1).")
+    parser.add_argument("--quantization", type=str, default=None, choices=["fp8", "awq", "gptq"],
+                        help="Optional quantization scheme. 'fp8' requires Hopper+ (H100). "
+                             "Combined with load_format=dummy, vLLM initializes random "
+                             "quantized weights — no quantized checkpoint needed.")
     args = parser.parse_args()
 
     workspace_path = args.workspace_dir
@@ -127,6 +135,7 @@ def main():
                     gpu=args.gpu,
                     attention_backend=sglang_attn_backend,
                     tokenizer=args.tokenizer,
+                    quantization=args.quantization,
                 )
 
         # Step 2: Collect trace files in order matching models list
@@ -158,6 +167,7 @@ def main():
             db_path=args.db_path,
             gpu=args.gpu,
             profile_comm=args.profile_comm,
+            quantization=args.quantization,
         )
 
     print("\n[E2E] Workflow complete!")
