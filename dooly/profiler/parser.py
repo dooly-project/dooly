@@ -562,7 +562,7 @@ class HierarchicalTraceParser:
             for launch_event in _launch_events:
                 parent_module = self._find_nearest_module(launch_event)
                 if (parent_module is None):
-                    print(f"[DEBUG] could not find module for cudaKernelLaunch {launch_event.correlation}. Skipping.")
+                    # print(f"[DEBUG] could not find module for cudaKernelLaunch {launch_event.correlation}. Skipping.")
                     continue
                 parent_module.correlation = launch_event.correlation
         self.build_tree_for_kernels()
@@ -614,6 +614,8 @@ class HierarchicalTraceParser:
         # For cpu_ops: "linear" from "aten::linear" or "_C::rms_norm"
         # For modules: "QKVParallelLinear_0" stays as is
         if event.cat == 'module':
+            if event.params is not None:
+                return [event]
             # Module names may have _N suffix (e.g., "QKVParallelLinear_0")
             # Strip the suffix to get the class name for matching
             event_base = event.name.rsplit('_', 1)[0] if '_' in event.name and event.name.rsplit('_', 1)[-1].isdigit() else event.name
@@ -634,14 +636,15 @@ class HierarchicalTraceParser:
             # Extract base name from taint
             # Handles: "API: linear", "aten::linear", "MODULE: QKVParallelLinear", "aten::index.Tensor"
             taint_name = taint.name
-            if taint_name.startswith("MODULE: "):
-                taint_base = taint_name.replace("MODULE: ", "")
-            elif taint_name.startswith("API: "):
+            if taint_name.startswith("API: "):
                 taint_base = taint_name.replace("API: ", "")
             elif taint_name.startswith("COMM: "):
                 taint_base = taint_name.replace("COMM: ", "")
             else:
                 taint_base = taint_name.split("::")[-1]
+
+            if event.ev_idx == 5094 and event.external_id == 5095:
+                print(f'[DEBUG @ find_associated_taints for event.ev_id 5094] Taint base: {taint_base}, event base: {event_base}')
 
             # 1. Exact base name match
             if taint_base == event_base:

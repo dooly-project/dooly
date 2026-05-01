@@ -137,8 +137,8 @@ class TraceParser:
 
         print("Extracting module to operation mapping...")
         operation_hierarchies: List[OperationHierarchy] = hierarchical_parser.extract_module_to_operation_mapping()
-        print(f"[DEBUG] operation hierarchies: {operation_hierarchies}")
 
+        
         print("Making module infos from operation hierarchies...")
         profile_metadata = profile_metadata or {}
         backend = profile_metadata.get("backend", "")
@@ -199,8 +199,7 @@ class TraceParser:
 
                 is_collective = True
 
-            else: 
-                    
+            else:
                 module_name = hierarchy.nearest_module_name   # root_module.name or "None" 
                 op_name = hierarchy.operation_name        # anchor.name
                 anchor_args = hierarchy.operation_args        # anchor.args
@@ -217,6 +216,8 @@ class TraceParser:
 
                 # Get taint string from hierarchy
                 matching_taint = hierarchy.get_taint_string()
+                if not shapes and matching_taint:
+                    shapes = hierarchy.anchor.get_dims_from_taint_string(matching_taint) or []
                 
                 
 

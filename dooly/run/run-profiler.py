@@ -20,7 +20,7 @@ _pre_parser.add_argument("--tp", type=int, default=1)
 _pre_parser.add_argument("--gpu", type=str, default="0,1,2,3")
 _pre_args, _ = _pre_parser.parse_known_args()
 os.environ["DOOLY_FAKE_TP"] = str(_pre_args.tp)
-os.environ["CUDA_VISIBLE_DEVICES"] = _pre_args.gpu
+# os.environ["CUDA_VISIBLE_DEVICES"] = str(_pre_args.gpu)
 
 import torch
 import multiprocessing as mp

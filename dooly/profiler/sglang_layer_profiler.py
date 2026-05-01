@@ -85,11 +85,11 @@ class SgLangLayerProfiler:
         self.dtype = dtype
         self.torch_dtype = getattr(torch, dtype)
 
-        # Set GPU visibility so vLLM initializes on the correct device.
-        # After CUDA_VISIBLE_DEVICES is set, the chosen GPU is remapped to
-        # index 0 within this process, so we always use cuda:0 locally.
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu
-        self.device = torch.device("cuda:0")
+        # Use the requested physical CUDA device instead of remapping it via
+        # CUDA_VISIBLE_DEVICES.
+        gpu_id = int(gpu)
+        torch.cuda.set_device(gpu_id)
+        self.device = torch.device(f"cuda:{gpu_id}")
 
         print(f"[SGLangLayerProfiler] Initializing SgLang with model: {model_name}")
 
@@ -122,7 +122,7 @@ class SgLangLayerProfiler:
         self.scheduler = Scheduler(
             server_args=server_args,
             port_args=port_args,
-            gpu_id=0,
+            gpu_id=gpu_id,
             tp_rank=0,
             moe_ep_rank=0,
             pp_rank=0,
