@@ -373,7 +373,7 @@ if __name__ == "__main__":
             }
             _out_path = _trace_path[:-3] if _is_gz else _trace_path
             with open(_out_path, "wt") as f:
-                _json.dump(_data, f)
+                _json.dump(_data, f, indent=2)
             if _is_gz and _out_path != _trace_path:
                 os.remove(_trace_path)
             print(f"[Tracer] Wrote trace + taint registry "
