@@ -86,10 +86,6 @@ def run_streaming_benchmark(
     # CPU/GPU timing data collection disabled - using timestamp instrumentation instead
     cpu_gpu_timing_data = []
 
-    # Per-request routed-experts capture (populated when LLM was constructed
-    # with enable_return_routed_experts=True). Shape per req: [seq_len, num_layers, topk].
-    routed_experts_per_req: dict = {}
-
     # Track first arrival time to normalize all times (like measure_vllm_direct.py does on line 142)
     first_request_arrival_time = None
 
@@ -441,10 +437,6 @@ def run_streaming_benchmark(
                 outputs.append(output)
                 completed_requests[req_id] = output
 
-                re_arr = getattr(request_output, "routed_experts", None)
-                if re_arr is not None:
-                    routed_experts_per_req[req_id] = re_arr
-
                 # Update progress bar
                 pbar.update(1)
                 pbar.set_postfix({
@@ -468,7 +460,7 @@ def run_streaming_benchmark(
     end_time = time.perf_counter()
     duration = end_time - start_time
 
-    return outputs, duration, step_batches, routed_experts_per_req
+    return outputs, duration, step_batches
 
 def main():
     parser = argparse.ArgumentParser(
@@ -653,7 +645,6 @@ def main():
             disable_log_stats=False,
             tensor_parallel_size=args.tp,
             attention_config=({"flash_attn_version": 2} if args.backend == 'FLASH_ATTN' else None),
-            enable_return_routed_experts=True,
             # Disable async scheduling to ensure each engine.step() synchronously
             # executes the batch it schedules (matching Dooly's behavior).
             async_scheduling=False,
@@ -804,7 +795,7 @@ def main():
 
     # Run streaming benchmark
     print("Running streaming benchmark...")
-    outputs, duration, step_batches, routed_experts_per_req = run_streaming_benchmark(
+    outputs, duration, step_batches = run_streaming_benchmark(
         llm=llm,
         warmup=2,
         requests=requests,
@@ -922,14 +913,6 @@ def main():
         json.dump(output_data, f, indent=2)
 
     print(f"\n✓ Results saved to {args.output}")
-
-    # Save routed-experts dump if any were captured.
-    # Stored as a single .npz: one array per req_id, shape [seq_len, num_layers, topk].
-    if routed_experts_per_req:
-        import numpy as np  # local import; numpy is already a transitive dep
-        re_path = args.output.rsplit('.', 1)[0] + '_routed_experts.npz'
-        np.savez_compressed(re_path, **{rid: arr for rid, arr in routed_experts_per_req.items()})
-        print(f"✓ Routed-experts dump saved to {re_path} ({len(routed_experts_per_req)} requests)")
 
     # Export batch composition to separate file if requested
     if args.batch_composition_output:

@@ -45,14 +45,15 @@ DEFAULT_CONFIGS: List[RunConfig] = [
         topology="mew1",
         db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
     ),
-    RunConfig(
-        model="Qwen/Qwen3-30B-A3B",
-        tp=1,
-        backend="FLASHINFER",
-        cache_dir="/home/ubuntu/dooly/h100-workspace/cache/Qwen/Qwen3-30B-A3B",
-        topology="mew1",
-        db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
-    ),
+    
+    # RunConfig(
+    #     model="Qwen/Qwen3-30B-A3B",
+    #     tp=1,
+    #     backend="FLASHINFER",
+    #     cache_dir="/home/ubuntu/dooly/h100-workspace/cache/Qwen/Qwen3-30B-A3B",
+    #     topology="mew1",
+    #     db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
+    # ),
     RunConfig(
         model="Qwen/Qwen3-32B",
         tp=1,
@@ -61,14 +62,14 @@ DEFAULT_CONFIGS: List[RunConfig] = [
         topology="mew1",
         db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
     ),
-    RunConfig(
-        model="CohereLabs/c4ai-command-r7b-12-2024",
-        tp=1,
-        backend="FLASHINFER",
-        cache_dir="/home/ubuntu/dooly/h100-workspace/cache/CohereLabs/c4ai-command-r7b-12-2024",
-        topology="mew1",
-        db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
-    ),
+    # RunConfig(
+    #     model="CohereLabs/c4ai-command-r7b-12-2024",
+    #     tp=1,
+    #     backend="FLASHINFER",
+    #     cache_dir="/home/ubuntu/dooly/h100-workspace/cache/CohereLabs/c4ai-command-r7b-12-2024",
+    #     topology="mew1",
+    #     db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
+    # ),
     RunConfig(
         model="mistralai/Mixtral-8x7B-Instruct-v0.1",
         tp=1,
