@@ -219,7 +219,6 @@ if __name__ == "__main__":
             trust_remote_code=True,
             max_num_batched_tokens=521,
             max_num_seqs=263,
-            enable_return_routed_experts=True,
         )
         if args.attention_backend == "FLASH_ATTN":
             llm_kwargs["attention_config"] = {"flash_attn_version": args.flash_attn_version}
@@ -287,25 +286,7 @@ if __name__ == "__main__":
             record_shapes=True,
             on_trace_ready=dooly_trace_handler(args.trace_dir, args.model, args.tensor_parallel_size),
         ) as prof:
-            tracer_request_outputs = llm.generate([args.prompts] * args.batch_size, sampling_params=sampling_params)
-
-        # Dump routed_experts dictated by enable_return_routed_experts=True so we
-        # can compare profile-time routing (dummy weights, dummy prompts) against
-        # streaming-time routing (dummy weights, real prompts) downstream.
-        try:
-            re_arrays = {}
-            for i, ro in enumerate(tracer_request_outputs):
-                re = getattr(ro, "routed_experts", None)
-                if re is not None:
-                    re_arrays[f"req_{i}"] = re
-            if re_arrays:
-                import numpy as _np
-                safe_model = args.model.replace("/", "_")
-                re_path = os.path.join(args.trace_dir, f"{safe_model}_{args.tensor_parallel_size}_routed_experts.npz")
-                _np.savez_compressed(re_path, **re_arrays)
-                print(f"[Tracer] Routed-experts dump: {re_path} ({len(re_arrays)} reqs)")
-        except Exception as _e:
-            print(f"[Tracer] Routed-experts dump failed: {_e}")
+            llm.generate([args.prompts] * args.batch_size, sampling_params=sampling_params)
 
         print(f"[Tracer] Done tracing {args.model}, output saved to {args.trace_dir}")
 
