@@ -521,11 +521,11 @@ def plot_chess(data: dict, axis_values_by_workload: dict, output_dir: Path,
                         fontweight="bold", clip_on=False)
 
         # Y-label only on left-most panel.
-        # if source == "measured":
-        #     ax.set_ylabel(
-        #         "Total Token Count",
-        #         fontsize=20, labelpad=1, fontweight="bold"
-        #     )
+        if source == "measured":
+            ax.set_ylabel(
+                "Total Token Count",
+                fontsize=20, labelpad=1, fontweight="bold"
+            )
 
     # Workload-section labels above the panels (centered across each
     # workload's group of panels).
@@ -578,7 +578,7 @@ def plot_chess(data: dict, axis_values_by_workload: dict, output_dir: Path,
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_pdf = output_dir / f"a100_{workloads[0]}_{source}.pdf"
+    out_pdf = output_dir / f"h100_{workloads[0]}_{source}.pdf"
     # out_png = output_dir / "inversion_heatmap_v2.png"
     fig.savefig(out_pdf, bbox_inches="tight", dpi=300)
     # fig.savefig(out_png, bbox_inches="tight", dpi=300)

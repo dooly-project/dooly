@@ -181,7 +181,8 @@ def run_vllm_direct(combo: Combo, batch_cfg: Path, out_dir: Path,
                     out_filename: str, python_exe: str,
                     max_model_len: int, max_num_seqs: int,
                     gpu_memory: float, warmup: int, iterations: int,
-                    cuda_visible_devices: str) -> dict | None:
+                    cuda_visible_devices: str,
+                    quantization: str | None = None) -> dict | None:
     """Invoke measure_vllm_direct (one process = one vLLM cold start) and
     load the resulting JSON.
 
@@ -205,6 +206,8 @@ def run_vllm_direct(combo: Combo, batch_cfg: Path, out_dir: Path,
         "--out-dir", str(out_dir),
         "--output", out_filename,
     ]
+    if quantization:
+        cmd.extend(["--quantization", quantization])
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     res = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(REPO))
@@ -297,6 +300,8 @@ def main() -> int:
                          "samples; each raw sample is also stored. (default: 3)")
     ap.add_argument("--buffer-tokens", type=int, default=256,
                     help="Added to each prefill length for max_model_len (vLLM needs prompt + at_least_1_output).")
+    ap.add_argument("--quantization", type=str, default=None, choices=["fp8", "awq", "gptq"],
+                    help="Optional quantization scheme passed through to vLLM. 'fp8' requires Hopper+.")
     args = ap.parse_args()
 
     db_path = os.path.abspath(args.db_path)
@@ -383,6 +388,7 @@ def main() -> int:
                         gpu_memory=args.gpu_memory,
                         warmup=args.warmup, iterations=args.iterations,
                         cuda_visible_devices=args.gpu,
+                        quantization=args.quantization,
                     )
                     if vllm_data is None:
                         print(f"  [run {run_idx + 1}/{args.num_runs}] FAILED")

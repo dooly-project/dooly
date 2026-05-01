@@ -11,14 +11,17 @@ from matplotlib.transforms import blended_transform_factory
 import argparse
 
 arg_parse = argparse.ArgumentParser()
+arg_parse.add_argument("--results-dir", type=Path, required=True)
 arg_parse.add_argument("--workload", type=str, default="decode", help="workload name for output file naming")
 arg_parse.add_argument("--split-per-model", action="store_true")
 arg_parse.add_argument("--no-title", action="store_true")
 args = arg_parse.parse_args()
 workload = args.workload
 
-HERE = Path(__file__).resolve().parent
-SUMMARY = HERE / f"{workload}_validation_summary.json"
+# HERE = Path(__file__).resolve().parent
+HERE = args.results_dir
+# SUMMARY = HERE / f"{workload}_validation_summary.json"
+SUMMARY = HERE / f"validation_summary.json"
 OUT_STEM        = HERE / f"{workload}_validation_bars"
 LEGEND_OUT_STEM = HERE / f"{workload}_validation_bars_legend"
 
@@ -39,6 +42,7 @@ MODEL_MAP = {
 GAP_BETWEEN_MODELS = 0.3  # x-units of empty space between the two model sections
 
 rows = json.loads(SUMMARY.read_text())
+rows = [row for row in rows if row["workload"] == workload]
 all_models = sorted({r["model"] for r in rows}, reverse=True)  # Llama first, then Cohere
 
 n_groups = len(LENGTHS)
@@ -131,7 +135,7 @@ def render(models_to_plot, out_stem, ylim_top=None):
     if not args.no_title:
         for j, model in enumerate(models_to_plot):
             center = j * section_stride + (n_groups - 1) / 2
-            ax.text(center, 0.8, MODEL_MAP.get(model, model),
+            ax.text(center, 1.02, MODEL_MAP.get(model, model),
                     ha="center", va="bottom", transform=trans,
                     fontsize=20, fontweight="bold")
 
@@ -147,7 +151,7 @@ def render(models_to_plot, out_stem, ylim_top=None):
     if ylim_top is not None:
         ax.set_ylim(top=ylim_top)
     else:
-        ax.set_ylim(top=ax.get_ylim()[1] * (1.0 if workload == "prefill" else 1.35))
+        ax.set_ylim(top=ax.get_ylim()[1] * (1.0 if workload == "prefill" else 1.75))
 
     # Trim left/right whitespace: hug the outer bars with a small margin
     EDGE_MARGIN_LEFT  = 0.1

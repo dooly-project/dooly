@@ -86,6 +86,10 @@ def run_streaming_benchmark(
     # CPU/GPU timing data collection disabled - using timestamp instrumentation instead
     cpu_gpu_timing_data = []
 
+    # Per-request routed-experts capture (populated when LLM was constructed
+    # with enable_return_routed_experts=True). Shape per req: [seq_len, num_layers, topk].
+    routed_experts_per_req: dict = {}
+
     # Track first arrival time to normalize all times (like measure_vllm_direct.py does on line 142)
     first_request_arrival_time = None
 
@@ -133,23 +137,20 @@ def run_streaming_benchmark(
         max_tokens=8,
         ignore_eos=True,
     )
-    # Sweep several prompt lengths at quantiles of the request distribution
-    # to seed Marlin MoE autotune at multiple isolated-request M values.
-    # Deduped so each M is warmed once; 5 lengths × ~8-token decode each
-    # adds a couple seconds at most and covers the common shapes the
-    # scheduler will later form under real arrival patterns.
+    # Warm every unique prompt length in the workload through an isolated
+    # engine.step() so Triton FP8 MoE autotune (cached exact-by-M) hits on
+    # every length the real streaming loop will later encounter. Quantile
+    # sampling missed near-by lengths (e.g. M=1232 vs warmup M=1295), so
+    # workload-driven exact coverage is the only robust option.
+    # Cost: ~50ms per unique length × ~N_unique lengths in dataset.
     _sorted_tokens = sorted((r[1] for r in requests), key=len)
-    _n = len(_sorted_tokens)
     _warmup_tokens_list = []
-    if _n > 0:
-        _seen_lens: set = set()
-        for q in (0.10, 0.30, 0.50, 0.70, 0.90):
-            idx = min(_n - 1, int(q * _n))
-            tokens = _sorted_tokens[idx]
-            if len(tokens) in _seen_lens:
-                continue
-            _seen_lens.add(len(tokens))
-            _warmup_tokens_list.append(tokens)
+    _seen_lens: set = set()
+    for tokens in _sorted_tokens:
+        if len(tokens) in _seen_lens:
+            continue
+        _seen_lens.add(len(tokens))
+        _warmup_tokens_list.append(tokens)
 
     print(
         f"Streaming-path warmup: {len(_warmup_tokens_list)} isolated-request "
@@ -328,21 +329,22 @@ def run_streaming_benchmark(
 
         # Record batch composition for this step (detailed)
         # IMPORTANT: Using scheduler.schedule() output for fair comparison with Dooly
-        step_batches.append({
-            "step_id": step_count,  # Match Dooly's field name
-            "sim_time_ms": elapsed_time * 1000.0,  # Convert to milliseconds
-            "elapsed_time_ms": step_duration * 1000.0,  # **Add actual step duration**
-            "batch_size": current_batch_size,
-            "scheduled_req_ids": sorted(scheduled_req_ids),
-            "num_scheduled_new": num_scheduled_new,
-            "num_scheduled_cached": num_scheduled_cached,
-            "total_tokens_scheduled": total_tokens_scheduled,
-            "free_blocks": free_blocks,
-            "waiting_count": len(scheduler.waiting),
-            "running_count": len(scheduler.running),
-            "finished_req_ids": finished_this_step,  # Will update after processing outputs
-            "preempted_req_ids": preempted_req_ids,
-        })
+        if total_tokens_scheduled > 0:
+            step_batches.append({
+                "step_id": step_count,  # Match Dooly's field name
+                "sim_time_ms": (step_end - start_time) * 1000.0,  # step end time, matches dooly_batch convention
+                "elapsed_time_ms": step_duration * 1000.0,  # **Add actual step duration**
+                "batch_size": current_batch_size,
+                "scheduled_req_ids": sorted(scheduled_req_ids),
+                "num_scheduled_new": num_scheduled_new,
+                "num_scheduled_cached": num_scheduled_cached,
+                "total_tokens_scheduled": total_tokens_scheduled,
+                "free_blocks": free_blocks,
+                "waiting_count": len(scheduler.waiting),
+                "running_count": len(scheduler.running),
+                "finished_req_ids": finished_this_step,  # Will update after processing outputs
+                "preempted_req_ids": preempted_req_ids,
+            })
 
         # CPU/GPU timing collection disabled - using timestamp instrumentation instead
         # cpu_gpu_timing_data.append({
@@ -439,6 +441,10 @@ def run_streaming_benchmark(
                 outputs.append(output)
                 completed_requests[req_id] = output
 
+                re_arr = getattr(request_output, "routed_experts", None)
+                if re_arr is not None:
+                    routed_experts_per_req[req_id] = re_arr
+
                 # Update progress bar
                 pbar.update(1)
                 pbar.set_postfix({
@@ -462,7 +468,7 @@ def run_streaming_benchmark(
     end_time = time.perf_counter()
     duration = end_time - start_time
 
-    return outputs, duration, step_batches
+    return outputs, duration, step_batches, routed_experts_per_req
 
 def main():
     parser = argparse.ArgumentParser(
@@ -516,6 +522,13 @@ def main():
                        help="GPU memory utilization")
     parser.add_argument("--enable-chunked-prefill", action="store_true",
                        help="Enable chunked prefill")
+    parser.add_argument("--moe-routing-sim", type=str, default="",
+                       choices=["", "uniform_random", "normal_routing"],
+                       help="If set, replaces real MoE routing with a simulator. "
+                            "Sets VLLM_MOE_ROUTING_SIMULATION_STRATEGY before LLM "
+                            "construction. 'uniform_random' matches the profiler's "
+                            "torch.randn router_logits regime (uniform expert load). "
+                            "Output text becomes invalid; latency measurements remain valid.")
 
     # Output options
     parser.add_argument("--output", type=str, default="vllm_streaming.json",
@@ -526,8 +539,21 @@ def main():
                        help="Export batch composition to separate JSON file")
     parser.add_argument("--verbose", action="store_true",
                        help="Verbose output")
+    parser.add_argument("--quantization", type=str, default=None,
+                       choices=["fp8", "awq", "gptq"],
+                       help="Optional quantization scheme. 'fp8' requires Hopper+. "
+                            "With load_format=dummy, vLLM initializes random quantized weights.")
 
     args = parser.parse_args()
+
+    # Apply MoE routing simulation BEFORE constructing LLM. vLLM reads this env
+    # var lazily at FusedMoE router construction (router_factory.py:93), which
+    # happens inside LLM(...). Setting it here is in time.
+    if args.moe_routing_sim:
+        os.environ["VLLM_MOE_ROUTING_SIMULATION_STRATEGY"] = args.moe_routing_sim
+        print(f"[moe-routing-sim] VLLM_MOE_ROUTING_SIMULATION_STRATEGY={args.moe_routing_sim} "
+              f"-- runtime routing replaced; output text will be invalid; latency is valid.",
+              flush=True)
 
     # Auto-generate output filenames based on dataset parameters if not explicitly provided
     if args.use_sharegpt:
@@ -613,7 +639,7 @@ def main():
     
     logging.getLogger("vllm.v1.metrics.loggers").setLevel(logging.CRITICAL)
 
-    llm = LLM(
+    llm_kwargs = dict(
             model=args.model,
             dtype="bfloat16",
             attention_backend=args.backend,
@@ -626,17 +652,15 @@ def main():
             load_format="dummy",
             disable_log_stats=False,
             tensor_parallel_size=args.tp,
-            # compilation_config=CompilationConfig(
-            #     mode=CompilationMode.NONE,
-            #     cudagraph_mode=CUDAGraphMode.FULL
-            # ),
+            attention_config=({"flash_attn_version": 2} if args.backend == 'FLASH_ATTN' else None),
+            enable_return_routed_experts=True,
             # Disable async scheduling to ensure each engine.step() synchronously
             # executes the batch it schedules (matching Dooly's behavior).
-            # Without this, TP>1 uses step_with_batch_queue() which pipelines
-            # scheduling and execution across steps, causing a one-step delay
-            # that inflates TTFT by ~one decode step.
             async_scheduling=False,
         )
+    if args.quantization:
+        llm_kwargs["quantization"] = args.quantization
+    llm = LLM(**llm_kwargs)
 
     # Load or generate requests
     if args.load_dataset:
@@ -780,7 +804,7 @@ def main():
 
     # Run streaming benchmark
     print("Running streaming benchmark...")
-    outputs, duration, step_batches = run_streaming_benchmark(
+    outputs, duration, step_batches, routed_experts_per_req = run_streaming_benchmark(
         llm=llm,
         warmup=2,
         requests=requests,
@@ -898,6 +922,14 @@ def main():
         json.dump(output_data, f, indent=2)
 
     print(f"\n✓ Results saved to {args.output}")
+
+    # Save routed-experts dump if any were captured.
+    # Stored as a single .npz: one array per req_id, shape [seq_len, num_layers, topk].
+    if routed_experts_per_req:
+        import numpy as np  # local import; numpy is already a transitive dep
+        re_path = args.output.rsplit('.', 1)[0] + '_routed_experts.npz'
+        np.savez_compressed(re_path, **{rid: arr for rid, arr in routed_experts_per_req.items()})
+        print(f"✓ Routed-experts dump saved to {re_path} ({len(routed_experts_per_req)} requests)")
 
     # Export batch composition to separate file if requested
     if args.batch_composition_output:

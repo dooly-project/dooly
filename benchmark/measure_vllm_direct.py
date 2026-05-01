@@ -205,8 +205,10 @@ def measure_batch_request(
         print(f"  Debug: Last output - start_time: {all_request_func_outputs[-1].start_time:.6f}s, latency: {all_request_func_outputs[-1].latency:.6f}s")
         print(f"  Debug: Benchmark duration: {benchmark_duration_s:.6f}s")
 
-    # Find the generated trace file
-    trace_files = sorted(Path(profile_dir).glob("rank*.pt.trace.json"))
+    # Find the generated trace file. vLLM ≥0.17 emits filenames like
+    # 'dp0_pp0_tp0_dcp0_ep0_rank0.<id>.pt.trace.json'; older versions used
+    # 'rank0.<id>.pt.trace.json'. Match both.
+    trace_files = sorted(Path(profile_dir).glob("*rank*.pt.trace.json"))
     gpu_times = {}
     trace_file_path = None
     if trace_files:
@@ -930,6 +932,8 @@ def main():
     parser.add_argument('--max-num-seqs', type=int, default=32,
                        help='Maximum number of sequences')
     parser.add_argument('--out-dir', type=str, default='./result/')
+    parser.add_argument('--quantization', type=str, default=None, choices=["fp8", "awq", "gptq"],
+                       help="Optional quantization scheme. 'fp8' requires Hopper+. With load_format=dummy, vLLM initializes random quantized weights.")
     args = parser.parse_args()
 
     print("=" * 80)
@@ -959,7 +963,7 @@ def main():
     backend = config.get('backend', args.attention_backend)
     tp = config.get('tensor_parallel_size', args.tensor_parallel_size)
 
-    llm = LLM(
+    llm_kwargs = dict(
         model=model,
         dtype="bfloat16",  # Ensure consistent dtype with Dooly
         attention_backend=backend,
@@ -971,6 +975,7 @@ def main():
         load_format="dummy",
         enforce_eager=False,
         enable_prefix_caching=False,
+        attention_config=({"flash_attn_version": 2} if args.attention_backend == 'FLASH_ATTN' else None),
         # compilation_config=CompilationConfig(
         #     mode=CompilationMode.NONE,
         #     cudagraph_mode=CUDAGraphMode.FULL
@@ -983,6 +988,9 @@ def main():
             'torch_profiler_record_shapes': True,
         },
     )
+    if args.quantization:
+        llm_kwargs["quantization"] = args.quantization
+    llm = LLM(**llm_kwargs)
 
     result = measure_batch_request(
         llm=llm,
