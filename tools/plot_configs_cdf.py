@@ -34,7 +34,7 @@ METRIC_NAMES = {
 
 # Batch-trace metrics: user-facing key -> (JSON field, y-axis label)
 BATCH_METRICS = {
-    'batch_size': ('batch_size', 'Scheduled Requests    '),
+    'batch_size': ('batch_size', 'Scheduled Requests     '),
     'running': ('running_count', 'Running requests'),
     'waiting': ('waiting_count', 'Waiting requests'),
     'tokens': ('total_tokens_scheduled', 'Tokens scheduled / step'),
@@ -153,7 +153,7 @@ def _draw_cdf_on_ax(
                 plotted_configs.append(config)
 
     metric_name = METRIC_NAMES.get(metric, metric.upper())
-    ax.set_xlabel(f'{metric_name} (s)', fontsize=22, fontweight='semibold')
+    ax.set_xlabel(f'{metric_name} (s)', fontsize=20, fontweight='semibold')
     ax.set_ylabel('CDF', fontsize=22, fontweight='semibold')
     ax.grid(True, alpha=0.25, linestyle='--', linewidth=1)
     ax.set_axisbelow(True)
@@ -170,14 +170,15 @@ def _draw_cdf_on_ax(
         p99_values = [
             row['p99'] for cfg in pcts.values() for row in cfg.values()
         ]
-        ax.set_xscale('log')
-        # Render tick labels as plain numbers (10, 100, 1000) instead of 10^n.
-        ax.xaxis.set_major_locator(LogLocator(base=10, numticks=10))
-        ax.xaxis.set_major_formatter(ScalarFormatter())
-        ax.xaxis.set_minor_formatter(plt.NullFormatter())
-        if p99_values:
-            # ax.set_xlim(left=0.005, right=max(p99_values) / 1000.0 * 1.1)
-            ax.set_xlim(left=0.005)
+    #     ax.set_xscale('log')
+    #     # Render tick labels as plain numbers (10, 100, 1000) instead of 10^n.
+    #     ax.xaxis.set_major_locator(LogLocator(base=10, numticks=10))
+    #     ax.xaxis.set_major_formatter(ScalarFormatter())
+    #     ax.xaxis.set_minor_formatter(plt.NullFormatter())
+    #     if p99_values:
+    #         # ax.set_xlim(left=0.005, right=max(p99_values) / 1000.0 * 1.1)
+        ax.set_xscale('function', functions=(np.sqrt, np.square)) 
+        ax.set_xlim(left=0.005, right=max(p99_values)/1000.0 * 2.5)
 
     for percentile in [0.5, 0.95, 0.99]:
         ax.axhline(y=percentile, color='gray', linestyle=':',
@@ -270,8 +271,8 @@ def _draw_batch_on_ax(
             if config not in plotted_configs:
                 plotted_configs.append(config)
 
-    ax.set_xlabel('Time Since First Dispatch (s)', fontsize=22, fontweight='semibold')
-    ax.set_ylabel(y_label, fontsize=18, fontweight='semibold')
+    ax.set_xlabel('Time Since First Dispatch (s)', fontsize=20, fontweight='semibold')
+    ax.set_ylabel(y_label, fontsize=16, fontweight='semibold')
     ax.grid(True, alpha=0.25, linestyle='--', linewidth=1)
     ax.set_axisbelow(True)
     ax.tick_params(axis='both', labelsize=22)

@@ -76,8 +76,24 @@ DEFAULT_CONFIGS: List[RunConfig] = [
         backend="FLASHINFER",
         cache_dir="/home/ubuntu/dooly/h100-workspace/cache/mistralai/Mixtral-8x7B-Instruct-v0.1",
         topology="mew1",
-        db_path="/home/ubuntu/dooly/test-quant.db",
+        db_path="/home/ubuntu/dooly/h100-workspace/database/test-quant.db",
         quantization="fp8",
+    ),
+    RunConfig(
+        model="mistralai/Ministral-8B-Instruct-2410",
+        tp=1,
+        backend="FLASHINFER",
+        cache_dir="/home/ubuntu/dooly/h100-workspace/cache/mistralai/Ministral-8B-Instruct-2410",
+        topology="mew1",
+        db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
+    ), 
+    RunConfig(
+        model="Qwen/Qwen3-14B",
+        tp=1,
+        backend="FLASHINFER",
+        cache_dir="/home/ubuntu/dooly/h100-workspace/cache/Qwen/Qwen3-14B/",
+        topology="mew1",
+        db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
     ),
 ]
 
