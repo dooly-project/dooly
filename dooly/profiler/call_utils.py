@@ -103,8 +103,11 @@ def prepare_module_call_args(
             continue
         if name in keywordable:
             assigned[name] = value
-        elif accepts_var_kwargs:
-            passthrough_kwargs[name] = value
+        # Deliberately do NOT fall through to accepts_var_kwargs: generic
+        # dispatchers like sglang's MultiPlatformOp.forward(*args, **kwargs)
+        # forward kwargs into a concrete backend method (e.g. forward_cuda)
+        # that doesn't accept forward_batch. Modules that genuinely consume
+        # forward_batch (LlamaAttention, RadixAttention) name it explicitly.
 
     for param in params:
         if param.name in assigned:

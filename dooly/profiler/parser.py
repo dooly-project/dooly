@@ -315,12 +315,11 @@ class HierarchicalTraceParser:
             if cpu_op.external_id is not None:
                 cpu_op_by_external_id[cpu_op.external_id].append(cpu_op)
 
-        modules_by_correlation: Dict[int, Event] = {}
-        for module in self.modules:
-            if module.correlation is not None:
-                assert module.correlation not in modules_by_correlation, \
-                    "Correlations should be a 1:1 mapping!"
-                modules_by_correlation[module.correlation] = module
+        # Use the launch->module map built in _parse_events; this contains
+        # every cudaLaunchKernel correlation, not just the last one per module.
+        modules_by_correlation: Dict[int, Event] = getattr(
+            self, "_correlation_to_module", {}
+        )
 
         for kernel in self.kernels:
             if kernel.external_id is None and kernel.correlation is None:
@@ -502,9 +501,10 @@ class HierarchicalTraceParser:
                 # GPU kernel
                 event_cat = 'kernel'
                 event_name = name
-            elif cat == 'cuda_runtime' and name == 'cudaLaunchKernel':
+            elif cat == 'cuda_runtime' and ('cudaLaunchKernel' in name):
                 event_cat = cat
                 event_name = name
+                print(f"[DEBUG!]{event_name}")
             else:
                 # Skip other event types (python_function, gpu_user_annotation, etc.)
                 continue
@@ -525,7 +525,7 @@ class HierarchicalTraceParser:
                 correlation=event_data.get('args').get('correlation')
             )
 
-            if cat == 'cuda_runtime' and name == 'cudaLaunchKernel':
+            if cat == 'cuda_runtime' and ('cudaLaunchKernel' in name):
                 _launch_events.append(event)
 
             self.events.append(event)
@@ -558,13 +558,20 @@ class HierarchicalTraceParser:
 
         # After parsing all, build the tree by filling in children and parent dict
         self.build_tree()
+        # Build correlation_id -> nearest module map from every cudaLaunchKernel.
+        # A module typically contains many launches; storing only one (as a
+        # single .correlation field on the module) loses the rest, so kernels
+        # without a cpu_op anchor (e.g. FlashInfer's prefill, which goes
+        # through a no-op @register_custom_op) get orphaned in
+        # build_tree_for_kernels. Map every launch's correlation to its nearest
+        # module so any orphan kernel can find its containing module.
+        self._correlation_to_module: Dict[int, Event] = {}
         if _launch_events:
             for launch_event in _launch_events:
                 parent_module = self._find_nearest_module(launch_event)
-                if (parent_module is None):
-                    # print(f"[DEBUG] could not find module for cudaKernelLaunch {launch_event.correlation}. Skipping.")
+                if parent_module is None or launch_event.correlation is None:
                     continue
-                parent_module.correlation = launch_event.correlation
+                self._correlation_to_module[launch_event.correlation] = parent_module
         self.build_tree_for_kernels()
 
         print("Finding taint association...")

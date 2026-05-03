@@ -14,6 +14,7 @@ from .tensor import TaintedTensor, TaintedParameter
 from .hooks import (
     install_hooks, uninstall_hooks,
     patch_int_in_modules, unpatch_int_in_modules,
+    patch_int_in_packages, unpatch_int_in_packages,
 )
 from .registry import TAINT_REGISTRY, register_taint, lookup_taint, clear_registry
 
@@ -49,6 +50,7 @@ __all__ = [
     'patch_autoconfig', 'unpatch_autoconfig',
     'patch_input_buffers', 'unpatch_input_buffers',
     'patch_int_in_modules', 'unpatch_int_in_modules',
+    'patch_int_in_packages', 'unpatch_int_in_packages',
     # Propagation (for advanced usage)
     'propagate_taints',
     # Registry

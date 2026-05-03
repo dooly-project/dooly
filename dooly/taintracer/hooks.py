@@ -3,6 +3,7 @@
 import copyreg
 import functools
 import importlib
+import sys
 import threading
 import dataclasses
 from typing import Optional, Tuple
@@ -15,6 +16,7 @@ from .tensor import TaintedTensor
 __all__ = [
     'install_hooks', 'uninstall_hooks',
     'patch_int_in_modules', 'unpatch_int_in_modules',
+    'patch_int_in_packages', 'unpatch_int_in_packages',
 ]
 
 # ---------------------------------------------------------------------------
@@ -321,7 +323,10 @@ def _extract_module_state_hash(module: "torch.nn.Module") -> str:
     #                  was called in one process but not the other
     #   quant_config, query_quant : late-bound infrastructure objects that
     #                  may be None in one context and non-None in another
-    _NON_CONFIG_ATTRS = frozenset({"training", "quant_config", "query_quant"})
+    #   layer_id   : positional index (e.g. SGLang RadixAttention.layer_id),
+    #                  identical kernels/shapes across layers — including it
+    #                  fragments the dedup into one signature per layer
+    _NON_CONFIG_ATTRS = frozenset({"training", "quant_config", "query_quant", "layer_id"})
 
     try:
         d = vars(module)
@@ -449,19 +454,45 @@ def unpatch_module_call():
 _real_int = int  # captured once at import time
 _patched_int_modules = {}
 
-def _preserving_int(x=0, /, *args, **kwargs):
-    """Drop-in replacement for int() that preserves TaintedInt."""
-    if isinstance(x, TaintedInt) and not args and not kwargs:
-        # print(f"[DEBUG @ _preserving_int] (TaintedInt) x: {x}, args: {args}, kwargs: {kwargs}")
-        return x
-    if isinstance(x, TaintedFloat) and not args and not kwargs:
-        # print(f"[DEBUG @ _preserving_int] (TaintedFloat) x: {x}, args: {args}, kwargs: {kwargs}")
-        output = TaintedInt(_real_int(x), x.taint)
-        # print(f"[DEBUG @ _preserving_int] (TaintedFloat) output: {output}, {output.taint}")
-        return output
 
-    # print(f"[DEBUG @ _preserving_int] (else) x: {x}, args: {args}, kwargs: {kwargs}")
-    return _real_int(x, *args, **kwargs)
+class _PreservingIntMeta(type):
+    """Metaclass for ``_PreservingInt``.
+
+    Two responsibilities:
+
+    * ``__instancecheck__`` / ``__subclasscheck__`` delegate to the real
+      ``int`` so callers that did ``isinstance(x, int)`` still work after
+      the module's ``int`` name has been rebound to ``_PreservingInt``.
+      Without this, SGLang's ``isinstance(value, int)`` raises
+      ``TypeError: isinstance() arg 2 must be a type, a tuple of types,
+      or a union`` — or silently returns False for plain ints.
+    * ``__call__`` short-circuits ``int(TaintedInt)`` so the taint is
+      preserved instead of getting stripped by ``int.__new__``.
+    """
+
+    def __instancecheck__(cls, instance):
+        return isinstance(instance, _real_int)
+
+    def __subclasscheck__(cls, subclass):
+        return issubclass(subclass, _real_int)
+
+    def __call__(cls, x=0, /, *args, **kwargs):
+        if not args and not kwargs:
+            if isinstance(x, TaintedInt):
+                return x
+            if isinstance(x, TaintedFloat):
+                return TaintedInt(_real_int(x), x.taint)
+        return _real_int(x, *args, **kwargs)
+
+
+class _PreservingInt(_real_int, metaclass=_PreservingIntMeta):
+    """Drop-in stand-in for the ``int`` builtin in patched module
+    namespaces. See ``_PreservingIntMeta`` for the behavior."""
+    pass
+
+
+# Back-compat alias: older code paths still reference ``_preserving_int``.
+_preserving_int = _PreservingInt
 
 
 def patch_int_in_modules(module_paths):
@@ -492,6 +523,95 @@ def unpatch_int_in_modules():
         except ModuleNotFoundError:
             pass
     _patched_int_modules.clear()
+
+
+# ---------------------------------------------------------------------------
+# Import hook: patch int() in any module loaded under given prefixes
+# ---------------------------------------------------------------------------
+
+_int_patch_prefixes: tuple = ()
+_seen_modules_for_int_patch: set = set()
+_original_builtin_import = None
+_in_sweep = False  # re-entrancy guard: the sweep itself triggers no imports,
+                   # but defensive — keeps us safe if any helper is changed
+                   # later to do a lazy import.
+
+
+def _sweep_and_patch_int():
+    """Walk sys.modules once; rebind `int` in any module whose name starts
+    with one of the registered prefixes. Each module is processed at most
+    once via _seen_modules_for_int_patch."""
+    global _in_sweep
+    if _in_sweep or not _int_patch_prefixes:
+        return
+    _in_sweep = True
+    try:
+        for name in list(sys.modules):
+            if name in _seen_modules_for_int_patch:
+                continue
+            _seen_modules_for_int_patch.add(name)
+            if not any(name.startswith(p) for p in _int_patch_prefixes):
+                continue
+            mod = sys.modules.get(name)
+            if mod is None:
+                continue
+            try:
+                _patched_int_modules[name] = getattr(mod, 'int', _real_int)
+                mod.int = _preserving_int
+            except (AttributeError, TypeError):
+                pass
+    finally:
+        _in_sweep = False
+
+
+def patch_int_in_packages(prefixes):
+    """Install an import hook that rebinds `int` to `_preserving_int` in any
+    module whose dotted name starts with one of the given prefixes.
+
+    Use this instead of :func:`patch_int_in_modules` when the target modules
+    are imported lazily (e.g. sglang's model classes are pulled in by the
+    model loader, not at scheduler boot). The hook fires on every subsequent
+    import; already-loaded modules are caught by the initial sweep.
+
+    Idempotent: calling repeatedly extends the prefix set without
+    reinstalling the import hook.
+    """
+    import builtins
+    global _int_patch_prefixes, _original_builtin_import
+
+    new_prefixes = tuple(prefixes)
+    _int_patch_prefixes = tuple(set(_int_patch_prefixes + new_prefixes))
+
+    if _original_builtin_import is None:
+        _original_builtin_import = builtins.__import__
+
+        def _hooked_import(name, globals=None, locals=None, fromlist=(), level=0):
+            mod = _original_builtin_import(name, globals, locals, fromlist, level)
+            # Skip the sweep while one is already running: the sweep does no
+            # imports itself, but Python's import machinery may import
+            # submodules transitively, and we don't want nested sweeps.
+            if not _in_sweep:
+                _sweep_and_patch_int()
+            return mod
+
+        _hooked_import._dooly_int_hooked = True
+        builtins.__import__ = _hooked_import
+
+    # Sweep already-loaded modules so callers can install prefixes after some
+    # of the matching modules are already in sys.modules.
+    _sweep_and_patch_int()
+
+
+def unpatch_int_in_packages():
+    """Remove the import hook and clear prefix state. Existing per-module
+    rebindings are reverted by :func:`unpatch_int_in_modules`."""
+    import builtins
+    global _int_patch_prefixes, _original_builtin_import
+    if _original_builtin_import is not None:
+        builtins.__import__ = _original_builtin_import
+        _original_builtin_import = None
+    _int_patch_prefixes = ()
+    _seen_modules_for_int_patch.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -2655,7 +2775,7 @@ def _wrap_einsum(original_fn):
 # Install / Uninstall
 # ---------------------------------------------------------------------------
 
-def install_hooks(int_patch_modules=()):
+def install_hooks(int_patch_modules=(), int_patch_prefixes=()):
     """Install hooks on tensor creation functions and enable profiler integration."""
     import os
 
@@ -2801,6 +2921,9 @@ def install_hooks(int_patch_modules=()):
 
     if int_patch_modules:
         patch_int_in_modules(int_patch_modules)
+
+    if int_patch_prefixes:
+        patch_int_in_packages(int_patch_prefixes)
 
     # Strip TaintedInt/TaintedFloat at Triton kernel launches (needed for
     # gpt-oss and other models that stash tainted scalars on backend impls).

@@ -41,7 +41,17 @@ SERVER_ARGS_TAINT_MAP = {
 
 }
 
+# Attributes to taint on ModelRunner. The KV cache pool reads
+# `model_runner.max_total_num_tokens` to size its buffers; without this patch
+# the value is a plain int and `KVCache.__init__`'s `self.size = size` breaks
+# the propagation chain, so torch.zeros((self.size + page_size, ...)) emits an
+# untainted tensor and store_cache sees `?(522)` on the K/V cache dim.
+MODEL_RUNNER_TAINT_MAP = {
+    'max_total_num_tokens': 'MAX_NUM_TOKS',
+}
+
 _original_server_args_getattribute = None
+_original_model_runner_getattribute = None
 _original_input_batch_num_reqs = None
 
 def patch_server_args(server_args):
@@ -83,8 +93,32 @@ def patch_server_args(server_args):
     except ImportError as e:
         print(f"[DEBUG @ patch_input_buffers] SchedulerConfig ImportError - {e}", flush=True)
 
+    # Patch ModelRunner so reads of max_total_num_tokens return a TaintedInt.
+    # The KV cache pool reads it from ModelRunner (not Scheduler), so without
+    # this patch the existing tensor factory hooks never see a tainted size and
+    # the K/V buffers come out untainted on dim 0.
+    try:
+        from sglang.srt.model_executor.model_runner import ModelRunner
+        global _original_model_runner_getattribute
+        if _original_model_runner_getattribute is None:
+            _original_model_runner_getattribute = ModelRunner.__getattribute__
+
+            def patched_model_runner_getattribute(self, name):
+                value = _original_model_runner_getattribute(self, name)
+                if name in MODEL_RUNNER_TAINT_MAP and isinstance(value, int) and not isinstance(value, TaintedInt):
+                    raw = int(value)
+                    taint_name = MODEL_RUNNER_TAINT_MAP[name]
+                    register_taint(raw, taint_name)
+                    return TaintedInt(raw, taint_name)
+                return value
+
+            ModelRunner.__getattribute__ = patched_model_runner_getattribute
+    except ImportError as e:
+        print(f"[DEBUG @ patch_input_buffers] ModelRunner ImportError - {e}", flush=True)
+
     # Patch SchedulerOutput to taint num_scheduled_tokens and total_num_scheduled_tokens
     try:
+        import torch
         from sglang.srt.managers.schedule_batch import ScheduleBatch
         # print("[DEBUG @ patch_input_buffers] Patching SchedulerOutput", flush=True)
 
@@ -102,6 +136,12 @@ def patch_server_args(server_args):
                 if isinstance(value, int) and not isinstance(value, TaintedInt):
                     register_taint(value, Taint('NUM_TOKS'))
                     return TaintedInt(value, 'NUM_TOKS')
+            # out_cache_loc is computed at runtime (torch.cat of allocator
+            # results); its length equals NUM_TOKS but it has no upstream
+            # tainted scalar to propagate from, so wrap on read.
+            if name == 'out_cache_loc':
+                if isinstance(value, torch.Tensor) and not isinstance(value, TaintedTensor):
+                    return TaintedTensor(value, [Taint('NUM_TOKS')])
             return value
 
         ScheduleBatch.__getattribute__ = patched_scheduler_output_getattribute
@@ -110,16 +150,24 @@ def patch_server_args(server_args):
                                                                                                                                                                                                 
         _original_init_new = ForwardBatch.init_new.__func__                                                                                                                                           
                                                                                                                                                                                                         
-        @classmethod                                              
+        @classmethod
         def patched_init_new(cls, batch, model_runner):
-            ret = _original_init_new(cls, batch, model_runner)                                                                                                                                        
+            ret = _original_init_new(cls, batch, model_runner)
             num_reqs = len(batch.seq_lens)
-            register_taint(num_reqs, Taint('NUM_REQS'))   
-            if not isinstance(ret.seq_lens, TaintedTensor):                                                                                                                                            
+            register_taint(num_reqs, Taint('NUM_REQS'))
+            if not isinstance(ret.seq_lens, TaintedTensor):
                 ret.seq_lens = TaintedTensor(ret.seq_lens, [Taint('NUM_REQS')])
-            if not isinstance(ret.positions, TaintedTensor):                                                                                                                         
-                ret.positions = TaintedTensor(ret.positions, [Taint('NUM_REQS')])                                                                                                
-            return ret                                                                                                                                                                           
+            if not isinstance(ret.positions, TaintedTensor):
+                ret.positions = TaintedTensor(ret.positions, [Taint('NUM_REQS')])
+            # input_ids is the model's entry-point tensor; its length equals
+            # the number of scheduled tokens this step. Without this wrap,
+            # VocabParallelEmbedding / LlamaModel see [?(N)] on their input.
+            if (isinstance(ret.input_ids, torch.Tensor)
+                    and not isinstance(ret.input_ids, TaintedTensor)):
+                num_toks = ret.input_ids.shape[0]
+                register_taint(int(num_toks), Taint('NUM_TOKS'))
+                ret.input_ids = TaintedTensor(ret.input_ids, [Taint('NUM_TOKS')])
+            return ret
         
         ForwardBatch.init_new = patched_init_new  
 
@@ -159,9 +207,15 @@ def tainted_run_scheduler_process(
     # 2. Re-install tensor factory hooks, custom-op hooks, and int()
     #    patches for the rotary-embedding layer.
     # ------------------------------------------------------------------
+    # Rebind `int` -> _preserving_int in every module under sglang.srt.* via
+    # an import hook. SGLang's model files (sglang.srt.models.*) and rope
+    # submodules (sglang.srt.layers.rotary_embedding.*) are imported lazily
+    # by the model loader, so a static list misses anything not pre-listed.
+    # The prefix hook fires on each import and catches whatever gets pulled
+    # in, model-agnostically.
     install_hooks(
-        int_patch_modules=[
-            "sglang.srt.layers.rotary_embedding",
+        int_patch_prefixes=[
+            "sglang.srt.",
         ]
     )
 

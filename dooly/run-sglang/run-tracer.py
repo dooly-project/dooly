@@ -35,7 +35,7 @@ parser.add_argument("--tp", "--tensor_parallel_size", type=int, default=1, dest=
 parser.add_argument("--dtype", type=str, default="bfloat16", help="Model dtype")
 parser.add_argument("--prompts", type=str, default="Hello, how are you? I am fine, and ", help="Prompt to run")
 parser.add_argument("--max-tokens", type=int, default=1, help="Max tokens to generate")
-parser.add_argument("--trace_dir", type=str, default="/home/jkim38/profiler/vllm_traces_tp", help="Directory to save trace")
+parser.add_argument("--trace_dir", type=str, default="/home/jkim38/dooly/profiler/vllm_traces_tp", help="Directory to save trace")
 parser.add_argument("--gpu", type=int, default=0, help="GPU device index to use")
 parser.add_argument("--attention-backend", type=str, default="FLASHINFER", help="Attention backend (FLASHINFER, FLASH_ATTN, XFORMERS)")
 parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
@@ -179,13 +179,13 @@ if __name__ == "__main__":
         # Set TORCH_TRACE_DIR for sglang_subprocess.py to pick up inside the spawned process.
         os.environ["TORCH_TRACE_DIR"] = args.trace_dir
 
-        prompts = [args.prompts] * 16
+        prompts = [args.prompts] * 5
         llm = TaintedEngine(model_path=args.model, enable_metrics=True, disable_cuda_graph=True, disable_piecewise_cuda_graph=True, load_format="dummy", enable_tokenizer_batch_encode=True,  max_running_requests=263, max_total_tokens=521)
         llm.start_profile(output_dir=args.trace_dir, activities=[
                 "CPU",
                 "GPU",
             ], with_stack=False, record_shapes=True, )
-        sampling_params={"max_new_tokens": 1, "temperature": 0.0}
+        sampling_params={"max_new_tokens": 0, "temperature": 0.0}
         outputs = llm.generate(prompt=prompts, sampling_params=sampling_params)
         llm.stop_profile()
         print(f"output: {outputs}")
@@ -219,17 +219,19 @@ if __name__ == "__main__":
         if _trace_candidates:
             _trace_path = _trace_candidates[-1]
             _is_gz = _trace_path.endswith(".gz")
-            _opener = _gzip.open if _is_gz else open
-            with _opener(_trace_path, "rt") as f:
+            with (_gzip.open(_trace_path, "rt") if _is_gz else open(_trace_path, "rt")) as f:
                 _data = _json.load(f)
             _data["dooly_taint_registry"] = {
                 str(v): str(t) for v, t in TAINT_REGISTRY.items()
                 if not isinstance(t, dict)
             }
-            with _opener(_trace_path, "wt") as f:
+            _out_path = _trace_path[:-3] if _is_gz else _trace_path
+            with open(_out_path, "wt") as f:
                 _json.dump(_data, f)
+            if _is_gz and _out_path != _trace_path:
+                os.remove(_trace_path)
             print(f"[Tracer] Wrote trace + taint registry "
-                  f"({len(_data['dooly_taint_registry'])} entries) to {_trace_path}")
+                  f"({len(_data['dooly_taint_registry'])} entries) to {_out_path}")
         else:
             print(f"[Tracer] WARNING: no trace file found in {args.trace_dir}")
 
