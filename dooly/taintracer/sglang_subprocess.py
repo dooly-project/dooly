@@ -246,7 +246,7 @@ def tainted_run_scheduler_process(
     # 4. Delegate to the real scheduler wrapped in torch profiler so that
     #    GPU kernels (running in this subprocess) are captured in the trace.
     # ------------------------------------------------------------------
-    # install_hooks()
+    install_hooks()
 
     try:
         return run_scheduler_process(

@@ -75,12 +75,13 @@ if "TAINT_REGISTRY_DUMP_BASE" not in os.environ:
 patch_autoconfig()
 # patch_common_attention_metadata()
 # patch_input_buffers()
-install_hooks(int_patch_modules=[
-    "sglang.multimodal_gen.runtime.models.encoders.llama",
-    "sglang.srt.models.llama",
-    "sglang.srt.layers.rotary_embedding.base",
-    "sglang.srt.layers.rotary_embedding.factory",
-])
+# install_hooks(int_patch_modules=[
+#     "sglang.multimodal_gen.runtime.models.encoders.llama",
+#     "sglang.srt.models.llama",
+#     "sglang.srt.layers.rotary_embedding.base",
+#     "sglang.srt.layers.rotary_embedding.factory",
+# ])
+install_hooks()
 
 # # Patch DummyModelLoader to force CUDA move
 # # (dummy models are loaded into CPU for some reason when tainting is enabled)
