@@ -4,7 +4,7 @@ Trace loading and parsing utilities for vLLM profiler traces.
 
 import json
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from .module import ModuleInfo
 from .parser import HierarchicalTraceParser, OperationHierarchy
@@ -37,18 +37,6 @@ class TraceLoader:
         }
 
     @staticmethod
-    def get_taint_registry(trace_data: Dict[str, Any]) -> Dict[int, str]:
-        """Extract the trace-time taint registry snapshot if present."""
-        raw = trace_data.get("dooly_taint_registry", {}) or {}
-        out: Dict[int, str] = {}
-        for v, t in raw.items():
-            try:
-                out[int(v)] = str(t)
-            except (TypeError, ValueError):
-                continue
-        return out
-
-    @staticmethod
     def save_to_json(data: Any, json_path: str) -> None:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -57,7 +45,6 @@ class TraceLoader:
 class TraceParser:
     def __init__(self, loader: Optional[TraceLoader] = None) -> None:
         self.loader = loader or TraceLoader()
-        self.taint_registry: Dict[int, str] = {}
 
     def parse_trace(
         self,
@@ -74,12 +61,6 @@ class TraceParser:
             return []
 
         trace_events = self.loader.get_trace_events(trace_data)
-        self.taint_registry = self.loader.get_taint_registry(trace_data)
-        if self.taint_registry:
-            print(f"[TraceParser] Loaded taint_registry ({len(self.taint_registry)} entries) from trace")
-        else:
-            print(f"[TraceParser] No dooly_taint_registry key in trace (older format); "
-                  f"resolver will fall back to tensor-axis heuristics")
 
         profile_metadata = {}
         module_infos = self.extract_module_infos(
@@ -137,18 +118,6 @@ class TraceParser:
         dtype = profile_metadata.get("dtype", "bfloat16")
 
 
-        from collections import Counter as _TCounter
-        _drops = _TCounter()
-        _drop_by_op = {
-            "no_taint": _TCounter(),
-            "no_inputs": _TCounter(),
-            "taint_extract_failed": _TCounter(),
-            "comm_no_params": _TCounter(),
-            "comm_no_dims": _TCounter(),
-            "comm_empty_inputs": _TCounter(),
-        }
-        _accepted_by_op = _TCounter()
-
         for hierarchy in operation_hierarchies:
             
             module_name, op_name, inputs, is_module, is_collective = "", "", [], False, False
@@ -159,15 +128,11 @@ class TraceParser:
                 op_name = comm_event.name 
 
                 if not comm_event.params:
-                    _drops["comm_no_params"] += 1
-                    _drop_by_op["comm_no_params"][op_name] += 1
                     continue
 
                 # Parse dims from comm event's taint string
                 dims_lists = comm_event.get_dims_from_taint_string(comm_event.params)
                 if not dims_lists:
-                    _drops["comm_no_dims"] += 1
-                    _drop_by_op["comm_no_dims"][op_name] += 1
                     continue
 
                 # Extract inputs
@@ -183,8 +148,6 @@ class TraceParser:
                     continue
 
                 if not inputs:
-                    _drops["comm_empty_inputs"] += 1
-                    _drop_by_op["comm_empty_inputs"][op_name] += 1
                     continue
                 
                 is_collective = True
@@ -207,19 +170,16 @@ class TraceParser:
 
                 # Get taint string from hierarchy
                 matching_taint = hierarchy.get_taint_string()
-                if not shapes and matching_taint:
-                    shapes = hierarchy.anchor.get_dims_from_taint_string(matching_taint) or []
                 
                 
 
                 # Debug module anchors with comm ops (to understand why input extraction fails)
                 if hierarchy.comm_ops:
                     first_comm = hierarchy.comm_ops[0]
-                    print(f"[DEBUG] Module {op_name} has comm: {first_comm.name}, module_taint={matching_taint[:50] if matching_taint else None}, shapes={shapes[:2] if shapes else []}")
+                    print(f"[DEBUG] Module {anchor_name} has comm: {first_comm.name}, module_taint={matching_taint[:50] if matching_taint else None}, shapes={shapes[:2] if shapes else []}")
 
                 if matching_taint is None:
-                    _drops["no_taint"] += 1
-                    _drop_by_op["no_taint"][op_name] += 1
+                    print(f"⚠ No taint for {anchor_name}, skipping")
                     continue
 
                 # Try taint-based extraction
@@ -233,22 +193,16 @@ class TraceParser:
                             concrete_inputs=concrete_inputs
                         )
                     except Exception as e:
-                        print(f"⚠ Taint-based extraction failed for {op_name}: {e}")
-                        _drops["taint_extract_failed"] += 1
-                        _drop_by_op["taint_extract_failed"][op_name] += 1
+                        print(f"⚠ Taint-based extraction failed for {anchor_name}: {e}")
                         inputs = []
 
                 # Skip if no inputs extracted
                 if not inputs:
                     if not hierarchy.comm_ops:
-                        _drops["no_inputs"] += 1
-                        _drop_by_op["no_inputs"][op_name] += 1
+                        print(f"⚠ No inputs extracted for {anchor_name}, skipping")
                     continue
 
-            state_hash = ""
-            if is_module:
-                state_hash = (hierarchy.operation_args or {}).get("state_hash", "") or ""
-
+            # Create ModuleInfo with hierarchy reference for full ancestry navigation
             info = ModuleInfo(
                 module_name=module_name,
                 operation_name=op_name,
@@ -258,28 +212,12 @@ class TraceParser:
                 is_module=is_module,
                 is_collective_op=is_collective,
                 hierarchy=hierarchy,
-                state_hash=state_hash,
             )
 
             # Add module_info to anchor event
             hierarchy.anchor.module_info = info
-            _accepted_by_op[op_name] += 1
 
             module_infos.append(info)
-
-        print(f"[DEBUG-TRACE] total_hierarchies={len(operation_hierarchies)}  "
-              f"accepted={sum(_accepted_by_op.values())}  "
-              f"drops_total={sum(_drops.values())}")
-        print(f"[DEBUG-TRACE] drops by reason: {dict(_drops)}")
-        print(f"[DEBUG-TRACE] accepted by op (top 12):")
-        for n, c in _accepted_by_op.most_common(12):
-            print(f"    {c:5d}  {n}")
-        for reason, tally in _drop_by_op.items():
-            if not tally:
-                continue
-            print(f"[DEBUG-TRACE] dropped ({reason}) top 12:")
-            for n, c in tally.most_common(12):
-                print(f"    {c:5d}  {n}")
 
         # print(f"Processed {comm_count} communication operations")
         print(f"Deduplicating module infos...")
@@ -397,33 +335,18 @@ class TraceParser:
             model_params_list = info._semantic_params_list()
             model_params_tuple = tuple(sorted(model_params_list[0].items())) if model_params_list else ()
 
-            kernel_tuple = tuple(sorted({k.name for k in info.kernels if k.name}))
-            nearest_module = info.hierarchy.nearest_module if info.hierarchy else None
-            module_kernel_tuple: Tuple[str, ...] = ()
-            if nearest_module is not None:
-                module_kernel_tuple = tuple(sorted(
-                    getattr(nearest_module, 'descendant_kernels', frozenset())
-                ))
-
-            signature = (
-                base_name,
-                info.operation_name,
-                model_params_tuple,
-                kernel_tuple,
-                module_kernel_tuple if info.is_module else (),
-                info.state_hash if info.is_module else "",
-            )
+            signature = (base_name, info.operation_name, model_params_tuple)
 
             # dictionary of lists that group module infos by signature
             groups[signature].append(info)
 
         deduplicated: List[ModuleInfo] = []
-        for (base_name, _op_name, _model_params_tuple, _kernel_tuple, _module_kernel_tuple, _state_hash), infos in groups.items():
+        for (base_name, _op_name, _model_params_tuple), infos in groups.items():
             # use the first info as template since all have same signature
             template = infos[0]
             count = len(infos)
             
-            print(f"[DEBUG] Deduplicating {count} modules with signature: {base_name}, operation: {template.operation_name}, model_params: {_model_params_tuple}, kernels: {_kernel_tuple}, module_kernels: {_module_kernel_tuple}")
+            print(f"[DEBUG] Deduplicating {count} modules with signature: {base_name}, operation: {template.operation_name}, model_params: {_model_params_tuple}")
 
             dedup_info = ModuleInfo(
                 module_name=base_name,
@@ -435,7 +358,6 @@ class TraceParser:
                 call_chain=template.call_chain,
                 hierarchy=template.hierarchy,
                 is_collective_op=template.is_collective_op,
-                state_hash=template.state_hash,
                 count = count,  # track how many were deduplicated into this one
             )
 

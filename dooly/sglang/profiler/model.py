@@ -6,6 +6,7 @@ from dooly.sglang.profiler.module import ModuleInfo, ModuleComparator
 from dooly.sglang.profiler.trace import TraceParser
 from sglang.srt.utils.hf_transformers_utils import get_config
 
+
 class ModelInfo:
     def __init__(
         self,
@@ -13,13 +14,11 @@ class ModelInfo:
         trace_dir: str,
         dtype: torch.dtype
     ):
-        # load model configuration
         self.config = get_config(name, trust_remote_code=True)
         self.name = name
         self.dtype = dtype
         self.model_family = self.get_model_family()
 
-        # model config values
         self.vocab_size = self.get_vocab_size()
         self.hidden_size = self.get_hidden_size()
         self.num_layers = self.get_num_layers()
@@ -27,60 +26,56 @@ class ModelInfo:
         self.max_model_len = self.get_max_model_len()
         self.num_kv_heads, self.head_dim = self.get_kv_params()
 
-        # Only validate for transformer models with attention
         if self.head_dim is not None and self.num_heads is not None:
             assert self.head_dim * self.num_heads == self.hidden_size, f"head_dim * num_heads != hidden_size for {self.name}"
-        
+
         parser = TraceParser()
         self.all_ops: List[ModuleInfo] = parser.parse_trace(
             trace_path=trace_dir,
             verbose=False,
             metadata_path=None
         )
-        # Preserve the tracer-time taint registry so the resolver can do
-        # inverse lookups (e.g. which value carries NUM_REQS?) without having
-        # to rescan the trace file.
         self.taint_registry = getattr(parser, 'taint_registry', {}) or {}
 
         self.used_ops: List[ModuleInfo] = [op for op in self.all_ops if not op.is_collective_op]
         self.collective_ops: List[ModuleInfo] = [op for op in self.all_ops if op.is_collective_op]
         self.to_profile: List[ModuleInfo] = self.used_ops
-        
-        self.all_resolved_ops: List[Tuple[ModuleInfo, Callable, str, str]] = []  # All ops with signatures
+
+        self.all_resolved_ops: List[Tuple[ModuleInfo, Callable, str, str]] = []
         self.to_profile_resolved: List[Tuple[ModuleInfo, Callable]] = []
-        
+
     def compare_with_many(self, models: List['ModelInfo'], db_path: Optional[str] = None, overwrite=False) -> None:
         all_models = list(models)
         if self not in all_models:
             all_models.insert(0, self)
 
         comparator = ModuleComparator()
-        # list of model names
         model_names = [model.name for model in all_models]
-        # list of [list of (ModuleInfo, Callable)]
         model_modules = [model.to_profile_resolved for model in all_models]
-        pruned, all_ops = comparator.prune_overlaps(model_modules, model_names, db_path=db_path, overwrite=overwrite)
+        pruned, all_ops = comparator.prune_overlaps(
+            model_modules,
+            model_names,
+            db_path=db_path,
+            overwrite=overwrite,
+        )
 
-        # update all models
         for model in all_models:
-            # to_profile_resolved: operations that need profiling
             model.to_profile_resolved = pruned.get(model.name, [])
             model.to_profile = [module for module, _, _, _ in model.to_profile_resolved]
-            # all_resolved_ops: ALL operations with signatures (for model_operations table)
             model.all_resolved_ops = all_ops.get(model.name, [])
 
-
-    # common values across model configs
     def get_model_family(self) -> str:
-        """Get model family from config's model_type attribute."""
         return getattr(self.config, "model_type", "unknown")
 
     def get_hidden_size(self) -> int:
         return getattr(self.config, "hidden_size", None)
+
     def get_num_heads(self) -> int:
         return getattr(self.config, "num_attention_heads", None)
+
     def get_vocab_size(self) -> int:
         return getattr(self.config, "vocab_size", None)
+
     def get_num_layers(self) -> int:
         return getattr(self.config, "num_hidden_layers", None)
 
@@ -98,7 +93,6 @@ class ModelInfo:
         return None
 
     def get_kv_params(self) -> Tuple[Optional[int], Optional[int]]:
-        # SSM models (Mamba) don't have attention heads
         if self.num_heads is None:
             return None, None
         return self._extract_kv_params(self.config)
@@ -110,7 +104,6 @@ class ModelInfo:
         if num_kv_heads is None:
             num_kv_heads = self.num_heads
         head_dim = self.hidden_size // self.num_heads
-
         return num_kv_heads, head_dim
 
     def get_max_num_blocks(
@@ -148,9 +141,8 @@ class ModelInfo:
             num_layers // world_config["pp"][0]
         )
         return int((torch.cuda.mem_get_info()[1] * gpu_memory_utilization) / block_memory_total)
-    
-    # save a json file with Dict[(model_name), (List[Dict[(module_name), (operation_name), (params)]])]
-    def to_json(self, models: List['ModelInfo'], json_output: str) -> Dict[str, List[Dict[str, Any]]]: 
+
+    def to_json(self, models: List['ModelInfo'], json_output: str) -> Dict[str, List[Dict[str, Any]]]:
         print(f"Outputting profiling results to {json_output}")
         all_models = list(models)
         if self not in all_models:
@@ -166,5 +158,5 @@ class ModelInfo:
 
         with open(json_output, 'w') as f:
             json.dump(output_data, f, indent=4)
-        
+
         return output_data

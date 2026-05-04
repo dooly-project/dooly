@@ -77,7 +77,6 @@ class Event:
     pid: Optional[int] = None           # Process ID
     tid: Optional[int] = None           # Thread ID
     module_info = None                  # Module info retrieval handle
-    correlation: Optional[int] = None   # CUDA launch correlation id
 
     # Hierarchy
     children: Dict[int, 'Event'] = field(default_factory=dict, repr=False)
@@ -262,7 +261,7 @@ class HierarchicalTraceParser:
             # We only stack CPU-side events (modules, ops, comm)
             # Taints are excluded as per user request
             # Kernels are on GPU/different thread, handled separately
-            if event.cat in ('module', 'cpu_op', 'comm', 'cuda_runtime'):
+            if event.cat in ('module', 'cpu_op', 'comm'):
             # if event.cat in ('module', 'cpu_op'):
                 # Use a combined key for pid/tid
                 key = (event.pid, event.tid)
@@ -297,46 +296,36 @@ class HierarchicalTraceParser:
                 # Push this event as potential parent
                 stack.append(event)
 
-        print("Building CPU event tree complete.")
-
-    def build_tree_for_kernels(self, enable_pruning: bool = True):
-        """Link GPU kernels to CPU/module launch sites after CPU tree exists."""
-        print("Linking kernels into event tree...")
-
+        # 3. Pre-build cpu_op index by external_id for faster kernel linking
         cpu_op_by_external_id = defaultdict(list)
         for cpu_op in self.cpu_ops:
             if cpu_op.external_id is not None:
                 cpu_op_by_external_id[cpu_op.external_id].append(cpu_op)
 
-        modules_by_correlation: Dict[int, Event] = {}
-        for module in self.modules:
-            if module.correlation is not None:
-                modules_by_correlation[module.correlation] = module
-
+        # 4. Link GPU Kernels to CPU Ops using index
         for kernel in self.kernels:
-            if kernel.external_id is None and kernel.correlation is None:
+            if kernel.external_id is None:
                 continue
 
             cpu_ops = cpu_op_by_external_id.get(kernel.external_id)
             if not cpu_ops:
-                parent_op = modules_by_correlation.get(kernel.correlation)
-                if parent_op is None:
-                    continue
-            elif len(cpu_ops) == 1:
+                continue
+
+            # Pick parent op
+            if len(cpu_ops) == 1:
                 parent_op = cpu_ops[0]
             else:
-                parent_op = max(
-                    (c for c in cpu_ops if c.ts <= kernel.ts),
-                    key=lambda c: c.ts,
-                    default=cpu_ops[0],
-                )
+                # Tie-breaking: prefer one with ev_idx
+                parent_op = next((c for c in cpu_ops if c.ev_idx is not None), cpu_ops[0])
 
+            # Link
             kernel.parent = parent_op
             key = kernel.ev_idx if kernel.ev_idx is not None else id(kernel)
             parent_op.children[key] = kernel
 
-        print("Kernel linking complete.")
+        print("Building event tree complete.")
 
+        # 5. Prune the tree to only keep paths leading to kernels (OPTIONAL)
         if enable_pruning:
             print("Pruning non-kernel paths...")
             self._prune_non_kernel_paths_optimized()
@@ -383,8 +372,6 @@ class HierarchicalTraceParser:
 
         print(f"Building event tree...")
 
-        _launch_events: List[Event] = []
-
         for event_data in trace_events:
             # Skip events without timestamp or duration
             if 'ts' not in event_data or 'dur' not in event_data:
@@ -398,11 +385,7 @@ class HierarchicalTraceParser:
             if cat == 'user_annotation' and name.startswith('MODULE:'):
                 # Module scope annotation emitted by _module_call_wrapper in hooks.py.
                 # Replaces python_function nn.Module: events when with_stack=False.
-                # Name format:
-                #   "MODULE: ClassName IN:[...] DTYPES:[...] KWARGS:[...] STATE:<hex>"
-                if ' STATE:' in name:
-                    name, _, _state_part = name.rpartition(' STATE:')
-                    args['state_hash'] = _state_part.strip()
+                # Name format: "MODULE: ClassName IN:[...] DTYPES:[...] KWARGS:[...]"
                 clean_name = name.split(' IN:')[0].replace('MODULE: ', '').strip()
                 event_cat = 'module'
                 event_name = clean_name
@@ -484,9 +467,6 @@ class HierarchicalTraceParser:
                 # GPU kernel
                 event_cat = 'kernel'
                 event_name = name
-            elif cat == 'cuda_runtime' and name == 'cudaLaunchKernel':
-                event_cat = cat
-                event_name = name
             else:
                 # Skip other event types (python_function, gpu_user_annotation, etc.)
                 continue
@@ -503,12 +483,8 @@ class HierarchicalTraceParser:
                 python_parent_id=args.get('Python parent id'),
                 args=args,
                 pid=event_data.get('pid'),
-                tid=event_data.get('tid'),
-                correlation=event_data.get('args', {}).get('correlation')
+                tid=event_data.get('tid')
             )
-
-            if cat == 'cuda_runtime' and name == 'cudaLaunchKernel':
-                _launch_events.append(event)
 
             self.events.append(event)
 
@@ -531,16 +507,8 @@ class HierarchicalTraceParser:
                     self.external_id_to_events[event.external_id] = []
                 self.external_id_to_events[event.external_id].append(event)
         
-        # Build the CPU/module tree first, then use correlation ids to attach
-        # kernels when no stable external-id path exists.
+        # After parsing all, build the tree by filling in children and parent dict
         self.build_tree()
-        if _launch_events:
-            for launch_event in _launch_events:
-                parent_module = self._find_nearest_module(launch_event)
-                if parent_module is None:
-                    continue
-                parent_module.correlation = launch_event.correlation
-        self.build_tree_for_kernels()
 
         print("Finding taint association...")
 
@@ -589,8 +557,6 @@ class HierarchicalTraceParser:
         # For cpu_ops: "linear" from "aten::linear" or "_C::rms_norm"
         # For modules: "QKVParallelLinear_0" stays as is
         if event.cat == 'module':
-            if event.params is not None:
-                return [event]
             # Module names may have _N suffix (e.g., "QKVParallelLinear_0")
             # Strip the suffix to get the class name for matching
             event_base = event.name.rsplit('_', 1)[0] if '_' in event.name and event.name.rsplit('_', 1)[-1].isdigit() else event.name
@@ -611,7 +577,9 @@ class HierarchicalTraceParser:
             # Extract base name from taint
             # Handles: "API: linear", "aten::linear", "MODULE: QKVParallelLinear", "aten::index.Tensor"
             taint_name = taint.name
-            if taint_name.startswith("API: "):
+            if taint_name.startswith("MODULE: "):
+                taint_base = taint_name.replace("MODULE: ", "")
+            elif taint_name.startswith("API: "):
                 taint_base = taint_name.replace("API: ", "")
             elif taint_name.startswith("COMM: "):
                 taint_base = taint_name.replace("COMM: ", "")
@@ -752,22 +720,6 @@ class HierarchicalTraceParser:
         """
         return [m for m in self.modules if m.children]
 
-    def _annotate_module_descendant_kernels(self) -> None:
-        """Record the set of descendant GPU kernel names on each module event."""
-        per_module: Dict[int, set] = defaultdict(set)
-        module_refs: Dict[int, Event] = {}
-        for kernel in self.kernels:
-            if not kernel.name:
-                continue
-            cur = kernel.parent
-            while cur is not None:
-                if cur.cat == 'module':
-                    per_module[id(cur)].add(kernel.name)
-                    module_refs[id(cur)] = cur
-                cur = cur.parent
-        for mid, names in per_module.items():
-            module_refs[mid].descendant_kernels = frozenset(names)
-
     def extract_module_to_operation_mapping(self) -> List[OperationHierarchy]:
         """
         Extract module→operation mappings as OperationHierarchy dataclasses.
@@ -784,8 +736,6 @@ class HierarchicalTraceParser:
         - kernel → anchor → nearest_module → root_module
         - anchor.parent chain for full path
         """
-        self._annotate_module_descendant_kernels()
-
         # 1. Collect kernel → anchor mappings
         anchor_to_kernels: Dict[int, List[Event]] = defaultdict(list)  # id(anchor) → kernels
         anchor_events: Dict[int, Event] = {}  # id(anchor) → anchor Event

@@ -160,13 +160,14 @@ def extract_inputs_from_taint(
         scalar_val = concrete_inputs[i] if concrete_inputs and i < len(concrete_inputs) else None
         
         if len(dims) == 0:
-            # Empty dims from trace can mean:
-            # 1. Python scalar value.
-            # 2. 0-d tensor.
-            # 3. Tensor with missing trace dims but present taint dims.
+            # Empty dims from trace - could be:
+            # 1. A true scalar (dtype='Scalar', 'ScalarList', 'Bool', or has concrete value)
+            # 2. A tensor whose dims weren't recorded (dtype='' for list elements like aten::index)
             scalar_type_indicators = {'Scalar', 'ScalarList', 'Bool', 'bool'}
             is_trace_scalar = (dtype in scalar_type_indicators or (dtype == '' and scalar_val))
-            is_tensor_dtype = bool(dtype) and dtype not in scalar_type_indicators
+
+            # print(f"[DEBUG @ finput] scalar_type_indicatrs: {scalar_type_indicators}")
+            # print(f"[DEBUG @ finput] is_trace_scalar: {is_trace_scalar}")
 
             if not is_trace_scalar and taint_input is not None and len(taint_input.dimensions) > 0:
                 # Taint has dimension info and trace doesn't indicate scalar - use taint to create tensor
@@ -181,14 +182,6 @@ def extract_inputs_from_taint(
                     dimensions=dim_types,
                     actual_shape=actual_shape,
                     dimension_components=dim_components
-                )
-            elif not is_trace_scalar and is_tensor_dtype:
-                # Preserve 0-d tensors as tensor inputs instead of scalars.
-                profile_input = ProfileInput(
-                    type="Tensor",
-                    dtype=dtype,
-                    dimensions=[],
-                    actual_shape=[],
                 )
             else:
                 # Scalar input
