@@ -18,49 +18,52 @@ import threading
 from pathlib import Path
 from typing import List, Tuple
 
-PY = "/home/jkim38/miniforge3/envs/utns_sim/bin/python"
+PY = "/home/jkim38/miniconda3/envs/dooly-sglang/bin/python"
 WORK = Path("/home/jkim38/dooly/profiler")
 
 DEFAULT_DB = WORK / "database" / "dooly-eval.db"
-DEFAULT_WS = WORK / "workspaces" / "scenario_a"
+DEFAULT_WS = WORK / "workspaces" / "sglang-eval"
 
+# Backend names use SGLang's native lowercase tokens. SGLang's ServerArgs
+# rejects the legacy vLLM-style uppercase names (FLASHINFER / FLASH_ATTN /
+# TRITON_ATTN) via argparse choices=ATTENTION_BACKEND_CHOICES.
 PAIRS: list[Tuple[str, str]] = [
-    ("meta-llama/Meta-Llama-3-8B",        "FLASHINFER"),
-    ("meta-llama/Meta-Llama-3-8B",        "FLASH_ATTN"),
-    ("meta-llama/Meta-Llama-3-8B",        "TRITON_ATTN"),
-    ("meta-llama/Llama-3.1-8B",           "FLASHINFER"),
-    ("meta-llama/Llama-3.1-8B",           "FLASH_ATTN"),
-    ("meta-llama/Llama-3.1-8B",           "TRITON_ATTN"),
-    ("meta-llama/Llama-2-7b-hf",          "FLASHINFER"),
-    ("meta-llama/Llama-2-7b-hf",          "FLASH_ATTN"),
-    ("meta-llama/Llama-2-7b-hf",          "TRITON_ATTN"),
-    ("Qwen/Qwen2.5-7B",                   "FLASHINFER"),
-    ("Qwen/Qwen2.5-7B",                   "FLASH_ATTN"),
-    ("Qwen/Qwen2.5-7B",                   "TRITON_ATTN"),
-    ("Qwen/Qwen3-8B",                     "FLASHINFER"),
-    ("Qwen/Qwen3-8B",                     "FLASH_ATTN"),
-    ("Qwen/Qwen3-8B",                     "TRITON_ATTN"),
-    ("CohereLabs/aya-expanse-8b",         "FLASHINFER"),
-    ("CohereLabs/aya-expanse-8b",         "FLASH_ATTN"),
-    ("CohereLabs/aya-expanse-8b",         "TRITON_ATTN"),
-    ("CohereLabs/c4ai-command-r7b-12-2024", "FLASHINFER"),
-    ("CohereLabs/c4ai-command-r7b-12-2024", "FLASH_ATTN"),
-    ("CohereLabs/c4ai-command-r7b-12-2024", "TRITON_ATTN"),
-    ("mistralai/Mistral-7B-v0.3",         "FLASHINFER"),
-    ("mistralai/Mistral-7B-v0.3",         "FLASH_ATTN"),
-    ("mistralai/Mistral-7B-v0.3",         "TRITON_ATTN"),
-    ('mistralai/Ministral-8B-Instruct-2410', "FLASHINFER"),
-    ('mistralai/Ministral-8B-Instruct-2410', "FLASH_ATTN"),
-    ('mistralai/Ministral-8B-Instruct-2410', "TRITON_ATTN"),
-    ("deepseek-ai/deepseek-llm-7b-base",  "FLASHINFER"),
-    ("deepseek-ai/deepseek-llm-7b-base",  "FLASH_ATTN"),
-    ("deepseek-ai/deepseek-llm-7b-base",  "TRITON_ATTN"),
-    ("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", "FLASHINFER"),
-    ("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", "FLASH_ATTN"),
-    ("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", "TRITON_ATTN"),
-    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "FLASHINFER"),
-    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "FLASH_ATTN"),
-    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "TRITON_ATTN"),
+    ("meta-llama/Meta-Llama-3-8B",        "flashinfer"),
+    ("meta-llama/Meta-Llama-3-8B",        "fa3"),
+    ("meta-llama/Meta-Llama-3-8B",        "triton"),
+    ("meta-llama/Llama-3.1-8B",           "flashinfer"),
+    ("meta-llama/Llama-3.1-8B",           "fa3"),
+    ("meta-llama/Llama-3.1-8B",           "triton"),
+    ("meta-llama/Llama-2-7b-hf",          "flashinfer"),
+    ("meta-llama/Llama-2-7b-hf",          "fa3"),
+    ("meta-llama/Llama-2-7b-hf",          "triton"),
+    ("Qwen/Qwen2.5-7B",                   "flashinfer"),
+    ("Qwen/Qwen2.5-7B",                   "fa3"),
+    ("Qwen/Qwen2.5-7B",                   "triton"),
+    ("Qwen/Qwen3-8B",                     "flashinfer"),
+    ("Qwen/Qwen3-8B",                     "fa3"),
+    ("Qwen/Qwen3-8B",                     "triton"),
+    ("CohereLabs/aya-expanse-8b",         "flashinfer"),
+    ("CohereLabs/aya-expanse-8b",         "fa3"),
+    ("CohereLabs/aya-expanse-8b",         "triton"),
+    ("CohereLabs/c4ai-command-r7b-12-2024", "flashinfer"),
+    ("CohereLabs/c4ai-command-r7b-12-2024", "fa3"),
+    ("CohereLabs/c4ai-command-r7b-12-2024", "triton"),
+    ("mistralai/Mistral-7B-v0.3",         "flashinfer"),
+    ("mistralai/Mistral-7B-v0.3",         "fa3"),
+    ("mistralai/Mistral-7B-v0.3",         "triton"),
+    ('mistralai/Ministral-8B-Instruct-2410', "flashinfer"),
+    ('mistralai/Ministral-8B-Instruct-2410', "fa3"),
+    ('mistralai/Ministral-8B-Instruct-2410', "triton"),
+    ("deepseek-ai/deepseek-llm-7b-base",  "flashinfer"),
+    ("deepseek-ai/deepseek-llm-7b-base",  "fa3"),
+    ("deepseek-ai/deepseek-llm-7b-base",  "triton"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", "flashinfer"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", "fa3"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", "triton"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "flashinfer"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "fa3"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "triton"),
 ]
 
 

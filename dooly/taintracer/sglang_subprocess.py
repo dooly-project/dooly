@@ -41,13 +41,17 @@ SERVER_ARGS_TAINT_MAP = {
 
 }
 
-# Attributes to taint on ModelRunner. The KV cache pool reads
-# `model_runner.max_total_num_tokens` to size its buffers; without this patch
-# the value is a plain int and `KVCache.__init__`'s `self.size = size` breaks
-# the propagation chain, so torch.zeros((self.size + page_size, ...)) emits an
-# untainted tensor and store_cache sees `?(522)` on the K/V cache dim.
+# Attributes to taint on ModelRunner. SGLang reads runtime caps off of
+# ModelRunner (not Scheduler) when sizing internal buffers; without these
+# the value is a plain int and the propagation chain breaks at the source.
+#   max_total_num_tokens : KV cache pool size on dim 0 (MHATokenToKVPool)
+#                          -> store_cache's [?(522)] becomes [MAX_NUM_TOKS(522)].
+#   max_running_requests : ReqToTokenPool's req_to_token shape[0]
+#                          -> FA3's [?(263), MODEL_CONFIG(131076)] becomes
+#                          [MAX_NUM_REQS(263), MODEL_CONFIG(131076)].
 MODEL_RUNNER_TAINT_MAP = {
     'max_total_num_tokens': 'MAX_NUM_TOKS',
+    'max_running_requests': 'MAX_NUM_REQS',
 }
 
 _original_server_args_getattribute = None
@@ -159,6 +163,12 @@ def patch_server_args(server_args):
                 ret.seq_lens = TaintedTensor(ret.seq_lens, [Taint('NUM_REQS')])
             if not isinstance(ret.positions, TaintedTensor):
                 ret.positions = TaintedTensor(ret.positions, [Taint('NUM_REQS')])
+            # batch_size is set as `len(batch.seq_lens)` at init_new — a plain
+            # int. Re-tainting here so `forward_batch.batch_size + 1`
+            # propagates to torch.arange(0, batch_size+1) for cu_seqlens_q/k.
+            if isinstance(ret.batch_size, int) and not isinstance(ret.batch_size, TaintedInt):
+                register_taint(ret.batch_size, Taint('NUM_REQS'))
+                ret.batch_size = TaintedInt(ret.batch_size, 'NUM_REQS')
             # input_ids is the model's entry-point tensor; its length equals
             # the number of scheduled tokens this step. Without this wrap,
             # VocabParallelEmbedding / LlamaModel see [?(N)] on their input.
@@ -285,10 +295,22 @@ def tainted_run_scheduler_process(
         import pickle
         from dooly.taintracer.registry import TAINT_REGISTRY
         dump_path = f"{dump_base}.{tp_rank}"
+        tmp_path = dump_path + ".tmp"
         while True:
             time.sleep(2)
-            with open(dump_path, "wb") as f:
-                pickle.dump(dict(TAINT_REGISTRY), f)
+            # Write to a temp file then atomically rename. Without this,
+            # `open(dump_path, "wb")` truncates first; if the subprocess
+            # gets sigterm before pickle.dump finishes, the parent reads a
+            # 0-byte file ("Ran out of input"). os.replace is atomic on
+            # POSIX, so the consumer either sees the previous valid dump
+            # or the new complete one — never a partial.
+            try:
+                with open(tmp_path, "wb") as f:
+                    pickle.dump(dict(TAINT_REGISTRY), f)
+                os.replace(tmp_path, dump_path)
+            except Exception:
+                # On crash mid-write, leave the previous good dump intact.
+                pass
 
     dump_thread = threading.Thread(target=dump_to_file, daemon=True)
     dump_thread.start()

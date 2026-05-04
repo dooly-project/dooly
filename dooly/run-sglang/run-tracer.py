@@ -37,16 +37,29 @@ parser.add_argument("--prompts", type=str, default="Hello, how are you? I am fin
 parser.add_argument("--max-tokens", type=int, default=1, help="Max tokens to generate")
 parser.add_argument("--trace_dir", type=str, default="/home/jkim38/dooly/profiler/vllm_traces_tp", help="Directory to save trace")
 parser.add_argument("--gpu", type=int, default=0, help="GPU device index to use")
-parser.add_argument("--attention-backend", type=str, default="FLASHINFER", help="Attention backend (FLASHINFER, FLASH_ATTN, XFORMERS)")
+# Accept either SGLang's native names ("flashinfer", "fa3", "fa4", "triton",
+# "torch_native", ...) or the legacy vLLM-style names (FLASHINFER, FLASH_ATTN,
+# TRITON_ATTN). Mapped below before passing to ServerArgs.
+parser.add_argument("--attention-backend", type=str, default="flashinfer",
+                    help="Attention backend. SGLang names: flashinfer, fa3, fa4, "
+                         "triton, torch_native. Legacy aliases: FLASHINFER, "
+                         "FLASH_ATTN (->fa3), TRITON_ATTN (->triton).")
 parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
 args = parser.parse_args()
 
 import torch
 import torch.profiler
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 os.environ["SGLANG_ENABLE_TORCH_INFERENCE_MODE"] = "1"
 
-print(f"[Tracer] Set VLLM_ATTENTION_BACKEND={args.attention_backend}")
+_BACKEND_ALIASES = {
+    "FLASHINFER": "flashinfer",
+    "FLASH_ATTN": "fa3",
+    "TRITON_ATTN": "triton",
+}
+sglang_attn_backend = _BACKEND_ALIASES.get(args.attention_backend, args.attention_backend)
+print(f"[Tracer] SGLang attention_backend={sglang_attn_backend} "
+      f"(from --attention-backend={args.attention_backend})")
 
 FAKE_TP = args.tensor_parallel_size
 # DOOLY_FAKE_TP is read inside `tainted_run_scheduler_process` (subprocess)
@@ -180,7 +193,17 @@ if __name__ == "__main__":
         os.environ["TORCH_TRACE_DIR"] = args.trace_dir
 
         prompts = [args.prompts] * 5
-        llm = TaintedEngine(model_path=args.model, enable_metrics=True, disable_cuda_graph=True, disable_piecewise_cuda_graph=True, load_format="dummy", enable_tokenizer_batch_encode=True,  max_running_requests=263, max_total_tokens=521)
+        llm = TaintedEngine(
+            model_path=args.model,
+            attention_backend=sglang_attn_backend,
+            enable_metrics=True,
+            disable_cuda_graph=True,
+            disable_piecewise_cuda_graph=True,
+            load_format="dummy",
+            enable_tokenizer_batch_encode=True,
+            max_running_requests=263,
+            max_total_tokens=521,
+        )
         llm.start_profile(output_dir=args.trace_dir, activities=[
                 "CPU",
                 "GPU",
@@ -200,9 +223,16 @@ if __name__ == "__main__":
         dump_base = os.environ.get("TAINT_REGISTRY_DUMP_BASE")
         if dump_base:
             for dump_path in sorted(glob.glob(f"{dump_base}.*")):
-                with open(dump_path, "rb") as f:
-                    TAINT_REGISTRY.update(pickle.load(f))
-                print(f"[taintracer] Loaded registry from {dump_path}")
+                try:
+                    with open(dump_path, "rb") as f:
+                        TAINT_REGISTRY.update(pickle.load(f))
+                    print(f"[taintracer] Loaded registry from {dump_path}")
+                except (EOFError, pickle.UnpicklingError, OSError) as e:
+                    # Subprocess can crash mid-dump (esp. on backend init
+                    # failures like fa3 on Ampere) and leave a 0-byte or
+                    # truncated pickle. Skip rather than aborting the rest
+                    # of the post-processing.
+                    print(f"[taintracer] WARNING: skipped {dump_path}: {e}")
 
         # Inject the merged taint registry as a top-level key in the SGLang
         # trace JSON, mirroring `dooly_trace_handler` in run/run-tracer.py.

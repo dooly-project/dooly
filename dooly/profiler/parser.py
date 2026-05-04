@@ -262,9 +262,11 @@ class HierarchicalTraceParser:
         for event in self.events:
             # We only stack CPU-side events (modules, ops, comm)
             # Taints are excluded as per user request
-            # Kernels are on GPU/different thread, handled separately
-            if event.cat in ('module', 'cpu_op', 'comm', 'cuda_runtime'):
-            # if event.cat in ('module', 'cpu_op'):
+            # Kernels are on GPU/different thread, handled separately.
+            # cuda_driver covers cuLaunchKernelEx — Triton's launch path —
+            # which we need in the tree so the correlation->module map
+            # picks up _fwd_kernel and friends.
+            if event.cat in ('module', 'cpu_op', 'comm', 'cuda_runtime', 'cuda_driver'):
                 # Use a combined key for pid/tid
                 key = (event.pid, event.tid)
                 thread_events[key].append(event)
@@ -501,10 +503,20 @@ class HierarchicalTraceParser:
                 # GPU kernel
                 event_cat = 'kernel'
                 event_name = name
-            elif cat == 'cuda_runtime' and ('cudaLaunchKernel' in name):
+            elif (
+                (cat == 'cuda_runtime' and 'cudaLaunchKernel' in name)
+                or (cat == 'cuda_driver' and 'cuLaunchKernel' in name)
+            ):
+                # cuda_runtime: cudaLaunchKernel, cudaLaunchKernelExC.
+                # cuda_driver: cuLaunchKernel, cuLaunchKernelEx — used by Triton's
+                # JIT runner (sgl_kernel/SGLang's triton attention emits these
+                # instead of going through the runtime API). Without catching the
+                # driver variant, the correlation->module map misses Triton's
+                # _fwd_kernel and the kernel ends up orphaned, so the dedup
+                # produces no LlamaAttention/RadixAttention entry for the
+                # attention compute.
                 event_cat = cat
                 event_name = name
-                print(f"[DEBUG!]{event_name}")
             else:
                 # Skip other event types (python_function, gpu_user_annotation, etc.)
                 continue
@@ -525,7 +537,10 @@ class HierarchicalTraceParser:
                 correlation=event_data.get('args').get('correlation')
             )
 
-            if cat == 'cuda_runtime' and ('cudaLaunchKernel' in name):
+            if (
+                (cat == 'cuda_runtime' and 'cudaLaunchKernel' in name)
+                or (cat == 'cuda_driver' and 'cuLaunchKernel' in name)
+            ):
                 _launch_events.append(event)
 
             self.events.append(event)

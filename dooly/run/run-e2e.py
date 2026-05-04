@@ -4,9 +4,9 @@ import glob
 import argparse
 import subprocess
 
-os.environ["PATH"] = f"/usr/local/cuda-12.3/bin:{os.environ.get('PATH', '')}"
-os.environ["LD_LIBRARY_PATH"] = f"/usr/local/cuda-12.3/lib64:{os.path.join(sys.prefix, 'lib')}:{os.environ.get('LD_LIBRARY_PATH', '')}"
-os.environ["CUDA_HOME"] = "/usr/local/cuda-12.3/"
+os.environ["PATH"] = f"/usr/local/cuda-13.0/bin:{os.environ.get('PATH', '')}"
+os.environ["LD_LIBRARY_PATH"] = f"/usr/local/cuda-13.0/lib64:{os.path.join(sys.prefix, 'lib')}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+os.environ["CUDA_HOME"] = "/usr/local/cuda-13.0/"
 
 def model_to_dirname(model: str) -> str:
     """Convert model name to a safe directory name."""
@@ -19,10 +19,20 @@ def find_trace_file(trace_dir: str) -> str | None:
     files = glob.glob(pattern)
     return files[0] if files else None
 
+_BACKEND_ALIASES = {
+    "FLASHINFER": "flashinfer",
+    "FLASH_ATTN": "fa3",
+    "TRITON_ATTN": "triton",
+}
 
 def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attention_backend: str, tokenizer: str | None = None):
     """Run the tracer as a subprocess (required due to module-level patching)."""
-    tracer_script = os.path.join(os.path.dirname(__file__), "run-tracer.py")
+    # SGLang tracer lives in a sibling directory: dooly/run-sglang/run-tracer.py
+    tracer_script = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "run-sglang",
+        "run-tracer.py",
+    )
     cmd = [
         sys.executable, tracer_script,
         "--model", model,
@@ -69,14 +79,17 @@ def main():
     parser = argparse.ArgumentParser(description="UTNS Sim Profiler Workflow")
 
     parser.add_argument("--models", nargs='+', type=str, default=["meta-llama/Llama-3.1-8B"], help="Model name or path")
-    parser.add_argument("--attention-backend", type=str, default="FLASHINFER", help="Attention backend (FLASHINFER, FLASH_ATTN, XFORMERS)")
+    parser.add_argument("--attention-backend", type=str, default="flashinfer",
+                        help="Attention backend. SGLang names: flashinfer, fa3, fa4, "
+                             "triton, torch_native. Legacy aliases (FLASHINFER, "
+                             "FLASH_ATTN, TRITON_ATTN) are mapped by the tracer.")
     parser.add_argument("--max-batch-size", type=int, default=5, help="Max batch size for profiling")
     parser.add_argument("--max-seq-len", type=int, default=128, help="Max sequence length for profiling")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="Model dtype")
     parser.add_argument("--tp", "--tensor_parallel_size", nargs='+', type=int, default=[1])
     parser.add_argument("--gpu", type=int, default=0, help="GPU device index to use")
     parser.add_argument("--profile-only", action="store_true", help="Skip tracing, only run profiler")
-    parser.add_argument("--workspace-dir", type=str, default="vllm_traces_tp", help="Directory to save trace and profile")
+    parser.add_argument("--workspace-dir", type=str, default="sglang_traces_tp", help="Directory to save trace and profile")
     parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
     parser.add_argument("--db-path", type=str, default=None, help="Path to SQLite database for persistent storage and deduplication")
     parser.add_argument("--profile-comm", action="store_true",
@@ -86,6 +99,7 @@ def main():
     workspace_path = args.workspace_dir
     trace_base = os.path.join(workspace_path, f"traces-{args.attention_backend}-{args.dtype}")
     profile_base = os.path.join(workspace_path, f"profiles-{args.attention_backend}-{args.dtype}")
+    sglang_attn_backend = _BACKEND_ALIASES.get(args.attention_backend, args.attention_backend)
 
     os.makedirs(workspace_path, exist_ok=True)
     os.makedirs(trace_base, exist_ok=True)
@@ -111,7 +125,7 @@ def main():
                     trace_dir=model_trace_dir,
                     dtype=args.dtype,
                     gpu=args.gpu,
-                    attention_backend=args.attention_backend,
+                    attention_backend=sglang_attn_backend,
                     tokenizer=args.tokenizer,
                 )
 
@@ -138,7 +152,7 @@ def main():
             tp=tp,
             profile_output=profile_output,
             dtype=args.dtype,
-            attention_backend=args.attention_backend,
+            attention_backend=sglang_attn_backend,
             max_batch_size=args.max_batch_size,
             max_seq_len=args.max_seq_len,
             db_path=args.db_path,
