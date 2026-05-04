@@ -7,9 +7,11 @@ import numpy as np
 from typing import List, Dict, Tuple, Any, Literal
 import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# Add repo root to path for dooly imports.
+# comm_profiler.py -> run/ -> vllm/ -> dooly/ -> repo root
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 from vllm import LLM
@@ -323,7 +325,7 @@ class CommProfiler:
         print(f"✓ Database initialized at {self.db_path}")
 
     def plan(self, collectives: List[Any]):
-        from dooly.profiler.finput import ProfileInput
+        from dooly.vllm.profiler.finput import ProfileInput
         
         # extract input shape, dim0, dim1 
         self.plan_info: Dict[str, Dict[str, Any]]= {}

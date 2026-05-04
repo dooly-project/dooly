@@ -14,6 +14,7 @@ import socket
 import argparse
 import time
 import torch
+from pathlib import Path
 
 
 def find_free_port() -> int:
@@ -24,9 +25,9 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
-# Add project root to path for dooly imports
-# run-tracer.py -> run/ -> dooly/ -> dooly (repo root)
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# Add repo root to path for dooly imports.
+# run-tracer.py -> run/ -> sglang/ -> dooly/ -> repo root
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 # Parse arguments BEFORE any heavy imports
 parser = argparse.ArgumentParser()
@@ -55,10 +56,10 @@ os.environ["VLLM_FAKE_TP"] = str(FAKE_TP)
 # This patches AutoConfig.from_pretrained to return TaintedConfig objects
 # and installs hooks on tensor factory functions for taint propagation
 import tempfile
-from dooly.taintracer.hooks import install_hooks
-from dooly.taintracer.config_sglang import patch_autoconfig, patch_input_buffers
-from dooly.taintracer.registry import TAINT_REGISTRY
-from dooly.taintracer import disable_taint_tracking, enable_taint_tracking
+from dooly.sglang.taintracer.hooks import install_hooks
+from dooly.sglang.taintracer.config import patch_autoconfig, patch_input_buffers
+from dooly.sglang.taintracer.registry import TAINT_REGISTRY
+from dooly.sglang.taintracer import disable_taint_tracking, enable_taint_tracking
 
 # Set up registry dump path so the subprocess can write it back to us
 _registry_dump_file = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
@@ -101,7 +102,7 @@ install_hooks()
 # # Debug patch: Track num_tokens in _dummy_run
 # try:
 #     import vllm.v1.worker.gpu_model_runner as gmr_module
-#     from dooly.taintracer.types import TaintedInt
+#     from dooly.sglang.taintracer.types import TaintedInt
 
 #     _orig_dummy_run = None
 #     _orig_get_slot_mappings = None
@@ -130,7 +131,7 @@ install_hooks()
 #     print(f"[DebugPatch] Could not setup debug patches - {e}", flush=True)
 
 # # Apply fake TP patches using shared utility, then import vLLM
-# from dooly.profiler.utils.fake_tp import apply_fake_tp_patches
+# from dooly.sglang.profiler.utils.fake_tp import apply_fake_tp_patches
 # if FAKE_TP > 1:
 #     apply_fake_tp_patches(FAKE_TP)
 
@@ -172,7 +173,7 @@ if __name__ == "__main__":
     #     except:
     #         pass
 
-        from dooly.taintracer.sglang_subprocess import (
+        from dooly.sglang.taintracer.sglang_subprocess import (
         TaintedEngine
         )
         # from sglang import Engine

@@ -4,9 +4,9 @@ import sys
 from pathlib import Path
 from time import time
 
-# Add project root to path for dooly imports
-# run-profiler.py -> run/ -> dooly/ -> dooly (repo root)
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# Add repo root to path for dooly imports.
+# run-profiler.py -> run/ -> vllm/ -> dooly/ -> repo root
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 # Parse --tp early and set VLLM_FAKE_TP env var BEFORE importing vLLM modules.
 # vllm_layer_profiler.py applies fake TP patches at module level based on this env var.
@@ -18,8 +18,8 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import torch
 import multiprocessing as mp
-from dooly.profiler.model import ModelInfo
-from dooly.profiler.profiler import Profiler 
+from dooly.vllm.profiler.model import ModelInfo
+from dooly.vllm.profiler.profiler import Profiler 
 
 DTYPE_MAP = {
     "float32": torch.float32,
@@ -72,9 +72,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_model(model, dtype, attention_backend, max_seq_len, result_queue, gpu):
-    from dooly.profiler.importer import OpImporter
-    from dooly.profiler.resolver import ModuleResolver
-    from dooly.profiler.vllm_layer_profiler import VLLMLayerProfiler
+    from dooly.vllm.profiler.importer import OpImporter
+    from dooly.vllm.profiler.resolver import ModuleResolver
+    from dooly.vllm.profiler.vllm_layer_profiler import VLLMLayerProfiler
     
     importer=OpImporter()
 

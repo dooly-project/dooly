@@ -7,9 +7,11 @@ and must NOT set VLLM_FAKE_TP or import any modules that set it.
 import os
 import sys
 import torch
+from pathlib import Path
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# Add repo root to path for dooly imports.
+# comm_worker.py -> run/ -> vllm/ -> dooly/ -> repo root
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 
 def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path):
@@ -25,7 +27,7 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
         raise RuntimeError(f"VLLM_FAKE_TP is still set to {fake_tp_val}! Cannot profile comm ops with fake TP.")
 
     # Import comm_profiler (which doesn't set VLLM_FAKE_TP)
-    from dooly.run.comm_profiler import CommProfiler, CommProfilingConfig
+    from dooly.vllm.run.comm_profiler import CommProfiler, CommProfilingConfig
 
     DTYPE_MAP = {
         "float32": torch.float32,
