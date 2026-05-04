@@ -8,9 +8,12 @@ Usage:
     python test.py --model meta-llama/Llama-3.1-8B --tp 2 --trace_dir ./traces
 """
 import os
+import pdb
 import sys
 import socket
 import argparse
+import time
+import torch
 
 
 def find_free_port() -> int:
@@ -31,103 +34,123 @@ parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B",
 parser.add_argument("--tp", "--tensor_parallel_size", type=int, default=1, dest="tensor_parallel_size", help="Fake tensor parallel size (weights sharded but run on 1 GPU)")
 parser.add_argument("--dtype", type=str, default="bfloat16", help="Model dtype")
 parser.add_argument("--prompts", type=str, default="Hello, how are you? I am fine, and ", help="Prompt to run")
-parser.add_argument("--batch-size", type=int, default=5, help="Number of identical prompts to send in a single generate() call")
 parser.add_argument("--max-tokens", type=int, default=1, help="Max tokens to generate")
-parser.add_argument("--trace_dir", type=str, default="./vllm_traces_tp", help="Directory to save trace")
+parser.add_argument("--trace_dir", type=str, default="/home/jkim38/dooly/profiler/vllm_traces_tp", help="Directory to save trace")
 parser.add_argument("--gpu", type=int, default=0, help="GPU device index to use")
-parser.add_argument("--attention-backend", type=str, default="FLASHINFER", help="Attention backend (FLASHINFER, FLASH_ATTN, XFORMERS)")
+# Accept either SGLang's native names ("flashinfer", "fa3", "fa4", "triton",
+# "torch_native", ...) or the legacy vLLM-style names (FLASHINFER, FLASH_ATTN,
+# TRITON_ATTN). Mapped below before passing to ServerArgs.
+parser.add_argument("--attention-backend", type=str, default="flashinfer",
+                    help="Attention backend. SGLang names: flashinfer, fa3, fa4, "
+                         "triton, torch_native. Legacy aliases: FLASHINFER, "
+                         "FLASH_ATTN (->fa3), TRITON_ATTN (->triton).")
 parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
 args = parser.parse_args()
 
 import torch
 import torch.profiler
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+os.environ["SGLANG_ENABLE_TORCH_INFERENCE_MODE"] = "1"
 
-print(f"[Tracer] Set VLLM_ATTENTION_BACKEND={args.attention_backend}")
+_BACKEND_ALIASES = {
+    "FLASHINFER": "flashinfer",
+    "FLASH_ATTN": "fa3",
+    "TRITON_ATTN": "triton",
+}
+sglang_attn_backend = _BACKEND_ALIASES.get(args.attention_backend, args.attention_backend)
+print(f"[Tracer] SGLang attention_backend={sglang_attn_backend} "
+      f"(from --attention-backend={args.attention_backend})")
 
 FAKE_TP = args.tensor_parallel_size
-os.environ["VLLM_FAKE_TP"] = str(FAKE_TP)
+# DOOLY_FAKE_TP is read inside `tainted_run_scheduler_process` (subprocess)
+# to apply parallel_state patches; SGLang's real engine still inits as a
+# single-rank ProcessGroup.
+os.environ["DOOLY_FAKE_TP"] = str(FAKE_TP)
 
 # Install taint hooks BEFORE any vLLM imports
 # This patches AutoConfig.from_pretrained to return TaintedConfig objects
 # and installs hooks on tensor factory functions for taint propagation
+import tempfile
 from dooly.taintracer.hooks import install_hooks
-from dooly.taintracer.config import patch_autoconfig, patch_input_buffers
+from dooly.taintracer.config_sglang import patch_autoconfig, patch_input_buffers
 from dooly.taintracer.registry import TAINT_REGISTRY
 from dooly.taintracer import disable_taint_tracking, enable_taint_tracking
 
+# Set up registry dump path so the subprocess can write it back to us
+_registry_dump_file = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+_registry_dump_file.close()
+if "TAINT_REGISTRY_DUMP_BASE" not in os.environ:
+    print(f"dump base: {_registry_dump_file.name}")
+    os.environ["TAINT_REGISTRY_DUMP_BASE"] = _registry_dump_file.name
+
 # Disable taint tracking initially - we'll enable it only during the actual generate() call
 # This prevents semantic confusion during warm-up/compilation where values are reused incorrectly
-disable_taint_tracking()
-print("[Tracer] Taint tracking DISABLED during initialization/warm-up")
+# disable_taint_tracking()
+# print("[Tracer] Taint tracking DISABLED during initialization/warm-up")
 
 patch_autoconfig()
 # patch_common_attention_metadata()
-patch_input_buffers()
-install_hooks(
-    int_patch_modules=[
-        "vllm.model_executor.layers.rotary_embedding",
-    ]
-)
+# patch_input_buffers()
+install_hooks()
 
-# Patch DummyModelLoader to force CUDA move
-# (dummy models are loaded into CPU for some reason when tainting is enabled)
-try:
-    from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
-    original_dummy_load_weights = DummyModelLoader.load_weights
+# # Patch DummyModelLoader to force CUDA move
+# # (dummy models are loaded into CPU for some reason when tainting is enabled)
+# try:
+#     from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+#     original_dummy_load_weights = DummyModelLoader.load_weights
 
-    def patched_dummy_load_weights(self, model, model_config):
-        original_dummy_load_weights(self, model, model_config)
-        if torch.cuda.is_available():
-            model.to("cuda")
+#     def patched_dummy_load_weights(self, model, model_config):
+#         original_dummy_load_weights(self, model, model_config)
+#         if torch.cuda.is_available():
+#             model.to("cuda")
 
-    DummyModelLoader.load_weights = patched_dummy_load_weights
-except ImportError:
-    print("[DebugPatch] Could not import DummyModelLoader")
+#     DummyModelLoader.load_weights = patched_dummy_load_weights
+# except ImportError:
+#     print("[DebugPatch] Could not import DummyModelLoader")
 
-# Debug patch: Track num_tokens in _dummy_run
-try:
-    import vllm.v1.worker.gpu_model_runner as gmr_module
-    from dooly.taintracer.types import TaintedInt
+# # Debug patch: Track num_tokens in _dummy_run
+# try:
+#     import vllm.v1.worker.gpu_model_runner as gmr_module
+#     from dooly.taintracer.types import TaintedInt
 
-    _orig_dummy_run = None
-    _orig_get_slot_mappings = None
+#     _orig_dummy_run = None
+#     _orig_get_slot_mappings = None
 
-    def patch_for_debugging():
-        global _orig_dummy_run, _orig_get_slot_mappings
-        if hasattr(gmr_module, 'GPUModelRunner'):
-            GPUModelRunner = gmr_module.GPUModelRunner
+#     def patch_for_debugging():
+#         global _orig_dummy_run, _orig_get_slot_mappings
+#         if hasattr(gmr_module, 'GPUModelRunner'):
+#             GPUModelRunner = gmr_module.GPUModelRunner
 
-            if _orig_dummy_run is None:
-                _orig_dummy_run = GPUModelRunner._dummy_run
-                def debug_dummy_run(self, num_tokens, *args, **kwargs):
-                    return _orig_dummy_run(self, num_tokens, *args, **kwargs)
-                GPUModelRunner._dummy_run = debug_dummy_run
+#             if _orig_dummy_run is None:
+#                 _orig_dummy_run = GPUModelRunner._dummy_run
+#                 def debug_dummy_run(self, num_tokens, *args, **kwargs):
+#                     return _orig_dummy_run(self, num_tokens, *args, **kwargs)
+#                 GPUModelRunner._dummy_run = debug_dummy_run
 
-            if _orig_get_slot_mappings is None:
-                _orig_get_slot_mappings = GPUModelRunner._get_slot_mappings
-                def debug_get_slot_mappings(self, num_tokens_padded, *args, **kwargs):
-                    return _orig_get_slot_mappings(self, num_tokens_padded, *args, **kwargs)
-                GPUModelRunner._get_slot_mappings = debug_get_slot_mappings
+#             if _orig_get_slot_mappings is None:
+#                 _orig_get_slot_mappings = GPUModelRunner._get_slot_mappings
+#                 def debug_get_slot_mappings(self, num_tokens_padded, *args, **kwargs):
+#                     return _orig_get_slot_mappings(self, num_tokens_padded, *args, **kwargs)
+#                 GPUModelRunner._get_slot_mappings = debug_get_slot_mappings
 
-            print("[DebugPatch] Installed debug wrappers for _dummy_run and _get_slot_mappings", flush=True)
+#             print("[DebugPatch] Installed debug wrappers for _dummy_run and _get_slot_mappings", flush=True)
 
-    # Will patch after GPUModelRunner is defined
-except Exception as e:
-    print(f"[DebugPatch] Could not setup debug patches - {e}", flush=True)
+#     # Will patch after GPUModelRunner is defined
+# except Exception as e:
+#     print(f"[DebugPatch] Could not setup debug patches - {e}", flush=True)
 
-# Apply fake TP patches using shared utility, then import vLLM
-from dooly.profiler.utils.fake_tp import apply_fake_tp_patches
-if FAKE_TP > 1:
-    apply_fake_tp_patches(FAKE_TP)
+# # Apply fake TP patches using shared utility, then import vLLM
+# from dooly.profiler.utils.fake_tp import apply_fake_tp_patches
+# if FAKE_TP > 1:
+#     apply_fake_tp_patches(FAKE_TP)
 
-from vllm import LLM, SamplingParams
+# from vllm import LLM, SamplingParams
 from transformers import AutoConfig
+# from sglang import  Engine
 
-# Debug: verify multiprocessing mode
-import vllm.envs as envs
-print(f"[DEBUG] VLLM_ENABLE_V1_MULTIPROCESSING = {envs.VLLM_ENABLE_V1_MULTIPROCESSING}", flush=True)
+# # Debug: verify multiprocessing mode
+# import vllm.envs as envs
+# print(f"[DEBUG] VLLM_ENABLE_V1_MULTIPROCESSING = {envs.VLLM_ENABLE_V1_MULTIPROCESSING}", flush=True)
 
 def get_max_model_len(model_name: str, default: int = 4096) -> int:
     """Auto-detect max_model_len from model config."""
@@ -153,88 +176,94 @@ if __name__ == "__main__":
     max_model_len = min(get_max_model_len(args.model), 32768)
 
     try:
-        # Apply debug patches before LLM init
-        try:
-            patch_for_debugging()
-        except:
-            pass
+    #     # Apply debug patches before LLM init
+    #     try:
+    #         patch_for_debugging()
+    #     except:
+    #         pass
 
-        llm = LLM(
-            model=args.model,
-            tokenizer=args.tokenizer if args.tokenizer else args.model,
-            dtype=args.dtype,
-            tensor_parallel_size=1,  # Tell vLLM executor we're single process
-            load_format="dummy",
-            enforce_eager=True,
-            gpu_memory_utilization=0.9,
-            attention_backend=args.attention_backend,
-            max_model_len=max_model_len,
-            trust_remote_code=True,
-            max_num_batched_tokens=521,
-            max_num_seqs=263
+        from dooly.taintracer.sglang_subprocess import (
+        tainted_run_scheduler_process, TaintedEngine
         )
+        # from sglang import Engine
 
-        # Check weight shapes to verify sharding
-        print(f"\n=== Checking weight shapes (should be divided by TP={FAKE_TP}) ===")
-        model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-        for name, param in model.named_parameters():
-            if "layers.0" in name and ("q_proj" in name or "down_proj" in name):
-                print(f"{name}: {param.shape}")
+        # print(Engine.run_scheduler_process_func.__qualname__)
 
-        sampling_params = SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
+        # Set TORCH_TRACE_DIR for sglang_subprocess.py to pick up inside the spawned process.
+        os.environ["TORCH_TRACE_DIR"] = args.trace_dir
 
-        # Enable taint tracking now - warm-up/compilation is done
-        enable_taint_tracking()
-        print("\n[Tracer] Taint tracking ENABLED for actual generation")
+        prompts = [args.prompts] * 5
+        llm = TaintedEngine(
+            model_path=args.model,
+            attention_backend=sglang_attn_backend,
+            enable_metrics=True,
+            disable_cuda_graph=True,
+            disable_piecewise_cuda_graph=True,
+            load_format="dummy",
+            enable_tokenizer_batch_encode=True,
+            max_running_requests=263,
+            max_total_tokens=521,
+        )
+        llm.start_profile(output_dir=args.trace_dir, activities=[
+                "CPU",
+                "GPU",
+            ], with_stack=False, record_shapes=True, )
+        sampling_params={"max_new_tokens": 0, "temperature": 0.0}
+        outputs = llm.generate(prompt=prompts, sampling_params=sampling_params)
+        llm.stop_profile()
+        print(f"output: {outputs}")
 
-        def dooly_trace_handler(dir_name: str, model_name: str, tp: int):
-            """torch.profiler handler that writes to a predictable filename
-            ``{model_name}_{tp}_dooly_trace.json`` and appends the
-            TAINT_REGISTRY snapshot as a top-level key. Mirrors the pattern
-            of torch.profiler.tensorboard_trace_handler.
+        # Sleep so children process dumping thread has time to write back to file
+        time.sleep(5)
+        llm.shutdown()
 
-            The handler runs after the profile context exits, at which point
-            TAINT_REGISTRY is fully populated by the preceding generate()
-            call, so the snapshot is complete.
-            """
-            import json as _json
+        # Load per-rank registry dumps written by subprocesses
+        import pickle
+        import glob
+        dump_base = os.environ.get("TAINT_REGISTRY_DUMP_BASE")
+        if dump_base:
+            for dump_path in sorted(glob.glob(f"{dump_base}.*")):
+                try:
+                    with open(dump_path, "rb") as f:
+                        TAINT_REGISTRY.update(pickle.load(f))
+                    print(f"[taintracer] Loaded registry from {dump_path}")
+                except (EOFError, pickle.UnpicklingError, OSError) as e:
+                    # Subprocess can crash mid-dump (esp. on backend init
+                    # failures like fa3 on Ampere) and leave a 0-byte or
+                    # truncated pickle. Skip rather than aborting the rest
+                    # of the post-processing.
+                    print(f"[taintracer] WARNING: skipped {dump_path}: {e}")
 
-            safe_model = model_name.replace("/", "_")
-            file_name = f"{safe_model}_{tp}_dooly_trace.json"
-
-            def handler_fn(prof) -> None:
-                if not os.path.isdir(dir_name):
-                    try:
-                        os.makedirs(dir_name, exist_ok=True)
-                    except Exception as e:
-                        raise RuntimeError(f"Can't create directory: {dir_name}") from e
-                trace_path = os.path.join(dir_name, file_name)
-                prof.export_chrome_trace(trace_path)
-
-                # Inject the taint registry as a top-level key.
-                with open(trace_path, "r") as f:
-                    data = _json.load(f)
-                data["dooly_taint_registry"] = {
-                    str(v): str(t) for v, t in TAINT_REGISTRY.items()
-                    if not isinstance(t, dict)
-                }
-                with open(trace_path, "w") as f:
-                    _json.dump(data, f)
-                print(f"[Tracer] Wrote trace + taint registry "
-                      f"({len(data['dooly_taint_registry'])} entries) to {trace_path}")
-
-            return handler_fn
-
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            # with_stack=True,
-            record_shapes=True,
-            on_trace_ready=dooly_trace_handler(args.trace_dir, args.model, args.tensor_parallel_size),
-        ) as prof:
-            llm.generate([args.prompts] * args.batch_size, sampling_params=sampling_params)
+        # Inject the merged taint registry as a top-level key in the SGLang
+        # trace JSON, mirroring `dooly_trace_handler` in run/run-tracer.py.
+        # SGLang writes traces as gzipped JSON via start_profile/stop_profile;
+        # we round-trip through gzip here. We pick the most recently modified
+        # `*.trace.json[.gz]` in args.trace_dir to avoid stale files.
+        import json as _json
+        import gzip as _gzip
+        _trace_candidates = sorted(
+            glob.glob(os.path.join(args.trace_dir, "*.trace.json.gz")) +
+            glob.glob(os.path.join(args.trace_dir, "*.trace.json")),
+            key=os.path.getmtime,
+        )
+        if _trace_candidates:
+            _trace_path = _trace_candidates[-1]
+            _is_gz = _trace_path.endswith(".gz")
+            with (_gzip.open(_trace_path, "rt") if _is_gz else open(_trace_path, "rt")) as f:
+                _data = _json.load(f)
+            _data["dooly_taint_registry"] = {
+                str(v): str(t) for v, t in TAINT_REGISTRY.items()
+                if not isinstance(t, dict)
+            }
+            _out_path = _trace_path[:-3] if _is_gz else _trace_path
+            with open(_out_path, "wt") as f:
+                _json.dump(_data, f)
+            if _is_gz and _out_path != _trace_path:
+                os.remove(_trace_path)
+            print(f"[Tracer] Wrote trace + taint registry "
+                  f"({len(_data['dooly_taint_registry'])} entries) to {_out_path}")
+        else:
+            print(f"[Tracer] WARNING: no trace file found in {args.trace_dir}")
 
         print(f"[Tracer] Done tracing {args.model}, output saved to {args.trace_dir}")
 
