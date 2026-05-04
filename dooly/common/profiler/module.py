@@ -33,6 +33,7 @@ class ModuleInfo:
     count: int = 0 # count of occurance (before deduplication)
     hierarchy: Optional[OperationHierarchy] = field(default=None, repr=False)
     absorbed_ops: List[str] = field(default_factory=list)  # ops merged into this module by resolver
+    state_hash: str = ""
     
     # Convenience properties for accessing hierarchy info
     @property
@@ -108,7 +109,10 @@ class ModuleInfo:
                     if dim_type == DimensionType.MODEL_CONFIG:
                         # Use a generic name for MODEL_CONFIG dimensions
                         param_name = f"input{i}_dim{j}"
-                        params_dict[param_name] = dim_val
+                        if type(dim_val) is int:
+                            params_dict[param_name] = dim_val
+                        else:
+                            params_dict[param_name] = tuple(dim_val)
             elif inp.type == "Scalar" and inp.scalar_value:
                 # Extract scalar value
                 param_name = f"input{i}_scalar"
@@ -216,10 +220,25 @@ class ModuleComparator:
             # No children: return just anchor's params
             return anchor_params_tuple
 
-    def _module_signature(
-        self, module: ModuleInfo
-    ) -> Tuple[str, str, Tuple[Tuple[str, Any], ...]]:
-        return (module.operation_name, self._get_model_param_signature(module))
+    def _get_kernel_signature(self, module: ModuleInfo) -> Tuple[str, ...]:
+        return tuple(sorted({k.name for k in module.kernels if k.name}))
+
+    def _get_module_kernel_signature(self, module: ModuleInfo) -> Tuple[str, ...]:
+        nearest = module.hierarchy.nearest_module if module.hierarchy else None
+        if nearest is None:
+            return ()
+        return tuple(sorted(getattr(nearest, 'descendant_kernels', frozenset())))
+
+    def _module_signature(self, module: ModuleInfo) -> Tuple:
+        parts = [
+            module.operation_name,
+            self._get_model_param_signature(module),
+            self._get_kernel_signature(module),
+        ]
+        if module.is_module:
+            parts.append(self._get_module_kernel_signature(module))
+            parts.append(module.state_hash or "")
+        return tuple(parts)
 
     def _hash_signature(self, signature: Tuple) -> str:
         """Convert a signature tuple to a stable hash string."""
@@ -246,6 +265,7 @@ class ModuleComparator:
         model_module_infos: List[List[Tuple[ModuleInfo, Callable]]],
         model_names: Optional[List[str]] = None,
         db_path: Optional[str] = None,
+        overwrite: bool = False,
     ) -> Dict[str, List[Tuple[ModuleInfo, Callable, str, str]]]:
         if model_names is None:
             model_names = [f"Model{i+1}" for i in range(len(model_module_infos))]
@@ -258,7 +278,7 @@ class ModuleComparator:
 
         # Load existing signatures from database
         existing_hashes = set()
-        if db_path:
+        if db_path and not overwrite:
             existing_hashes = self._load_existing_signatures(db_path)
             if existing_hashes:
                 print(f"[COMPARATOR] Loaded {len(existing_hashes)} existing signatures from database")

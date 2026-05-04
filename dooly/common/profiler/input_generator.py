@@ -19,6 +19,22 @@ def is_attention_operation(module: ModuleInfo) -> bool:
     return False
 
 
+def classify_op(module: ModuleInfo) -> str:
+    """Classify an op so the profiler can choose an input sweep strategy."""
+    name = module.module_name or ""
+    if is_attention_operation(module):
+        return "attention"
+    for tok in ("FusedMoE", "SharedFusedMoE", "MoE"):
+        if tok in name:
+            return "moe"
+    for tok in ("Mamba", "MambaMixer"):
+        if tok in name:
+            return "mamba"
+    if "SSM" in name:
+        return "ssm"
+    return "stateless"
+
+
 
 class InputGenerator:
     # for a given ModuleInfo, generate the inputs needed to profile
@@ -193,8 +209,14 @@ class InputGenerator:
                         # MODEL_CONFIG dimension - keep fixed value from trace
                         shape.append(actual_dim_value)
 
-                # Validate shape
+                # A zero dim usually indicates an optional Tensor arg that was
+                # None in the traced call. Preserve positional alignment by
+                # emitting None instead of failing the whole config.
                 if not all(isinstance(d, int) and d > 0 for d in shape):
+                    if any(isinstance(d, int) and d == 0 for d in shape):
+                        print(f"[InputGenerator] Shape {shape} has zero dim — treating as None")
+                        inputs.append(None)
+                        continue
                     print(f"[InputGenerator] Invalid shape {shape}, skipping input")
                     print(f"[InputGenerator]   actual_shape={profile_input.actual_shape}")
                     print(f"[InputGenerator]   dimensions={[d.value for d in profile_input.dimensions]}")
@@ -254,88 +276,76 @@ class InputGenerator:
         return generate_vidur_num_tokens(max_size=self.max_num_token)
 
     def prepare_inputs(self, mode: str, use_batch_config: bool = None) -> Union[List[AttentionBatchConfig], List[Dict[str, int]]]:
-        """
-        Generate workload configurations for profiling.
+        if use_batch_config is True:
+            return self._prepare_attention_inputs(mode)
+        if use_batch_config is False:
+            return self._prepare_stateless_inputs()
 
-        For attention operations: Returns List[AttentionBatchConfig]
-        For non-attention operations: Returns List[Dict] with keys 'num_tokens', 'num_requests'
-        """
-        if use_batch_config is None:
-            use_batch_config = is_attention_operation(self.module)
+        op_class = classify_op(self.module)
+        if op_class == "attention":
+            return self._prepare_attention_inputs(mode)
+        return self._prepare_stateless_inputs()
 
-        if use_batch_config:
-            # Attention operations use AttentionBatchConfig
-            if mode == "vidur":
-                self.batches = generate_vidur_inputs(
-                    max_seq_len=self.max_num_token,
-                    min_batch_size=1,
-                    max_batch_size=self.max_num_request,
-                    profile_only_prefill=False,
-                    profile_only_decode=False
-                )
-            else:
-                raise NotImplementedError(f"Mode {mode} is not implemented yet")
-            return self.batches
+    def _prepare_attention_inputs(self, mode: str) -> List[AttentionBatchConfig]:
+        if mode != "vidur":
+            raise NotImplementedError(f"Mode {mode} is not implemented yet")
+        self.batches = generate_vidur_inputs(
+            max_seq_len=self.max_num_token,
+            min_batch_size=1,
+            max_batch_size=self.max_num_request,
+            profile_only_prefill=False,
+            profile_only_decode=False,
+        )
+        return self.batches
 
-        else:
-            # Non-attention operations: generate sweep values for num_tokens and num_requests
-            num_tokens_sweep = self._generate_num_tokens_sweep()
-            num_requests_sweep = self._generate_num_requests_sweep()
+    def _prepare_stateless_inputs(self) -> List[Dict[str, int]]:
+        num_tokens_sweep = self._generate_num_tokens_sweep()
+        num_requests_sweep = self._generate_num_requests_sweep()
 
-            # Check which dimension types are present in inputs
-            has_num_tokens_dim = any(
-                inp.get_toks_dim() for inp in self.module.inputs if inp.type == "Tensor"
-            )
-            has_num_requests_dim = any(
-                inp.get_reqs_dim() for inp in self.module.inputs if inp.type == "Tensor"
-            )
+        has_num_tokens_dim = any(
+            inp.get_toks_dim() for inp in self.module.inputs if inp.type == "Tensor"
+        )
+        has_num_requests_dim = any(
+            inp.get_reqs_dim() for inp in self.module.inputs if inp.type == "Tensor"
+        )
 
-            # Also check for MIX dimensions that contain NUM_TOKENS or NUM_REQUESTS
-            # (including MAX_NUM_TOKS and MAX_NUM_REQS variants)
-            for inp in self.module.inputs:
-                if inp.type == "Tensor" and inp.dimension_components:
-                    for dim_idx in inp.get_mix_dims():
-                        components = inp.dimension_components[dim_idx]
-                        if components:
-                            for taint_name in components.keys():
-                                if 'NUM_TOK' in taint_name:  # Matches NUM_TOKS, NUM_TOK, MAX_NUM_TOKS
-                                    has_num_tokens_dim = True
-                                if 'NUM_REQ' in taint_name:  # Matches NUM_REQS, NUM_REQ, MAX_NUM_REQS
-                                    has_num_requests_dim = True
+        for inp in self.module.inputs:
+            if inp.type == "Tensor" and inp.dimension_components:
+                for dim_idx in inp.get_mix_dims():
+                    components = inp.dimension_components[dim_idx]
+                    if components:
+                        for taint_name in components.keys():
+                            if 'NUM_TOK' in taint_name:
+                                has_num_tokens_dim = True
+                            if 'NUM_REQ' in taint_name:
+                                has_num_requests_dim = True
 
-            workload_configs = []
-
-            if has_num_tokens_dim and has_num_requests_dim:
-                # Generate combinations of both (could be expensive, limit combinations)
-                # Use a subset to avoid explosion
-                for num_tokens in num_tokens_sweep:
-                    for num_requests in num_requests_sweep:
-                        # Skip invalid combinations where num_tokens < num_requests
-                        if num_tokens >= num_requests:
-                            workload_configs.append({
-                                'num_tokens': num_tokens,
-                                'num_requests': num_requests
-                            })
-            elif has_num_tokens_dim:
-                # Only sweep num_tokens
-                for num_tokens in num_tokens_sweep:
-                    workload_configs.append({
-                        'num_tokens': num_tokens,
-                        'num_requests': 1  # Default
-                    })
-            elif has_num_requests_dim:
-                # Only sweep num_requests
+        workload_configs = []
+        if has_num_tokens_dim and has_num_requests_dim:
+            for num_tokens in num_tokens_sweep:
                 for num_requests in num_requests_sweep:
-                    workload_configs.append({
-                        'num_tokens': num_requests,  # Default to same value
-                        'num_requests': num_requests
-                    })
-            else:
-                # No workload dimensions, just use default values
+                    if num_tokens >= num_requests:
+                        workload_configs.append({
+                            'num_tokens': num_tokens,
+                            'num_requests': num_requests
+                        })
+        elif has_num_tokens_dim:
+            for num_tokens in num_tokens_sweep:
                 workload_configs.append({
-                    'num_tokens': 1,
+                    'num_tokens': num_tokens,
                     'num_requests': 1
                 })
+        elif has_num_requests_dim:
+            for num_requests in num_requests_sweep:
+                workload_configs.append({
+                    'num_tokens': num_requests,
+                    'num_requests': num_requests
+                })
+        else:
+            workload_configs.append({
+                'num_tokens': 1,
+                'num_requests': 1
+            })
 
-            self.batches = workload_configs
-            return self.batches    
+        self.batches = workload_configs
+        return self.batches
