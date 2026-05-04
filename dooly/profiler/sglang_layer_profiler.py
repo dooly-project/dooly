@@ -69,6 +69,8 @@ class SgLangLayerProfiler:
         gpu_memory_utilization: float = 0.9,
         max_model_len: int = 2048,
         attn_backend: str = "flashinfer",
+        flash_attn_version: int = 2,
+        quantization: Optional[str] = None,
         gpu: str = "0"
     ):
         """
@@ -84,6 +86,14 @@ class SgLangLayerProfiler:
         self.model_name = model_name
         self.dtype = dtype
         self.torch_dtype = getattr(torch, dtype)
+
+        normalized_attn_backend = attn_backend
+        if attn_backend.upper() == "FLASH_ATTN" or attn_backend.lower() == "flash_attn":
+            normalized_attn_backend = "fa4" if flash_attn_version == 4 else "fa3"
+        elif attn_backend.upper() == "FLASHINFER":
+            normalized_attn_backend = "flashinfer"
+        elif attn_backend.upper() == "TRITON_ATTN":
+            normalized_attn_backend = "triton"
 
         # Use the requested physical CUDA device instead of remapping it via
         # CUDA_VISIBLE_DEVICES.
@@ -104,7 +114,8 @@ class SgLangLayerProfiler:
             load_format="dummy",
             mem_fraction_static=gpu_memory_utilization,
             context_length=max_model_len,
-            attention_backend=attn_backend,
+            attention_backend=normalized_attn_backend,
+            quantization=quantization,
             tp_size=1,
             trust_remote_code=True,
             disable_cuda_graph=True,

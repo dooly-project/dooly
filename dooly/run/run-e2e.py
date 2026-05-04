@@ -4,9 +4,9 @@ import glob
 import argparse
 import subprocess
 
-os.environ["PATH"] = f"/usr/local/cuda-13.2/bin:{os.environ.get('PATH', '')}"
-os.environ["LD_LIBRARY_PATH"] = f"/usr/local/cuda-13.2/lib64:{os.path.join(sys.prefix, 'lib')}:{os.environ.get('LD_LIBRARY_PATH', '')}"
-os.environ["CUDA_HOME"] = "/usr/local/cuda-13.2/"
+os.environ["PATH"] = f"/usr/local/cuda-13.0/bin:{os.environ.get('PATH', '')}"
+os.environ["LD_LIBRARY_PATH"] = f"/usr/local/cuda-13.0/lib64:{os.path.join(sys.prefix, 'lib')}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+os.environ["CUDA_HOME"] = "/usr/local/cuda-13.0/"
 
 def model_to_dirname(model: str) -> str:
     """Convert model name to a safe directory name."""
@@ -27,10 +27,10 @@ _BACKEND_ALIASES = {
 
 def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attention_backend: str, tokenizer: str | None = None, quantization: str | None = None):
     """Run the tracer as a subprocess (required due to module-level patching)."""
-    # SGLang tracer lives in a sibling directory: dooly/run-sglang/run-tracer.py
+    # SGLang tracer lives in a sibling directory: dooly/run/run-tracer.py
     tracer_script = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "run-sglang",
+        "run",
         "run-tracer.py",
     )
     cmd = [
