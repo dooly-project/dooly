@@ -293,7 +293,9 @@ def _torch_function_implementation(cls, func, types, args=(), kwargs=None):
 
     def wrap_output(x):
         if isinstance(x, torch.Tensor):
-            out_shape = tuple(x.shape)
+            with torch._C.DisableTorchFunction():
+                with torch._C._DisableTorchDispatch():
+                    out_shape = tuple(torch.Tensor.size(x))
             try:
                 out_taints = list(propagate_taints(input_infos, out_shape))
             except Exception:

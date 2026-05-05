@@ -630,6 +630,8 @@ class TaintedTensor(torch.Tensor):
 
         # Special handling for copy_: source taints should propagate to destination
         func_name = func.name() if hasattr(func, 'name') else str(func)
+        if ("size" in func_name):
+            print(f"[DEBUG ANOOP] func name: {func_name}")
         is_copy = 'copy_' in func_name or 'copy' in func_name
         
         def wrap_output(x):
@@ -833,4 +835,3 @@ class TaintedParameter(torch.nn.Parameter, TaintedTensor):
             self._dim_taints = data._dim_taints
         else:
             self._dim_taints = tuple([None] * data.ndim)
-
