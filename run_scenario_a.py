@@ -192,6 +192,9 @@ _CONFIG_SCHEMA: list[tuple[str, str, object, callable]] = [
     ("max_batch_size", "sweep",  4,                     int),
     ("max_seq_len",    "sweep",  16384,                 int),
     ("tp",             "sweep",  1,                     int),
+    # dtype is part of profiled_models's uniqueness key, so multi-dtype
+    # experiments don't ghost-skip on (model, backend, tp) collisions.
+    ("dtype",          "sweep",  "bfloat16",            str),
     # gpus
     ("num_gpus",       "gpus",   1,                     int),
     ("gpu_ids",        "gpus",   None,                  str),
@@ -291,20 +294,24 @@ def resolve_pairs(args: argparse.Namespace) -> List[Tuple[str, str]]:
         f"db_path={resolved['db_path']}, workspace_dir={resolved['workspace_dir']}, "
         f"max_batch_size={resolved['max_batch_size']}, "
         f"max_seq_len={resolved['max_seq_len']}, tp={resolved['tp']}, "
+        f"dtype={resolved['dtype']}, "
         f"num_gpus={resolved['num_gpus']}, gpu_ids={resolved['gpu_ids']!r}"
         + (f"  (config: {args.config})" if config_data else "")
     )
     return pairs
 
 
-def already_profiled(db: Path, model: str, backend: str, tp: int) -> bool:
-    """Check DB for existing (model, backend, tp) row.
+def already_profiled(db: Path, model: str, backend: str, tp: int, dtype: str) -> bool:
+    """Check DB for existing (model, backend, tp, dtype) row.
 
     Uses a long busy-timeout so concurrent workers wait on the SQLite lock
     instead of raising, and catches OperationalError defensively: on a transient
     DB error we return False (i.e. "assume not profiled"). The worst case is
-    re-profiling a pair, which is fine — `profiled_models` has a UNIQUE
-    constraint that will reject the duplicate on insert.
+    re-profiling a pair, which is fine — `profiled_models` has a UNIQUE INDEX
+    on (model_name, backend, tp_degree, dtype) that rejects duplicates on insert.
+
+    dtype is part of the key so multi-dtype experiments (e.g. comparing bf16
+    vs fp16 cost) don't ghost-collide.
     """
     if not db.exists():
         return False
@@ -312,13 +319,13 @@ def already_profiled(db: Path, model: str, backend: str, tp: int) -> bool:
         with sqlite3.connect(str(db), timeout=60.0) as con:
             (n,) = con.execute(
                 "SELECT COUNT(*) FROM profiled_models "
-                "WHERE model_name=? AND backend=? AND tp_degree=?",
-                (model, backend, tp),
+                "WHERE model_name=? AND backend=? AND tp_degree=? AND dtype=?",
+                (model, backend, tp, dtype),
             ).fetchone()
         return n > 0
     except sqlite3.OperationalError as e:
         print(f"[WARN] already_profiled check failed for "
-              f"{model}/{backend}/tp{tp}: {e}", flush=True)
+              f"{model}/{backend}/tp{tp}/{dtype}: {e}", flush=True)
         return False
 
 
@@ -350,6 +357,7 @@ def run_one(
     tp: int,
     gpu: int,
     quantization: str | None = None,
+    dtype: str,
 ) -> int:
     safe = model.replace("/", "_")
     log_path = log_dir / f"{safe}__{backend}__gpu{gpu}.log"
@@ -358,6 +366,7 @@ def run_one(
         PY, "-m", "dooly.run.run-e2e",
         "--models", model,
         "--attention-backend", backend,
+        "--dtype", dtype,
         "--max-batch-size", str(max_batch_size),
         "--max-seq-len", str(max_seq_len),
         "--tp", str(tp),
@@ -392,15 +401,15 @@ def worker_loop(
     )
     for model, backend in my_pairs:
         try:
-            if already_profiled(worker_db, model, backend, args.tp):
-                log_progress(progress, f"[gpu{gpu}] SKIP (already in DB): {model} {backend}")
+            if already_profiled(worker_db, model, backend, args.tp, args.dtype):
+                log_progress(progress, f"[gpu{gpu}] SKIP (already in DB): {model} {backend} dtype={args.dtype}")
                 continue
 
             if args.dry_run:
-                log_progress(progress, f"[gpu{gpu}] DRY-RUN would start: {model} {backend}")
+                log_progress(progress, f"[gpu{gpu}] DRY-RUN would start: {model} {backend} dtype={args.dtype}")
                 continue
 
-            log_progress(progress, f"[gpu{gpu}] START: {model} {backend}")
+            log_progress(progress, f"[gpu{gpu}] START: {model} {backend} dtype={args.dtype}")
             ec = run_one(
                 model=model, backend=backend,
                 db=worker_db, ws=args.workspace_dir, log_dir=log_dir,
@@ -409,8 +418,9 @@ def worker_loop(
                 tp=args.tp,
                 gpu=gpu,
                 quantization=args.quantization,
+                dtype=args.dtype,
             )
-            log_progress(progress, f"[gpu{gpu}] DONE: {model} {backend} exit={ec}")
+            log_progress(progress, f"[gpu{gpu}] DONE: {model} {backend} dtype={args.dtype} exit={ec}")
         except Exception as e:
             log_progress(
                 progress,
@@ -432,6 +442,11 @@ def main() -> int:
     ap.add_argument("--max-batch-size", type=int, default=None)
     ap.add_argument("--max-seq-len", type=int, default=None)
     ap.add_argument("--tp", type=int, default=None)
+    ap.add_argument("--dtype", type=str, default=None,
+                    help="Model dtype to profile at (e.g. bfloat16, float16). "
+                         "Stored on profiled_models so fp16/bf16 runs of the same "
+                         "(model, backend, tp) tuple are tracked as distinct rows. "
+                         "(default: bfloat16, or whatever the config supplies)")
     ap.add_argument("--num-gpus", type=int, default=None,
                     help="How many GPUs to run across in parallel. Pairs are "
                          "round-robin partitioned; each worker uses --gpu N. "

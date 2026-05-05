@@ -458,8 +458,17 @@ class Profiler:
                 model_family TEXT NOT NULL,
                 backend TEXT NOT NULL,
                 tp_degree INTEGER NOT NULL,
+                dtype TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+        # Enforce uniqueness on the (model, backend, tp, dtype) tuple. Must be
+        # an INDEX rather than an inline UNIQUE constraint so it can be added
+        # to existing DBs without recreating the table; existing rows missing
+        # a dtype value are backfilled from a one-shot ALTER TABLE migration.
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ix_profiled_models_unique
+                ON profiled_models(model_name, backend, tp_degree, dtype)
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS model_operations (
@@ -1218,27 +1227,30 @@ class Profiler:
         try:
             conn.execute("BEGIN")
 
+            # dtype is stored on profiled_models so multi-dtype experiments
+            # don't ghost-collide on the (model, backend, tp) tuple.
+            dtype_str = str(self.dtype).split(".")[-1]
             for model in models:
                 # Check if this model configuration already exists
                 cursor = conn.execute(
                     """SELECT model_id FROM profiled_models
-                       WHERE model_name = ? AND model_family = ? AND backend = ? AND tp_degree = ?""",
-                    (model.name, model.model_family, self.attention_backend, self.tp_config)
+                       WHERE model_name = ? AND model_family = ? AND backend = ? AND tp_degree = ? AND dtype = ?""",
+                    (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str)
                 )
                 existing = cursor.fetchone()
 
                 if existing:
                     # Model already exists, use existing model_id
                     model_id = existing[0]
-                    print(f"[PROFILER] Model {model.name} (backend={self.attention_backend}, tp={self.tp_config}) already exists (model_id={model_id})")
+                    print(f"[PROFILER] Model {model.name} (backend={self.attention_backend}, tp={self.tp_config}, dtype={dtype_str}) already exists (model_id={model_id})")
                 else:
                     # Insert new model and get the auto-generated model_id
                     cursor = conn.execute(
-                        """INSERT INTO profiled_models (model_name, model_family, backend, tp_degree) VALUES (?, ?, ?, ?)""",
-                        (model.name, model.model_family, self.attention_backend, self.tp_config)
+                        """INSERT INTO profiled_models (model_name, model_family, backend, tp_degree, dtype) VALUES (?, ?, ?, ?, ?)""",
+                        (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str)
                     )
                     model_id = cursor.lastrowid
-                    print(f"[PROFILER] Created new model entry (model_id={model_id})")
+                    print(f"[PROFILER] Created new model entry (model_id={model_id}, dtype={dtype_str})")
 
                 # Use all_resolved_ops which contains ALL operations this model uses
                 # (not just the ones that need profiling).
