@@ -13,7 +13,6 @@ import sys
 import socket
 import argparse
 import time
-import torch
 
 
 def find_free_port() -> int:
@@ -28,7 +27,18 @@ def find_free_port() -> int:
 # run-tracer.py -> run/ -> dooly/ -> dooly (repo root)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-# Parse arguments BEFORE any heavy imports
+# Parse --gpu early BEFORE importing torch / CUDA so the requested physical
+# GPU is remapped to local cuda:0 inside this process and any subprocesses.
+_pre_parser = argparse.ArgumentParser(add_help=False)
+_pre_parser.add_argument("--gpu", type=str, default="0")
+_pre_args, _ = _pre_parser.parse_known_args()
+os.environ["CUDA_VISIBLE_DEVICES"] = str(_pre_args.gpu)
+
+import torch
+import torch.profiler
+os.environ["SGLANG_ENABLE_TORCH_INFERENCE_MODE"] = "1"
+
+# Parse full arguments after the CUDA device mask is established.
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="Model name or path")
 parser.add_argument("--tp", "--tensor_parallel_size", type=int, default=1, dest="tensor_parallel_size", help="Fake tensor parallel size (weights sharded but run on 1 GPU)")
@@ -36,17 +46,26 @@ parser.add_argument("--dtype", type=str, default="bfloat16", help="Model dtype")
 parser.add_argument("--prompts", type=str, default="Hello, how are you? I am fine, and ", help="Prompt to run")
 parser.add_argument("--max-tokens", type=int, default=1, help="Max tokens to generate")
 parser.add_argument("--trace_dir", type=str, default="/home/jkim38/dooly/profiler/vllm_traces_tp", help="Directory to save trace")
-parser.add_argument("--gpu", type=int, default=0, help="GPU device index to use")
+parser.add_argument("--gpu", type=str, default="0", help="GPU device index to use")
 parser.add_argument("--attention-backend", type=str, default="fa3", help="Attention backend for SGLang. Accepts SGLang names like flashinfer/fa3/fa4/triton, plus legacy aliases like FLASHINFER/FLASH_ATTN/TRITON_ATTN.")
 parser.add_argument("--flash-attn-version", type=int, default=2, choices=[2, 3, 4], help="Only used when --attention-backend is a FlashAttention alias. Maps to SGLang fa3/fa4.")
 parser.add_argument("--quantization", type=str, default=None, choices=["fp8", "awq", "gptq"], help="Optional quantization scheme for SGLang dummy loading.")
 parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
+parser.add_argument("--enable-torch-compile", action="store_true", help="Follow SGLang main-branch torch.compile path.")
+parser.add_argument("--torch-compile-max-bs", type=int, default=32, help="Maximum batch size to compile when --enable-torch-compile is set.")
+parser.add_argument("--context-length", type=int, default=None, help="Override model context length. Lower this to reduce memory.")
+parser.add_argument("--max-running-requests", type=int, default=263, help="Max running requests for the SGLang engine.")
+parser.add_argument("--max-total-tokens", type=int, default=521, help="Max total tokens for the SGLang engine.")
+parser.add_argument("--mem-fraction-static", type=float, default=None, help="Optional mem_fraction_static override for the SGLang engine.")
 args = parser.parse_args()
 
-import torch
-import torch.profiler
-os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-os.environ["SGLANG_ENABLE_TORCH_INFERENCE_MODE"] = "1"
+if torch.cuda.is_available():
+    torch.cuda.set_device(0)
+    print(
+        f"[Tracer] physical --gpu={args.gpu} mapped via "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} "
+        f"to local cuda:{torch.cuda.current_device()}"
+    )
 
 _SGLANG_SUPPORTED_BACKENDS = {
     "triton",
@@ -284,6 +303,9 @@ if __name__ == "__main__":
 
     # Auto-detect max_model_len from model config, capped at 32768 to avoid OOM
     max_model_len = min(get_max_model_len(args.model), 32768)
+    if args.context_length is not None:
+        max_model_len = min(args.context_length, max_model_len)
+        print(f"[Tracer] Overriding context_length to {max_model_len}")
 
     try:
     #     # Apply debug patches before LLM init
@@ -309,16 +331,23 @@ if __name__ == "__main__":
             attention_backend=sglang_attn_backend,
             load_format="dummy",
             trust_remote_code=True,
-            max_running_requests=263,
-            max_total_tokens=521,
+            max_running_requests=args.max_running_requests,
+            max_total_tokens=args.max_total_tokens,
             context_length=max_model_len,
             enable_metrics=True,
-            disable_cuda_graph=True,
-            disable_piecewise_cuda_graph=True,
             enable_tokenizer_batch_encode=True,
         )
+        if args.mem_fraction_static is not None:
+            engine_kwargs["mem_fraction_static"] = args.mem_fraction_static
         if args.quantization:
             engine_kwargs["quantization"] = args.quantization
+        if args.enable_torch_compile:
+            engine_kwargs["enable_torch_compile"] = True
+            engine_kwargs["torch_compile_max_bs"] = args.torch_compile_max_bs
+        else:
+            # Preserve the historical profiler path when compile is off.
+            engine_kwargs["disable_cuda_graph"] = True
+            engine_kwargs["disable_piecewise_cuda_graph"] = True
 
         llm = TaintedEngine(**engine_kwargs)
         llm.start_profile(output_dir=args.trace_dir, activities=[

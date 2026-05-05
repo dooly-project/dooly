@@ -20,12 +20,15 @@ _pre_parser.add_argument("--tp", type=int, default=1)
 _pre_parser.add_argument("--gpu", type=str, default="0,1,2,3")
 _pre_args, _ = _pre_parser.parse_known_args()
 os.environ["DOOLY_FAKE_TP"] = str(_pre_args.tp)
-# os.environ["CUDA_VISIBLE_DEVICES"] = str(_pre_args.gpu)
+os.environ["CUDA_VISIBLE_DEVICES"] = str(_pre_args.gpu)
 
 import torch
 import multiprocessing as mp
 from dooly.profiler.model import ModelInfo
 from dooly.profiler.profiler import Profiler 
+
+if torch.cuda.is_available():
+    torch.cuda.set_device(0)
 
 DTYPE_MAP = {
     "float32": torch.float32,
@@ -71,6 +74,10 @@ def parse_args() -> argparse.Namespace:
                         help="Optional quantization scheme. 'fp8' requires Hopper+ (H100). "
                              "Combined with load_format=dummy, vLLM initializes random "
                              "quantized weights — no quantized checkpoint needed.")
+    parser.add_argument("--enable-torch-compile", action="store_true",
+                        help="Follow SGLang main-branch torch.compile path.")
+    parser.add_argument("--torch-compile-max-bs", type=int, default=32,
+                        help="Maximum batch size to compile when --enable-torch-compile is set.")
     parser.add_argument("--workload-mode", default="vidur")
     parser.add_argument("--max-batch-size", type=int, default=5)
     parser.add_argument("--max-seq-len", type=int, default=128)
@@ -95,7 +102,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_model(model, dtype, attention_backend, flash_attn_version, quantization, max_seq_len, result_queue, gpu):
+def resolve_model(
+    model,
+    dtype,
+    attention_backend,
+    flash_attn_version,
+    quantization,
+    max_seq_len,
+    result_queue,
+    gpu,
+    enable_torch_compile,
+    torch_compile_max_bs,
+):
     from dooly.profiler.importer import OpImporter
     from dooly.profiler.resolver import ModuleResolver
     from dooly.profiler.sglang_layer_profiler import SgLangLayerProfiler
@@ -121,6 +139,8 @@ def resolve_model(model, dtype, attention_backend, flash_attn_version, quantizat
         flash_attn_version=flash_attn_version,
         quantization=quantization,
         gpu=gpu,
+        enable_torch_compile=enable_torch_compile,
+        torch_compile_max_bs=torch_compile_max_bs,
     )
     resolver = ModuleResolver(
         vlp=vlp,
@@ -223,7 +243,21 @@ def main() -> None:
 
     for i, model in enumerate(models):
         print(f"[RUNNER] Starting RESOLVER for {model.name}...")
-        p = mp.Process(target=resolve_model, args=(model, dtype, args.attention_backend, args.flash_attn_version, args.quantization, args.max_seq_len, result_queue, args.gpu))
+        p = mp.Process(
+            target=resolve_model,
+            args=(
+                model,
+                dtype,
+                args.attention_backend,
+                args.flash_attn_version,
+                args.quantization,
+                args.max_seq_len,
+                result_queue,
+                args.gpu,
+                args.enable_torch_compile,
+                args.torch_compile_max_bs,
+            ),
+        )
         p.start()
         model.to_profile_resolved = result_queue.get()
         p.join()

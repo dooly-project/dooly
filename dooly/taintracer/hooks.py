@@ -126,6 +126,15 @@ def _strip_tainted_scalars(obj):
     return obj
 
 
+def _wrap_or_retag_tensor(result, dim_taints):
+    """Wrap plain tensor outputs or retag an existing TaintedTensor."""
+    taints = tuple(dim_taints)
+    if isinstance(result, TaintedTensor):
+        object.__setattr__(result, "_dim_taints", taints)
+        return result
+    return TaintedTensor(result, taints)
+
+
 # ---------------------------------------------------------------------------
 # Triton JIT patch
 # ---------------------------------------------------------------------------
@@ -199,12 +208,14 @@ def _torch_function_implementation(cls, func, types, args=(), kwargs=None):
 
     taint_str = "no_inputs"
     annotated_name = f"{op_name}"
+    input_infos = []
 
     # Use DisableTorchFunction to avoid recursion when inspecting tensor properties
     with torch._C.DisableTorchFunction():
         try:
             input_shapes = []
             input_ints = []
+            scalar_infos = []
 
             def format_tensor_shape(tensor):
                 if isinstance(tensor, TaintedTensor):
@@ -226,10 +237,19 @@ def _torch_function_implementation(cls, func, types, args=(), kwargs=None):
                             # Use just the taint name, not the full DimTaint repr
                             taint_repr = taint_repr.taint if taint_repr.taint else taint_repr
                         input_ints.append(f"{taint_repr}={obj.value}")
+                        scalar_infos.append((obj.value, DimTaint.from_taint(taint_repr)))
                 elif isinstance(obj, torch.Tensor):
                     shape_str = format_tensor_shape(obj)
                     if shape_str:
                         input_shapes.append(shape_str)
+                    if isinstance(obj, TaintedTensor):
+                        shape = tuple(torch.Tensor.size(obj))
+                        input_infos.append((shape, obj._dim_taints))
+                    else:
+                        shape = tuple(torch.Tensor.size(obj))
+                        input_infos.append(
+                            (shape, tuple(None for _ in range(len(shape))))
+                        )
                 elif isinstance(obj, (list, tuple)) and not isinstance(obj, TaintedShape):
                     for item in obj:
                         collect_from(item)
@@ -260,7 +280,46 @@ def _torch_function_implementation(cls, func, types, args=(), kwargs=None):
 
     with record_function(annotated_name):
         with torch._C.DisableTorchFunction():
-            return func(*stripped_args, **stripped_kwargs)
+            result = func(*stripped_args, **stripped_kwargs)
+
+    # Most Python-level ops still flow into __torch_dispatch__ and already
+    # return TaintedTensor outputs. Custom-op boundaries can instead return
+    # plain tensors here, which drops dimension labels like MODEL_CONFIG.
+    # Re-wrap only those plain tensor outputs using shape-based propagation.
+    if not input_infos:
+        return result
+
+    from .propagation import propagate_taints
+
+    def wrap_output(x):
+        if isinstance(x, torch.Tensor):
+            out_shape = tuple(x.shape)
+            try:
+                out_taints = list(propagate_taints(input_infos, out_shape))
+            except Exception:
+                out_taints = [None for _ in range(len(out_shape))]
+
+            # Recover taints for dimensions determined by scalar metadata
+            # (for example, size_n in custom GEMM wrappers) after the call has
+            # stripped TaintedInt/TaintedFloat wrappers for kernel safety.
+            if scalar_infos:
+                for i, dim in enumerate(out_shape):
+                    if out_taints[i] is not None:
+                        continue
+                    matches = [taint for value, taint in scalar_infos if value == dim]
+                    if not matches:
+                        continue
+                    first = matches[0]
+                    if all(match == first for match in matches[1:]):
+                        out_taints[i] = first
+            return _wrap_or_retag_tensor(x, tuple(out_taints))
+        if isinstance(x, (list, tuple)):
+            return type(x)(wrap_output(i) for i in x)
+        if isinstance(x, dict):
+            return {k: wrap_output(v) for k, v in x.items()}
+        return x
+
+    return wrap_output(result)
 
 
 # ---------------------------------------------------------------------------
@@ -701,7 +760,7 @@ def _wrap_factory_output(original_fn):
 
         result = original_fn(*plain_args, **plain_kwargs)
         if has_taint:
-            return TaintedTensor(result, taints)
+            return _wrap_or_retag_tensor(result, taints)
         return result
 
     return wrapper
@@ -745,7 +804,7 @@ def _wrap_arange(original_fn):
             # arange always returns a 1D tensor
             # The size of this 1D tensor depends on start/end/step.
             # So the dimension 0 is tainted.
-            return TaintedTensor(result, (taint_label,))
+            return _wrap_or_retag_tensor(result, (taint_label,))
             
         return result
     return wrapper
@@ -862,7 +921,7 @@ def _wrap_torch_reshape(original_fn):
 
             # Wrap result if we have any taints
             if any(t is not None for t in output_taints):
-                return TaintedTensor(result, tuple(output_taints))
+                return _wrap_or_retag_tensor(result, tuple(output_taints))
 
             return result
 
@@ -968,7 +1027,7 @@ def _wrap_view_reshape(original_fn, fn_name):
 
                 # Wrap result if we have any taints
                 if any(t is not None and t.taint is not None for t in output_taints):
-                    return TaintedTensor(result, tuple(output_taints))
+                    return _wrap_or_retag_tensor(result, tuple(output_taints))
                 return result
             else:
                 # STEP 1: Aggregate input taints from self._dim_taints
@@ -1144,7 +1203,7 @@ def _wrap_view_reshape(original_fn, fn_name):
 
             # Wrap result if we have any taints
             if any(t is not None and t.taint is not None for t in output_taints):
-                return TaintedTensor(result, tuple(output_taints))
+                return _wrap_or_retag_tensor(result, tuple(output_taints))
 
             return result
 
@@ -1186,7 +1245,7 @@ def _wrap_permute(original_fn, fn_name):
                     else:
                         new_taints.append(None)
 
-                return TaintedTensor(result, tuple(new_taints))
+                return _wrap_or_retag_tensor(result, tuple(new_taints))
                     
             return result
         
@@ -1238,7 +1297,7 @@ def _wrap_transpose(original_fn, fn_name):
                 if dim0 < len(new_taints) and dim1 < len(new_taints):
                     new_taints[dim0], new_taints[dim1] = new_taints[dim1], new_taints[dim0]
 
-                return TaintedTensor(result, tuple(new_taints))
+                return _wrap_or_retag_tensor(result, tuple(new_taints))
 
             return result
     
@@ -1341,7 +1400,7 @@ def _wrap_cat(original_fn):
                     else:
                         output_taints.append(None)
 
-            return TaintedTensor(result, tuple(output_taints))
+            return _wrap_or_retag_tensor(result, tuple(output_taints))
     
         finally:
             if not was_already_in_hook:
@@ -1416,7 +1475,7 @@ def _wrap_stack(original_fn):
                         output_taints.append(None)
                     input_idx += 1
 
-            return TaintedTensor(result, tuple(output_taints))
+            return _wrap_or_retag_tensor(result, tuple(output_taints))
     
         finally:
             if not was_already_in_hook:
@@ -1496,13 +1555,13 @@ def _wrap_split(original_fn):
                             # Plain int → dimension loses taint
                             new_taints[dim] = None
 
-                    new_results.append(TaintedTensor(result, tuple(new_taints)))
+                    new_results.append(_wrap_or_retag_tensor(result, tuple(new_taints)))
                 return tuple(new_results)
             else:
                 # Mode 2: Single int - preserve all original taints
                 new_results = []
                 for result in results:
-                    new_results.append(TaintedTensor(result, tensor._dim_taints))
+                    new_results.append(_wrap_or_retag_tensor(result, tensor._dim_taints))
                 return tuple(new_results)
 
         finally:
@@ -1542,7 +1601,7 @@ def _wrap_chunk(original_fn):
             # Preserve all taints
             new_results = []
             for result in results:
-                new_results.append(TaintedTensor(result, tensor._dim_taints))
+                new_results.append(_wrap_or_retag_tensor(result, tensor._dim_taints))
                 
             return tuple(new_results)
 
@@ -1610,7 +1669,7 @@ def _wrap_unsqueeze(original_fn):
                         output_taints.append(None)
                     input_idx += 1
 
-            new_tensor = TaintedTensor(result, tuple(output_taints))
+            new_tensor = _wrap_or_retag_tensor(result, tuple(output_taints))
 
             return new_tensor
 
@@ -1674,7 +1733,7 @@ def _wrap_squeeze(original_fn):
 
             # If shapes are the same, no dimensions were removed
             if input_shape == result_shape:
-                return TaintedTensor(result, input._dim_taints)
+                return _wrap_or_retag_tensor(result, input._dim_taints)
 
             if dim is None:
                 # Mode 1: Remove all size-1 dimensions
@@ -1710,7 +1769,7 @@ def _wrap_squeeze(original_fn):
                     # Preserve all taints unchanged
                     output_taints = list(input._dim_taints)
 
-            return TaintedTensor(result, tuple(output_taints))
+            return _wrap_or_retag_tensor(result, tuple(output_taints))
 
         finally:
             if not was_already_in_hook:
@@ -1769,7 +1828,7 @@ def _wrap_unbind(original_fn):
             output_taints_tuple = tuple(output_taints)
             new_results = []
             for result in results:
-                new_results.append(TaintedTensor(result, output_taints_tuple))
+                new_results.append(_wrap_or_retag_tensor(result, output_taints_tuple))
 
             return tuple(new_results)
         
@@ -1837,19 +1896,19 @@ def _wrap_matmul(original_fn):
             elif input_ndim == 1 and other_ndim == 2:
                 # Output gets taint from second dim of other
                 new_taints = (other._dim_taints[1],)
-                return TaintedTensor(result, new_taints)
+                return _wrap_or_retag_tensor(result, new_taints)
 
             # Case 3: (m, n) @ (n,) → (m,)
             elif input_ndim == 2 and other_ndim == 1:
                 # Output gets taint from first dim of input
                 new_taints = (input._dim_taints[0],)
-                return TaintedTensor(result, new_taints)
+                return _wrap_or_retag_tensor(result, new_taints)
 
             # Case 4: (m, n) @ (n, k) → (m, k)
             elif input_ndim == 2 and other_ndim == 2:
                 # Output: [input_dim0, other_dim1]
                 new_taints = (input._dim_taints[0], other._dim_taints[1])
-                return TaintedTensor(result, new_taints)
+                return _wrap_or_retag_tensor(result, new_taints)
 
             # Case 5: Batched matmul (..., m, n) @ (..., n, k) → (..., m, k)
             else:
@@ -1872,7 +1931,7 @@ def _wrap_matmul(original_fn):
                 k_taint = other._dim_taints[-1] if other_ndim >= 1 else None
 
                 new_taints = batch_taints + (m_taint, k_taint)
-                return TaintedTensor(result, new_taints)
+                return _wrap_or_retag_tensor(result, new_taints)
         finally:
             # Only turn off flag if we were the ones who turned it on
             if not was_already_in_hook:
@@ -1977,7 +2036,7 @@ def _wrap_flatten(original_fn):
             for i in range(end_dim + 1, input_ndim):
                 new_taints.append(input._dim_taints[i])
 
-            return TaintedTensor(result, tuple(new_taints))
+            return _wrap_or_retag_tensor(result, tuple(new_taints))
 
         finally:
             if not was_already_in_hook:
@@ -2024,7 +2083,7 @@ def _wrap_pad(original_fn):
             # Sanity: result should have same ndim as input.
             if len(result.shape) != len(new_taints):
                 return result
-            return TaintedTensor(result, tuple(new_taints))
+            return _wrap_or_retag_tensor(result, tuple(new_taints))
         finally:
             if not was_already_in_hook:
                 TaintedTensor._inside_hook.active = False
@@ -2114,7 +2173,7 @@ def _wrap_expand(original_fn):
                         # (in_size must be 1 or equal to out_size)
                         out_taints.append(None)
 
-            return TaintedTensor(result, tuple(out_taints))
+            return _wrap_or_retag_tensor(result, tuple(out_taints))
 
         finally:
             if not was_already_in_hook:
@@ -2162,7 +2221,7 @@ def _wrap_linear(original_fn):
             # If weight is not tainted, preserve batch dims and mark last dim as None
             if not isinstance(weight, TaintedTensor):
                 new_taints = input._dim_taints[:-1] + (None,)
-                return TaintedTensor(result, new_taints)
+                return _wrap_or_retag_tensor(result, new_taints)
 
             # VALIDATION: Check shapes match expectations
             # input: (..., in_features), weight: (out_features, in_features)
@@ -2179,7 +2238,7 @@ def _wrap_linear(original_fn):
             output_dim_taint = weight._dim_taints[0]
 
             new_taints = batch_taints + (output_dim_taint,)
-            return TaintedTensor(result, new_taints)
+            return _wrap_or_retag_tensor(result, new_taints)
         finally:
             # Only turn off flag if we were the ones who turned it on
             if not was_already_in_hook:
@@ -2538,7 +2597,7 @@ def _wrap_einops_rearrange(original_fn):
                     # Unknown mapping type
                     out_taints.append(None)
 
-            return TaintedTensor(result, tuple(out_taints))
+            return _wrap_or_retag_tensor(result, tuple(out_taints))
 
         finally:
             if not was_already_in_hook:
@@ -2607,7 +2666,7 @@ def _wrap_einops_reduce(original_fn):
                 else:
                     out_taints.append(None)
 
-            return TaintedTensor(result, tuple(out_taints))
+            return _wrap_or_retag_tensor(result, tuple(out_taints))
 
         finally:
             if not was_already_in_hook:
@@ -2672,7 +2731,7 @@ def _wrap_einops_repeat(original_fn):
                 else:
                     out_taints.append(None)
 
-            return TaintedTensor(result, tuple(out_taints))
+            return _wrap_or_retag_tensor(result, tuple(out_taints))
 
         finally:
             if not was_already_in_hook:
@@ -2712,6 +2771,8 @@ def _wrap_einsum(original_fn):
 
             # Call original operation
             result = original_fn(equation, *operands)
+            if isinstance(result, TaintedTensor):
+                return result
 
             if was_already_in_hook:
                 return result
@@ -2759,7 +2820,7 @@ def _wrap_einsum(original_fn):
                     # New dimension or broadcast - untainted
                     out_taints.append(None)
 
-            return TaintedTensor(result, tuple(out_taints))
+            return _wrap_or_retag_tensor(result, tuple(out_taints))
 
         finally:
             if not was_already_in_hook:
@@ -2876,7 +2937,7 @@ def _make_taint_aware_compiled(original_fn, original_compiled_fn):
                     # shape propagation hits an unexpected case (e.g., a
                     # dimension-collision raise inside propagate_taints).
                     out_taints = tuple(None for _ in range(len(out_shape)))
-                return TaintedTensor(x, out_taints)
+                return _wrap_or_retag_tensor(x, out_taints)
             elif isinstance(x, (list, tuple)):
                 return type(x)(wrap_output(i) for i in x)
             elif isinstance(x, dict):

@@ -25,7 +25,18 @@ _BACKEND_ALIASES = {
     "TRITON_ATTN": "triton",
 }
 
-def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attention_backend: str, tokenizer: str | None = None, quantization: str | None = None):
+def run_tracer(
+    model: str,
+    tp: int,
+    trace_dir: str,
+    dtype: str,
+    gpu: int,
+    attention_backend: str,
+    tokenizer: str | None = None,
+    quantization: str | None = None,
+    enable_torch_compile: bool = False,
+    torch_compile_max_bs: int = 32,
+):
     """Run the tracer as a subprocess (required due to module-level patching)."""
     # SGLang tracer lives in a sibling directory: dooly/run/run-tracer.py
     tracer_script = os.path.join(
@@ -46,6 +57,9 @@ def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attent
         cmd.extend(["--tokenizer", tokenizer])
     if quantization:
         cmd.extend(["--quantization", quantization])
+    if enable_torch_compile:
+        cmd.append("--enable-torch-compile")
+        cmd.extend(["--torch-compile-max-bs", str(torch_compile_max_bs)])
     print(f"[E2E] Running tracer: {' '.join(cmd)}")
 
     result = subprocess.run(cmd, check=True)
@@ -53,7 +67,22 @@ def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attent
     return result.returncode == 0
 
 
-def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: str, dtype: str, attention_backend: str, max_batch_size: int, max_seq_len: int, gpu: int, db_path: str | None = None, profile_comm: bool = False, quantization: str | None = None):
+def run_profiler(
+    models: list[str],
+    traces: list[str],
+    tp: int,
+    profile_output: str,
+    dtype: str,
+    attention_backend: str,
+    max_batch_size: int,
+    max_seq_len: int,
+    gpu: int,
+    db_path: str | None = None,
+    profile_comm: bool = False,
+    quantization: str | None = None,
+    enable_torch_compile: bool = False,
+    torch_compile_max_bs: int = 32,
+):
     """Run the profiler as a subprocess."""
     profiler_script = os.path.join(os.path.dirname(__file__), "run-profiler.py")
     cmd = [
@@ -74,6 +103,9 @@ def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: 
         cmd.append("--profile-comm")
     if quantization:
         cmd.extend(["--quantization", quantization])
+    if enable_torch_compile:
+        cmd.append("--enable-torch-compile")
+        cmd.extend(["--torch-compile-max-bs", str(torch_compile_max_bs)])
     print(f"[E2E] Running profiler: {' '.join(cmd)}")
     result = subprocess.run(cmd, check=True)
     return result.returncode == 0
@@ -102,6 +134,10 @@ def main():
                         help="Optional quantization scheme. 'fp8' requires Hopper+ (H100). "
                              "Combined with load_format=dummy, vLLM initializes random "
                              "quantized weights — no quantized checkpoint needed.")
+    parser.add_argument("--enable-torch-compile", action="store_true",
+                        help="Follow SGLang main-branch torch.compile path.")
+    parser.add_argument("--torch-compile-max-bs", type=int, default=32,
+                        help="Maximum batch size to compile when --enable-torch-compile is set.")
     args = parser.parse_args()
 
     workspace_path = args.workspace_dir
@@ -136,6 +172,8 @@ def main():
                     attention_backend=sglang_attn_backend,
                     tokenizer=args.tokenizer,
                     quantization=args.quantization,
+                    enable_torch_compile=args.enable_torch_compile,
+                    torch_compile_max_bs=args.torch_compile_max_bs,
                 )
 
         # Step 2: Collect trace files in order matching models list
@@ -168,6 +206,8 @@ def main():
             gpu=args.gpu,
             profile_comm=args.profile_comm,
             quantization=args.quantization,
+            enable_torch_compile=args.enable_torch_compile,
+            torch_compile_max_bs=args.torch_compile_max_bs,
         )
 
     print("\n[E2E] Workflow complete!")
@@ -175,5 +215,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

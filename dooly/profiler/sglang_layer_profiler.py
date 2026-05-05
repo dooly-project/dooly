@@ -71,7 +71,9 @@ class SgLangLayerProfiler:
         attn_backend: str = "flashinfer",
         flash_attn_version: int = 2,
         quantization: Optional[str] = None,
-        gpu: str = "0"
+        gpu: str = "0",
+        enable_torch_compile: bool = False,
+        torch_compile_max_bs: int = 32,
     ):
         """
         Initialize the profiler by creating a vLLM LLM instance.
@@ -95,11 +97,13 @@ class SgLangLayerProfiler:
         elif attn_backend.upper() == "TRITON_ATTN":
             normalized_attn_backend = "triton"
 
-        # Use the requested physical CUDA device instead of remapping it via
-        # CUDA_VISIBLE_DEVICES.
-        gpu_id = int(gpu)
+        # The runner sets CUDA_VISIBLE_DEVICES before torch import, so the
+        # requested physical GPU is remapped to local cuda:0 in this process.
+        # Use the local device consistently to match the rest of the profiler
+        # stack, which allocates tensors on "cuda" / "cuda:0".
+        gpu_id = 0
         torch.cuda.set_device(gpu_id)
-        self.device = torch.device(f"cuda:{gpu_id}")
+        self.device = torch.device("cuda:0")
 
         print(f"[SGLangLayerProfiler] Initializing SgLang with model: {model_name}")
 
@@ -118,9 +122,14 @@ class SgLangLayerProfiler:
             quantization=quantization,
             tp_size=1,
             trust_remote_code=True,
-            disable_cuda_graph=True,
-            disable_piecewise_cuda_graph=True,
+            enable_torch_compile=enable_torch_compile,
+            torch_compile_max_bs=torch_compile_max_bs,
         )
+        if not enable_torch_compile:
+            # Preserve the historical eager-only profiler path unless compile
+            # is explicitly requested.
+            server_args.disable_cuda_graph = True
+            server_args.disable_piecewise_cuda_graph = True
 
         port_args = PortArgs.init_new(server_args)
 
