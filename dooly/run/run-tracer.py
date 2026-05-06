@@ -344,10 +344,8 @@ if __name__ == "__main__":
         if args.enable_torch_compile:
             engine_kwargs["enable_torch_compile"] = True
             engine_kwargs["torch_compile_max_bs"] = args.torch_compile_max_bs
-        else:
-            # Preserve the historical profiler path when compile is off.
-            engine_kwargs["disable_cuda_graph"] = True
-            engine_kwargs["disable_piecewise_cuda_graph"] = True
+        engine_kwargs["disable_cuda_graph"] = True
+        engine_kwargs["disable_piecewise_cuda_graph"] = True
 
         llm = TaintedEngine(**engine_kwargs)
         llm.start_profile(output_dir=args.trace_dir, activities=[
