@@ -16,17 +16,19 @@ import re
 import sys
 
 
-SHARD_RE = re.compile(r"profile_timings_(.+)\.csv$")
+SHARD_RE = re.compile(r"^profile_timings_(gpu\d+)\.csv$")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Merge per-shard profile_timings CSVs")
     ap.add_argument("--dir", type=Path, required=True,
-                    help="Directory containing profile_timings_*.csv files.")
+                    help="Directory containing profile_timings_gpuN.csv files.")
     ap.add_argument("--output", type=Path, default=None,
                     help="Merged output path. Defaults to {dir}/profile_timings.csv.")
-    ap.add_argument("--keep-shards", action="store_true",
-                    help="Don't delete per-shard files after merging.")
+    ap.add_argument("--delete-shards", action="store_true",
+                    help="Delete per-shard files after merging. Default: keep them. "
+                         "Backups like *_pre8192.csv or *_orig.csv are NEVER touched "
+                         "since the shard regex requires the suffix to be 'gpuN'.")
     args = ap.parse_args()
 
     d: Path = args.dir
@@ -34,9 +36,12 @@ def main() -> int:
         print(f"[ERROR] Not a directory: {d}", file=sys.stderr)
         return 2
 
+    # Only match strict 'profile_timings_gpuN.csv' — explicitly skip backups
+    # like profile_timings_gpu0_orig.csv, profile_timings_gpu0_pre8192.csv,
+    # and the merged-output file profile_timings_v2.csv.
     shard_files = sorted(
         p for p in d.glob("profile_timings_*.csv")
-        if SHARD_RE.search(p.name)
+        if SHARD_RE.match(p.name)
     )
     if not shard_files:
         print(f"[WARN] No profile_timings_*.csv files found in {d}")
@@ -70,10 +75,12 @@ def main() -> int:
 
     print(f"\n[OK] Wrote {total_rows} rows from {len(shard_files)} shards -> {out_path}")
 
-    if not args.keep_shards:
+    if args.delete_shards:
         for p in shard_files:
             p.unlink()
         print(f"[OK] Removed {len(shard_files)} shard files.")
+    else:
+        print(f"[OK] Per-shard files kept (pass --delete-shards to remove them).")
 
     return 0
 

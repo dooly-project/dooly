@@ -44,49 +44,49 @@ import threading
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
-PY = "/home/ubuntu/miniconda3/envs/dooly/bin/python"
-WORK = Path("/home/ubuntu/dooly/profiler")
+PY = "/home/jkim38/miniforge3/envs/dooly/bin/python"
+WORK = Path("/home/jkim38/dooly/profiler")
 
 DEFAULT_DB = WORK / "database" / "dooly-eval.db"
 DEFAULT_WS = WORK / "workspaces" / "scenario_a"
 
 DEFAULT_PAIRS: list[Tuple[str, str]] = [
-    # ("meta-llama/Meta-Llama-3-8B",        "FLASHINFER"),
-    # ("meta-llama/Meta-Llama-3-8B",        "FLASH_ATTN"),
-    # ("meta-llama/Meta-Llama-3-8B",        "TRITON_ATTN"),
+    ("meta-llama/Meta-Llama-3-8B",        "FLASHINFER"),
+    ("meta-llama/Meta-Llama-3-8B",        "FLASH_ATTN"),
+    ("meta-llama/Meta-Llama-3-8B",        "TRITON_ATTN"),
     ("meta-llama/Llama-3.1-8B",           "FLASHINFER"),
-    # ("meta-llama/Llama-3.1-8B",           "FLASH_ATTN"),
-    # ("meta-llama/Llama-3.1-8B",           "TRITON_ATTN"),
-    # ("meta-llama/Llama-2-7b-hf",          "FLASHINFER"),
-    # ("meta-llama/Llama-2-7b-hf",          "FLASH_ATTN"),
-    # ("meta-llama/Llama-2-7b-hf",          "TRITON_ATTN"),
-    # ("Qwen/Qwen2.5-7B",                   "FLASHINFER"),
-    # ("Qwen/Qwen2.5-7B",                   "FLASH_ATTN"),
-    # ("Qwen/Qwen2.5-7B",                   "TRITON_ATTN"),
-    # ("Qwen/Qwen3-8B",                     "FLASHINFER"),
-    # ("Qwen/Qwen3-8B",                     "FLASH_ATTN"),
-    # ("Qwen/Qwen3-8B",                     "TRITON_ATTN"),
-    # ("CohereLabs/aya-expanse-8b",         "FLASHINFER"),
-    # ("CohereLabs/aya-expanse-8b",         "FLASH_ATTN"),
-    # ("CohereLabs/aya-expanse-8b",         "TRITON_ATTN"),
+    ("meta-llama/Llama-3.1-8B",           "FLASH_ATTN"),
+    ("meta-llama/Llama-3.1-8B",           "TRITON_ATTN"),
+    ("meta-llama/Llama-2-7b-hf",          "FLASHINFER"),
+    ("meta-llama/Llama-2-7b-hf",          "FLASH_ATTN"),
+    ("meta-llama/Llama-2-7b-hf",          "TRITON_ATTN"),
+    ("Qwen/Qwen2.5-7B",                   "FLASHINFER"),
+    ("Qwen/Qwen2.5-7B",                   "FLASH_ATTN"),
+    ("Qwen/Qwen2.5-7B",                   "TRITON_ATTN"),
+    ("Qwen/Qwen3-8B",                     "FLASHINFER"),
+    ("Qwen/Qwen3-8B",                     "FLASH_ATTN"),
+    ("Qwen/Qwen3-8B",                     "TRITON_ATTN"),
+    ("CohereLabs/aya-expanse-8b",         "FLASHINFER"),
+    ("CohereLabs/aya-expanse-8b",         "FLASH_ATTN"),
+    ("CohereLabs/aya-expanse-8b",         "TRITON_ATTN"),
     ("CohereLabs/c4ai-command-r7b-12-2024", "FLASHINFER"),
-    # ("CohereLabs/c4ai-command-r7b-12-2024", "FLASH_ATTN"),
-    # ("CohereLabs/c4ai-command-r7b-12-2024", "TRITON_ATTN"),
-    # ("mistralai/Mistral-7B-v0.3",         "FLASHINFER"),
-    # ("mistralai/Mistral-7B-v0.3",         "FLASH_ATTN"),
-    # ("mistralai/Mistral-7B-v0.3",         "TRITON_ATTN"),
-    # ('mistralai/Ministral-8B-Instruct-2410', "FLASHINFER"),
-    # ('mistralai/Ministral-8B-Instruct-2410', "FLASH_ATTN"),
-    # ('mistralai/Ministral-8B-Instruct-2410', "TRITON_ATTN"),
-    # ("deepseek-ai/deepseek-llm-7b-base",  "FLASHINFER"),
-    # ("deepseek-ai/deepseek-llm-7b-base",  "FLASH_ATTN"),
-    # ("deepseek-ai/deepseek-llm-7b-base",  "TRITON_ATTN"),
-    # ("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", "FLASHINFER"),
-    # ("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", "FLASH_ATTN"),
-    # ("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", "TRITON_ATTN"),
-    # ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "FLASHINFER"),
-    # ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "FLASH_ATTN"),
-    # ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "TRITON_ATTN"),
+    ("CohereLabs/c4ai-command-r7b-12-2024", "FLASH_ATTN"),
+    ("CohereLabs/c4ai-command-r7b-12-2024", "TRITON_ATTN"),
+    ("mistralai/Mistral-7B-v0.3",         "FLASHINFER"),
+    ("mistralai/Mistral-7B-v0.3",         "FLASH_ATTN"),
+    ("mistralai/Mistral-7B-v0.3",         "TRITON_ATTN"),
+    ('mistralai/Ministral-8B-Instruct-2410', "FLASHINFER"),
+    ('mistralai/Ministral-8B-Instruct-2410', "FLASH_ATTN"),
+    ('mistralai/Ministral-8B-Instruct-2410', "TRITON_ATTN"),
+    ("deepseek-ai/deepseek-llm-7b-base",  "FLASHINFER"),
+    ("deepseek-ai/deepseek-llm-7b-base",  "FLASH_ATTN"),
+    ("deepseek-ai/deepseek-llm-7b-base",  "TRITON_ATTN"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", "FLASHINFER"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", "FLASH_ATTN"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", "TRITON_ATTN"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "FLASHINFER"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "FLASH_ATTN"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "TRITON_ATTN"),
 ]
 
 
@@ -356,6 +356,7 @@ def run_one(
     max_seq_len: int,
     tp: int,
     gpu: int,
+    overwrite: bool = False,
     quantization: str | None = None,
     dtype: str,
 ) -> int:
@@ -374,6 +375,8 @@ def run_one(
         "--db-path", str(db),
         "--gpu", str(gpu),
     ]
+    if overwrite:
+        cmd.append("--overwrite")
     if quantization:
         cmd.extend(["--quantization", quantization])
     env = os.environ.copy()
@@ -401,7 +404,7 @@ def worker_loop(
     )
     for model, backend in my_pairs:
         try:
-            if already_profiled(worker_db, model, backend, args.tp, args.dtype):
+            if not args.overwrite and already_profiled(worker_db, model, backend, args.tp, args.dtype):
                 log_progress(progress, f"[gpu{gpu}] SKIP (already in DB): {model} {backend} dtype={args.dtype}")
                 continue
 
@@ -417,6 +420,7 @@ def worker_loop(
                 max_seq_len=args.max_seq_len,
                 tp=args.tp,
                 gpu=gpu,
+                overwrite=args.overwrite,
                 quantization=args.quantization,
                 dtype=args.dtype,
             )
@@ -439,8 +443,8 @@ def main() -> int:
     # defaults when neither CLI nor config sets a value.
     ap.add_argument("--db-path", type=Path, default=None)
     ap.add_argument("--workspace-dir", type=Path, default=None)
-    ap.add_argument("--max-batch-size", type=int, default=None)
-    ap.add_argument("--max-seq-len", type=int, default=None)
+    ap.add_argument("--max-batch-size", type=int, default=64)
+    ap.add_argument("--max-seq-len", type=int, default=8192)
     ap.add_argument("--tp", type=int, default=None)
     ap.add_argument("--dtype", type=str, default=None,
                     help="Model dtype to profile at (e.g. bfloat16, float16). "
@@ -456,6 +460,8 @@ def main() -> int:
                          "Overrides --num-gpus. Length determines number of workers.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print which pairs would run/skip without launching.")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="Force re-profiling of every (model, backend) pair, even if already in DB. Plumbs --overwrite through run-e2e to run-profiler.")
     ap.add_argument("--quantization", type=str, default=None,
                     choices=["fp8", "awq", "gptq"],
                     help="Optional quantization scheme. 'fp8' requires Hopper+ (H100). "

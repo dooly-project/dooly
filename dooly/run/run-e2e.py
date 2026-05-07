@@ -43,7 +43,7 @@ def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attent
     return result.returncode == 0
 
 
-def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: str, dtype: str, attention_backend: str, max_batch_size: int, max_seq_len: int, gpu: int, db_path: str | None = None, profile_comm: bool = False, quantization: str | None = None):
+def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: str, dtype: str, attention_backend: str, max_batch_size: int, max_seq_len: int, gpu: int, db_path: str | None = None, profile_comm: bool = False, quantization: str | None = None, overwrite: bool = False):
     """Run the profiler as a subprocess."""
     profiler_script = os.path.join(os.path.dirname(__file__), "run-profiler.py")
     cmd = [
@@ -64,6 +64,8 @@ def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: 
         cmd.append("--profile-comm")
     if quantization:
         cmd.extend(["--quantization", quantization])
+    if overwrite:
+        cmd.append("--overwrite")
     print(f"[E2E] Running profiler: {' '.join(cmd)}")
     result = subprocess.run(cmd, check=True)
     return result.returncode == 0
@@ -89,6 +91,8 @@ def main():
                         help="Optional quantization scheme. 'fp8' requires Hopper+ (H100). "
                              "Combined with load_format=dummy, vLLM initializes random "
                              "quantized weights — no quantized checkpoint needed.")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Pass --overwrite to run-profiler to force re-profile of existing sigs.")
     args = parser.parse_args()
 
     workspace_path = args.workspace_dir
@@ -154,6 +158,7 @@ def main():
             gpu=args.gpu,
             profile_comm=args.profile_comm,
             quantization=args.quantization,
+            overwrite=args.overwrite,
         )
 
     print("\n[E2E] Workflow complete!")

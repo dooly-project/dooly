@@ -973,7 +973,7 @@ class HierarchicalTraceParser:
 
     def _find_nearest_module(self, event: Event) -> Optional[Event]:
         """Find the nearest (innermost) nn.Module parent of an event."""
-        current = event.parent
+        current = event
         while current:
             if current.cat == 'module':
                 return current
