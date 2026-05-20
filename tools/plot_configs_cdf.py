@@ -6,6 +6,7 @@ the selected configurations on a single plot.
 """
 
 import argparse
+import csv
 import glob
 import os
 import sys
@@ -209,6 +210,37 @@ def _rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
         return values
     kernel = np.ones(window) / window
     return np.convolve(values, kernel, mode='same')
+
+
+def _compute_batch_series(
+    trace: List[dict],
+    field: str,
+    smooth_window: int,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Return (times_since_first_dispatch_s, values) for a batch trace.
+
+    Single source of truth for batch temporal data — used by both the
+    matplotlib temporal plot and the CSV export so they cannot diverge.
+    Returns None if the trace has no dispatched step.
+    """
+    if not isinstance(trace, list) or not trace:
+        return None
+    t0 = _first_dispatch_time_ms(trace)
+    if t0 is None:
+        return None
+    times = np.array(
+        [float(r.get('sim_time_ms', 0.0)) for r in trace]
+    ) - t0
+    values = np.array(
+        [float(r.get(field, 0)) for r in trace], dtype=float,
+    )
+    mask = times >= 0
+    times, values = times[mask], values[mask]
+    if times.size == 0:
+        return None
+    if smooth_window > 1:
+        values = _rolling_mean(values, smooth_window)
+    return times / 1000.0, values
 
 
 def _draw_batch_on_ax(
@@ -474,6 +506,217 @@ def _save_split_outputs(
     print(f"✓ Saved {legend_path}")
 
 
+def _compress_constant_runs(
+    x: np.ndarray, y: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Drop interior points of horizontal segments (lossless for line plots).
+
+    A point i is "interior" iff y[i-1] == y[i] == y[i+1]. Removing such
+    points doesn't change the line drawn between consecutive samples, so
+    the rendered figure is bit-for-bit identical to the uncompressed
+    series.
+    """
+    n = x.size
+    if n <= 2:
+        return x, y
+    keep = np.ones(n, dtype=bool)
+    interior = (y[:-2] == y[1:-1]) & (y[1:-1] == y[2:])
+    keep[1:-1] = ~interior
+    return x[keep], y[keep]
+
+
+def _resample_cdf(
+    x: np.ndarray,
+    y: np.ndarray,
+    max_points: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Downsample a CDF to ~max_points while preserving tail accuracy.
+
+    Strategy: linear spacing in [0, 0.99] for the body plus geometric
+    spacing in [0.99, 1.0] so p95/p99/p999 land on real sample indices.
+    Empirical CDFs are step functions, so for each target y we pick the
+    nearest underlying sample (no interpolation between points).
+    """
+    n = x.size
+    if max_points <= 0 or n <= max_points:
+        return x, y
+
+    # ~70% body / ~30% tail; dial down if the user picked a small budget.
+    n_body = max(int(max_points * 0.7), 1)
+    n_tail = max(max_points - n_body, 1)
+
+    body = np.linspace(1.0 / n, 0.99, n_body, endpoint=False)
+    # geomspace in distance-from-1: 0.99, 0.999, 0.9999, ...
+    tail_gap = np.geomspace(0.01, max(1.0 / n, 1e-9), n_tail)
+    tail = 1.0 - tail_gap
+
+    y_targets = np.unique(np.concatenate([body, tail, [1.0]]))
+    # Each y_target maps to a real index in the sorted array (1-based / n).
+    indices = np.clip(np.ceil(y_targets * n).astype(int) - 1, 0, n - 1)
+    indices = np.unique(indices)
+    return x[indices], y[indices]
+
+
+def _collect_cdfs_for_config(
+    config_dir: str,
+    metrics: List[str],
+    sources: List[str],
+    use_batch: bool,
+    max_points: int = 0,
+    smooth_window: int = 1,
+) -> "Dict[Tuple[str, str], Tuple[np.ndarray, np.ndarray]]":
+    """Compute (x, y) arrays for each (metric, source) pair in one config.
+
+    TTFT/ITL: empirical CDF, x in seconds, y in [0, 1].
+    Batch metrics: temporal trace, x = time-since-first-dispatch (s),
+    y = the metric value at each scheduler step, with the same warm-up
+    filter and optional smoothing as the on-screen temporal plot.
+    """
+    out: Dict[Tuple[str, str], Tuple[np.ndarray, np.ndarray]] = {}
+    for metric in metrics:
+        for source in sources:
+            filepath = find_result_file(
+                config_dir, source,
+                use_batch=use_batch or metric in BATCH_METRICS,
+            )
+            if filepath is None:
+                continue
+
+            if metric in BATCH_METRICS:
+                field, _ = BATCH_METRICS[metric]
+                trace = load_json(filepath)
+                if not isinstance(trace, list) or not trace:
+                    continue
+                t0 = _first_dispatch_time_ms(trace)
+                if t0 is None:
+                    continue
+                times = np.array(
+                    [float(r.get('sim_time_ms', 0.0)) for r in trace]
+                ) - t0
+                values = np.array(
+                    [float(r.get(field, 0)) for r in trace], dtype=float
+                )
+                mask = times >= 0
+                times, values = times[mask], values[mask]
+                if times.size == 0:
+                    continue
+                if smooth_window > 1:
+                    values = _rolling_mean(values, smooth_window)
+                x, y = times / 1000.0, values
+                # Drop interior points of horizontal runs. The rendered
+                # line is unchanged but the CSV shrinks dramatically when
+                # the trace has long idle / steady-state stretches.
+                x, y = _compress_constant_runs(x, y)
+            else:
+                values = extract_metric(load_json(filepath), metric)
+                if not values:
+                    continue
+                x, y = compute_cdf(values)
+                x = x / 1000.0  # ms -> s, matches the plot's x-axis units
+                x, y = _resample_cdf(x, y, max_points)
+
+            out[(metric, source)] = (x, y)
+    return out
+
+
+def _csv_axis_names(metric: str) -> Tuple[str, str]:
+    """Column-name suffixes for (x, y) of this metric in the CSV.
+
+    Batch metrics export a temporal trace; others export an empirical CDF.
+    """
+    if metric in BATCH_METRICS:
+        return 'time_s', 'value'
+    return 'x_s', 'cdf'
+
+
+def _export_cdf_csv(
+    config_dir: str,
+    metrics: List[str],
+    sources: List[str],
+    use_batch: bool,
+    csv_path: str,
+    max_points: int = 0,
+    smooth_window: int = 1,
+) -> bool:
+    """Write one wide-format CSV with paired x/cdf columns per (metric, source).
+
+    Each series is independently sorted, so shorter series are right-padded
+    with empty cells. Returns True if any data was written.
+    """
+    cdfs = _collect_cdfs_for_config(
+        config_dir, metrics, sources, use_batch,
+        max_points=max_points, smooth_window=smooth_window,
+    )
+    if not cdfs:
+        return False
+
+    # Stable column order: metrics in user-supplied order, sources nested.
+    columns: List[Tuple[str, str]] = [
+        (m, s) for m in metrics for s in sources if (m, s) in cdfs
+    ]
+    max_len = max(cdfs[c][0].size for c in columns)
+
+    header: List[str] = []
+    for metric, source in columns:
+        x_name, y_name = _csv_axis_names(metric)
+        header.append(f'{metric}_{source}_{x_name}')
+        header.append(f'{metric}_{source}_{y_name}')
+
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        for i in range(max_len):
+            row: List[str] = []
+            for metric, source in columns:
+                x, y = cdfs[(metric, source)]
+                if i < x.size:
+                    row.append(f'{float(x[i]):.6g}')
+                    row.append(f'{float(y[i]):.6g}')
+                else:
+                    row.extend(['', ''])
+            writer.writerow(row)
+    return True
+
+
+def _export_all_cdf_csvs(
+    config_dirs: List[str],
+    metrics: List[str],
+    sources: List[str],
+    use_batch: bool,
+    csv_output_dir: str,
+    config_labels: Dict[str, str],
+    max_points: int = 0,
+    smooth_window: int = 1,
+) -> None:
+    """Write one CSV per config_dir into csv_output_dir.
+
+    TTFT/ITL columns hold an empirical CDF; batch-metric columns hold the
+    temporal trace (x = time-since-first-dispatch in seconds, y = value).
+    """
+    os.makedirs(csv_output_dir, exist_ok=True)
+    for config_dir in config_dirs:
+        if not os.path.isdir(config_dir):
+            print(f"WARNING: config dir not found: {config_dir}")
+            continue
+
+        label = (
+            config_labels.get(config_dir)
+            or read_config_model_name(config_dir, use_batch)
+            or os.path.basename(config_dir.rstrip('/'))
+        )
+        # Sanitize for use as a filename.
+        safe = ''.join(c if c.isalnum() or c in ('-', '_', '.') else '_'
+                       for c in label)
+        csv_path = os.path.join(csv_output_dir, f'{safe}_cdf.csv')
+        if _export_cdf_csv(
+            config_dir, metrics, sources, use_batch, csv_path,
+            max_points=max_points, smooth_window=smooth_window,
+        ):
+            print(f"✓ Saved CDF CSV to {csv_path}")
+        else:
+            print(f"WARNING: no CDF data exported for {config_dir}")
+
+
 def plot_configs_cdf(
     config_dirs: List[str],
     metric: str,
@@ -486,6 +729,8 @@ def plot_configs_cdf(
     smooth_window: int = 1,
     config_labels: Optional[Dict[str, str]] = None,
     split_output: Optional[str] = None,
+    csv_output: Optional[str] = None,
+    max_cdf_points: int = 0,
 ) -> None:
     config_labels = config_labels or {}
     plt.style.use('seaborn-v0_8-whitegrid')
@@ -498,6 +743,12 @@ def plot_configs_cdf(
         metrics = ['ttft', 'itl', 'batch_size']
     else:
         metrics = [metric]
+
+    if csv_output:
+        _export_all_cdf_csvs(
+            config_dirs, metrics, sources, use_batch, csv_output, config_labels,
+            max_points=max_cdf_points, smooth_window=smooth_window,
+        )
 
     if split_output:
         _save_split_outputs(
@@ -639,6 +890,22 @@ def main() -> None:
             "(legend.pdf, plot1.pdf, plot2.pdf, ...). Use for paper subfigures."
         ),
     )
+    parser.add_argument(
+        "--csv-output",
+        help=(
+            "Directory to save one CDF CSV per config (e.g. {model}_cdf.csv). "
+            "Wide format with paired x/cdf columns per (metric, source) so the "
+            "same figure can be plotted in Excel."
+        ),
+    )
+    parser.add_argument(
+        "--max-cdf-points", type=int, default=1000,
+        help=(
+            "Downsample each CDF series to ~N points before writing CSV "
+            "(default: 1000; pass 0 to disable). Uses a dense-tail grid so "
+            "p95/p99/p999 percentile accuracy is preserved."
+        ),
+    )
     parser.add_argument("--title", help="Custom plot title")
     parser.add_argument(
         "--style", choices=['smooth', 'stepped', 'markers'], default='smooth',
@@ -707,6 +974,8 @@ def main() -> None:
         smooth_window=max(1, args.smooth),
         config_labels=labels_map,
         split_output=args.split_output,
+        csv_output=args.csv_output,
+        max_cdf_points=max(0, args.max_cdf_points),
     )
 
 
