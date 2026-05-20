@@ -31,29 +31,30 @@ from typing import List, Dict
 # ---------------------------------------------------------------------------
 
 MODELS = [
-    "meta-llama/Llama-3.1-8B",
-    "CohereLabs/c4ai-command-r7b-12-2024",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1",
 ]
 
-BACKENDS = ["FLASHINFER", "FLASH_ATTN", "TRITON_ATTN"]  # add "FLASHINFER" if including it
+BACKENDS = ["FLASHINFER"]
 
-# Log-spaced lengths spanning the SWA boundary (4K).
-PREFILL_LENGTHS = [512, 1024, 2048, 4096]
+# Quantization scheme to apply to all runs (None = BF16). When set to "fp8",
+# both batch_predictor (uses the FP8-profiled DB) and measure_vllm_direct
+# (loads the model with quantization=fp8) operate consistently.
+QUANTIZATION = "fp8"
+
+PREFILL_LENGTHS = [512, 1024, 2048]
 DECODE_KV_SIZES = []
-# PREFILL_LENGTHS = [512, 1024, 2048, 4096, 8192, 16384]
-# DECODE_KV_SIZES = [1024, 2048, 4096, 8192, 16384]
 
 # Per-run knobs
 WARMUP = 0
 ITERATIONS = 1        # take median across iterations for noise reduction
-MAX_MODEL_LEN = 32768  # must exceed the largest scenario length
-MAX_NUM_SEQS = 256
+MAX_MODEL_LEN = 4096  # must exceed the largest scenario length; keep small for FP8 KV-cache budget
+MAX_NUM_SEQS = 32
 GPU_MEMORY = 0.9
 
-DB_PATH = "/home/jkim38/dooly/profiler/database/dooly-ipu0.db"
-CACHE_ROOT = "/home/jkim38/dooly/cache/tp1"   # cache layout: {CACHE_ROOT}/{model}
-RESULTS_DIR = "./results/longctx_sweep"
-CONFIGS_DIR = "./batch_configs/longctx_sweep"
+DB_PATH = "/home/ubuntu/dooly/test-quant.db"
+CACHE_ROOT = "/home/ubuntu/dooly/h100-workspace/cache"   # cache layout: {CACHE_ROOT}/{model}/{backend}
+RESULTS_DIR = "./results/mixtral_fp8_sweep"
+CONFIGS_DIR = "./batch_configs/mixtral_fp8_sweep"
 
 
 # ---------------------------------------------------------------------------
@@ -66,8 +67,8 @@ def safe_name(model: str) -> str:
 
 
 def cache_dir_for(model: str, backend: str) -> str:
-    """Cache layout: {CACHE_ROOT}/{model}/{backend}/"""
-    return os.path.join(CACHE_ROOT, model, backend)
+    """Cache layout: {CACHE_ROOT}/{model}/  (per-backend subdir is unused)."""
+    return os.path.join(CACHE_ROOT, model)
 
 
 def build_scenarios() -> List[Dict]:
@@ -135,6 +136,19 @@ def run_command(cmd: List[str], description: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def main():
+    # Make sure ninja / nvcc are reachable for FlashInfer JIT inside vLLM.
+    # When this script is invoked with the absolute conda python path, the
+    # interpreter's bin dir (which contains `ninja`) isn't on PATH, and
+    # vLLM's EngineCore subprocess fails when compiling FP8 kernels.
+    py_bindir = os.path.dirname(sys.executable)
+    if py_bindir not in os.environ.get("PATH", "").split(":"):
+        os.environ["PATH"] = f"{py_bindir}:{os.environ.get('PATH', '')}"
+    for cuda_bin in ("/usr/local/cuda-13.2/bin", "/usr/local/cuda-12.8/bin"):
+        if os.path.isdir(cuda_bin) and cuda_bin not in os.environ["PATH"]:
+            os.environ["PATH"] = f"{cuda_bin}:{os.environ['PATH']}"
+            os.environ.setdefault("CUDA_HOME", os.path.dirname(cuda_bin))
+            break
+
     print("Long-context sweep comparison runner")
     print("=" * 80)
     print(f"  models  : {MODELS}")
@@ -164,11 +178,7 @@ def main():
     for model in MODELS:
         for backend in BACKENDS:
             cache_dir = cache_dir_for(model, backend)
-            if not os.path.exists(cache_dir):
-                print(f"⚠️  Cache dir missing for ({model}, {backend}): {cache_dir}")
-                print(f"    Skipping all runs for this pair. Profile it first via "
-                      f"`python -m simulator.estimator --model {model} --backend {backend} ...`")
-                continue
+            os.makedirs(cache_dir, exist_ok=True)
 
             for scenario in scenarios:
                 run_idx += 1
@@ -202,6 +212,8 @@ def main():
                     "--out-dir", RESULTS_DIR,
                     "--output", vllm_output_name,
                 ]
+                if QUANTIZATION:
+                    vllm_cmd.extend(["--quantization", QUANTIZATION])
                 vllm_success = run_command(vllm_cmd, f"vLLM: {tag}")
 
                 results_summary.append({

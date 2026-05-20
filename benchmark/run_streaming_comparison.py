@@ -33,6 +33,7 @@ class RunConfig:
     cache_dir: str
     topology: str
     db_path: str
+    quantization: Optional[str] = None  # e.g. "fp8" — passed only to the vLLM streaming side
 
 
 DEFAULT_CONFIGS: List[RunConfig] = [
@@ -40,36 +41,61 @@ DEFAULT_CONFIGS: List[RunConfig] = [
         model="meta-llama/Llama-3.1-8B",
         tp=1,
         backend="FLASHINFER",
-        cache_dir="/home/jkim38/dooly/cache/meta-llama/Llama-3.1-8B/",
+        cache_dir="/home/ubuntu/dooly/h100-workspace/cache/meta-llama/Llama-3.1-8B/",
         topology="mew1",
-        db_path="/home/jkim38/dooly/profiler/database/rtx-sharegpt-eval.db",
+        db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
     ),
-    RunConfig(
-        model="Qwen/Qwen3-30B-A3B",
-        tp=1,
-        backend="FLASHINFER",
-        cache_dir="/home/jkim38/dooly/cache/Qwen/Qwen3-30B-A3B",
-        topology="mew1",
-        db_path="/home/jkim38/dooly/profiler/database/rtx-sharegpt-eval.db",
-    ),
+    
+    # RunConfig(
+    #     model="Qwen/Qwen3-30B-A3B",
+    #     tp=1,
+    #     backend="FLASHINFER",
+    #     cache_dir="/home/ubuntu/dooly/h100-workspace/cache/Qwen/Qwen3-30B-A3B",
+    #     topology="mew1",
+    #     db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
+    # ),
     RunConfig(
         model="Qwen/Qwen3-32B",
         tp=1,
         backend="FLASHINFER",
-        cache_dir="/home/jkim38/dooly/cache/Qwen/Qwen3-32B/",
+        cache_dir="/home/ubuntu/dooly/h100-workspace/cache/Qwen/Qwen3-32B/",
         topology="mew1",
-        db_path="/home/jkim38/dooly/profiler/database/rtx-sharegpt-eval.db",
+        db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
     ),
     # RunConfig(
-    #     model="meta-llama/Llama-3.1-70B",
-    #     tp=4,
+    #     model="CohereLabs/c4ai-command-r7b-12-2024",
+    #     tp=1,
     #     backend="FLASHINFER",
-    #     cache_dir="./cache/tp4/meta-llama/Llama-3.1-70B/",
+    #     cache_dir="/home/ubuntu/dooly/h100-workspace/cache/CohereLabs/c4ai-command-r7b-12-2024",
     #     topology="mew1",
-    #     db_path="./profiler/database/dooly-mew1.db",
+    #     db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
     # ),
+    RunConfig(
+        model="mistralai/Mixtral-8x7B-Instruct-v0.1",
+        tp=1,
+        backend="FLASHINFER",
+        cache_dir="/home/ubuntu/dooly/h100-workspace/cache/mistralai/Mixtral-8x7B-Instruct-v0.1",
+        topology="mew1",
+        db_path="/home/ubuntu/dooly/h100-workspace/database/test-quant.db",
+        quantization="fp8",
+    ),
+    RunConfig(
+        model="mistralai/Ministral-8B-Instruct-2410",
+        tp=1,
+        backend="FLASHINFER",
+        cache_dir="/home/ubuntu/dooly/h100-workspace/cache/mistralai/Ministral-8B-Instruct-2410",
+        topology="mew1",
+        db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
+    ), 
+    RunConfig(
+        model="Qwen/Qwen3-14B",
+        tp=1,
+        backend="FLASHINFER",
+        cache_dir="/home/ubuntu/dooly/h100-workspace/cache/Qwen/Qwen3-14B/",
+        topology="mew1",
+        db_path="/home/ubuntu/dooly/h100-workspace/database/h100-sharegpt-eval.db",
+    ),
 ]
-
 
 def run_command(cmd: List[str], description: str, log_file: Optional[str] = None) -> bool:
     banner = "=" * 80
@@ -150,6 +176,8 @@ def vllm_cmd(
         "--output", output,
         "--batch-composition-output", batch_composition_output,
     ]
+    if cfg.quantization:
+        cmd.extend(["--quantization", cfg.quantization])
     if verbose:
         cmd.append("--verbose")
     return cmd
@@ -223,6 +251,18 @@ def filter_configs(configs: List[RunConfig], only_models: Optional[List[str]]) -
 
 
 def main() -> None:
+    # Make sure ninja / nvcc are reachable for FlashInfer JIT inside vLLM.
+    # Same fix as run_comparison.py — when invoked via the absolute conda
+    # python, the env's bin/ isn't on PATH and EngineCore can't find ninja.
+    py_bindir = os.path.dirname(sys.executable)
+    if py_bindir not in os.environ.get("PATH", "").split(":"):
+        os.environ["PATH"] = f"{py_bindir}:{os.environ.get('PATH', '')}"
+    for cuda_bin in ("/usr/local/cuda-13.2/bin", "/usr/local/cuda-12.8/bin"):
+        if os.path.isdir(cuda_bin) and cuda_bin not in os.environ["PATH"]:
+            os.environ["PATH"] = f"{cuda_bin}:{os.environ['PATH']}"
+            os.environ.setdefault("CUDA_HOME", os.path.dirname(cuda_bin))
+            break
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True,
                         help="Path to the JSONL dataset (e.g. ./dataset/openchat-0.5rps.jsonl)")
@@ -247,6 +287,7 @@ def main() -> None:
     if args.skip_dooly and args.skip_vllm:
         parser.error("--skip-dooly and --skip-vllm can't both be set")
 
+    print(args.only)
     configs = filter_configs(DEFAULT_CONFIGS, args.only)
     if not configs:
         parser.error("no configs selected (check --only)")
