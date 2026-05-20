@@ -451,6 +451,16 @@ class Profiler:
                 FOREIGN KEY (signature_hash) REFERENCES signatures(signature_hash)
             )
         """)
+        # Composite index covering the upsert WHERE-clause in _write_results.
+        # Without this, the per-row "does this exact (sig, workload_params) row
+        # already exist?" SELECT degrades to a full scan, making the write
+        # phase O(N²) in result-row count. With it: O(N log N).
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_results_lookup
+            ON results (signature_hash, num_tokens, num_requests,
+                        is_context, is_prefill, kv_cache_size,
+                        prefill_chunk_size, num_tensor_parallel_workers)
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS profiled_models (
                 model_id INTEGER PRIMARY KEY AUTOINCREMENT,
