@@ -358,7 +358,7 @@ def run_one(
     gpu: int,
     overwrite: bool = False,
     quantization: str | None = None,
-    dtype: str,
+    dtype: str = "bfloat16",
 ) -> int:
     safe = model.replace("/", "_")
     log_path = log_dir / f"{safe}__{backend}__gpu{gpu}.log"
@@ -443,8 +443,8 @@ def main() -> int:
     # defaults when neither CLI nor config sets a value.
     ap.add_argument("--db-path", type=Path, default=None)
     ap.add_argument("--workspace-dir", type=Path, default=None)
-    ap.add_argument("--max-batch-size", type=int, default=64)
-    ap.add_argument("--max-seq-len", type=int, default=8192)
+    ap.add_argument("--max-batch-size", type=int, default=None)
+    ap.add_argument("--max-seq-len", type=int, default=None)
     ap.add_argument("--tp", type=int, default=None)
     ap.add_argument("--dtype", type=str, default=None,
                     help="Model dtype to profile at (e.g. bfloat16, float16). "
