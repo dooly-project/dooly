@@ -1,0 +1,13 @@
+# .publishignore — dev-only paths to keep OUT of the public repo.
+#
+# Used by publish.sh as `rsync --exclude-from`. Patterns are relative to each
+# published path (see PUBLISH_PATHS in publish.sh) and use rsync filter syntax,
+# which is close to .gitignore:
+#   - trailing slash matches directories:      scratch/
+#   - leading slash anchors to the path root:  /experimental.py
+#   - glob:                                    *_wip.py
+#
+# Currently empty: all dev-only files (analyze_overlap.py, configs/, notes/,
+# tests/, etc.) live at the repo ROOT, outside the published doolyprof/ package,
+# so they are never copied. Add patterns here only if you introduce dev-only
+# files INSIDE doolyprof/ that should not be published.
