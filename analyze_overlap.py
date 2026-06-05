@@ -86,7 +86,7 @@ parser.add_argument("--naive-mode", choices=["max", "direct", "extrapolated"], d
 # export_op_savings.py with its own CLI flags) doesn't crash here. The unknown
 # flags are forwarded to whatever argparse the importing script runs.
 _modlevel_args, _ = parser.parse_known_args()
-DB = Path("/home/jkim38/dooly/profiler/database/dooly-eval-v2.db") if not _modlevel_args.db_path else _modlevel_args.db_path
+DB = Path("/home/jkim38/dooly-project/doolyprof-dev/database/dooly-eval-v2.db") if not _modlevel_args.db_path else _modlevel_args.db_path
 CSV_V2 = Path("/home/jkim38/dooly/comparison/overlap_v2/profile_timings_v2.csv") if not _modlevel_args.csv_path else _modlevel_args.csv_path
 OUT_DIR = Path("/home/jkim38/dooly/comparison/overlap_v2") if not _modlevel_args.out_dir else _modlevel_args.out_dir
 OUT_DIR.mkdir(parents=True, exist_ok=True)

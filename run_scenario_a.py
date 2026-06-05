@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import List, Sequence, Tuple
 
 PY = "/home/jkim38/miniforge3/envs/dooly/bin/python"
-WORK = Path("/home/jkim38/dooly/profiler")
+WORK = Path("/home/jkim38/dooly-project/doolyprof-dev")
 
 DEFAULT_DB = WORK / "database" / "dooly-eval.db"
 DEFAULT_WS = WORK / "workspaces" / "scenario_a"
