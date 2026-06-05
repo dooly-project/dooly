@@ -457,7 +457,7 @@ class TraceParser:
             # symbols are identical but whose runtime-branching config
             # differs (e.g. FA2/Triton Attention layers with sliding_window=None
             # vs sliding_window=4096 — same kernel binary, different runtime
-            # arg). _extract_module_state_hash in the taintracer produces the
+            # arg). _extract_module_state_hash in the tracer produces the
             # hex digest.
             #
             # For MODULE anchors (is_module=True), use the module's own hash.

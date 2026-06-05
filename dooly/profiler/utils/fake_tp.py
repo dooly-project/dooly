@@ -19,8 +19,8 @@ Usage:
 import os
 import torch
 from torch.profiler import record_function
-from dooly.taintracer.tensor import TaintedTensor
-from dooly.taintracer.types import TaintedInt, TaintedShape
+from dooly.tracer.tensor import TaintedTensor
+from dooly.tracer.types import TaintedInt, TaintedShape
 
 def format_tensor_shape(tensor):
     if isinstance(tensor, TaintedTensor):

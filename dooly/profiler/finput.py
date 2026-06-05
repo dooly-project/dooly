@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
 """
 finput - input to function setup for profiling
 
-This module provides a simple data structure for representing operation inputs
-with dimension categorization (WORKLOAD vs MODEL_CONFIG) for profiling purposes.
+Provides a simple data structure for representing operation inputs
+with dimension categorization (WORKLOAD vs MODEL_CONFIG).
 """
 
 from dataclasses import dataclass
@@ -76,8 +75,7 @@ def extract_inputs_from_taint(
     trace_input_dtypes: List[str],
     concrete_inputs: Optional[List[str]] = None,
 ) -> List[ProfileInput]:
-    """
-    Extract ProfileInput list from taint annotation.
+    """Extract ProfileInput list from taint annotation.
 
     Args:
         taint_string: Full taint string (e.g., "_C::rms_norm IN:[[...]]")
@@ -85,42 +83,13 @@ def extract_inputs_from_taint(
         trace_input_dtypes: Input types from trace (e.g., ["c10::BFloat16", ...])
         concrete_inputs: Concrete scalar values (e.g., ["", "", "", "1.0e-05"])
 
-    Returns:
-        List of ProfileInput objects
-
     Example:
         taint_string = "_C::rms_norm IN:[[?(15), MODEL_CONFIG(4096)] | [?(15), MODEL_CONFIG(4096)] | [MODEL_CONFIG(4096)]]"
         trace_input_dims = [[15, 4096], [15, 4096], [4096], []]
         trace_input_dtypes = ["c10::BFloat16", "c10::BFloat16", "c10::BFloat16", "Scalar"]
 
-        Result:
-        [
-            ProfileInput(
-                type="Tensor",
-                dtype="c10::BFloat16",
-                dimensions=[DimensionType.WORKLOAD, DimensionType.MODEL_CONFIG],
-                actual_shape=[15, 4096]
-            ),
-            ProfileInput(
-                type="Tensor",
-                dtype="c10::BFloat16",
-                dimensions=[DimensionType.WORKLOAD, DimensionType.MODEL_CONFIG],
-                actual_shape=[15, 4096]
-            ),
-            ProfileInput(
-                type="Tensor",
-                dtype="c10::BFloat16",
-                dimensions=[DimensionType.MODEL_CONFIG],
-                actual_shape=[4096]
-            ),
-            ProfileInput(
-                type="Scalar",
-                dtype="Scalar",
-                dimensions=[],
-                actual_shape=[],
-                scalar_value="1.0e-05"
-            )
-        ]
+        Returns ProfileInput entries with dimensions tagged WORKLOAD vs
+        MODEL_CONFIG so the sweep generator knows which axes to vary.
     """
     # Strip KWARGS: section before parsing the taint string, save kwarg names
     kwarg_names = []
@@ -143,14 +112,6 @@ def extract_inputs_from_taint(
     for i, (taint_input, dims, dtype) in enumerate(zip_longest(
         taint_inputs, trace_input_dims, trace_input_dtypes, fillvalue=None
     )):
-        
-        # print(f"[DEBUG @ finput] taint_input: {taint_input}")
-        # print(f"[DEBUG @ finput] dims: {dims}")
-
-        # print(f"[DEBUG @ finput.py] i: {i}")
-        # print(f"[DEBUG @ finput.py]   taint_input: {taint_input}")
-        # print(f"[DEBUG @ finput.py]   dims: {dims}")
-        # print(f"[DEBUG @ finput.py]   dtype: {dtype}")
         # Skip if we have more taint inputs than trace data (shouldn't happen)
         if dims is None:
             # print(f"[DEBUG @ finput] dims is None, skipping.")
@@ -208,7 +169,6 @@ def extract_inputs_from_taint(
                 )
 
         elif taint_input is None:
-            # print(f"[DEBUG @ finput] taint_input is None")
             # Tensor without taint info (extra input not in taint string)
             # Mark all dims as MODEL_CONFIG (conservative - won't be swept)
             profile_input = ProfileInput(
@@ -222,9 +182,6 @@ def extract_inputs_from_taint(
             # Tensor with taint info - extract dimension types
             dim_types = [dim.dim_type for dim in taint_input.dimensions]
             dim_components = [dim.components for dim in taint_input.dimensions]
-            # print(f"[DEBUG @ finput] TENSOR WITH TAINT INFO")
-            # print(f"[DEBUG @ finput] dims: {dim_types}")
-
             # Handle dimension mismatch (broadcasting case)
             # If taint has fewer dims than trace, the tensor was broadcast
             # Pad leading dimensions with MODEL_CONFIG (conservative)
@@ -248,10 +205,6 @@ def extract_inputs_from_taint(
                 actual_shape=dims,
                 dimension_components=dim_components
             )
-
-        # print(f"[DEBUG @ finput] profile_input: {profile_input}")
-        # print()
-
         profile_inputs.append(profile_input)
 
     # Assign kwarg names to the inputs that came from kwargs.
@@ -266,7 +219,6 @@ def extract_inputs_from_taint(
     return profile_inputs
 
 
-# Test function
 if __name__ == "__main__":
     import json
 

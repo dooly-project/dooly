@@ -290,7 +290,7 @@ class ModuleResolver:
         # and both SWA/full variants would profile the same non-SWA layer.
         target_state_hash = (module.state_hash or "").strip()
         if len(paths) > 1 and target_state_hash:
-            from dooly.taintracer.hooks import _extract_module_state_hash
+            from dooly.tracer.hooks import _extract_module_state_hash
             filtered_paths = []
             for p in paths:
                 try:
@@ -720,7 +720,7 @@ class ModuleResolver:
             # Update anchor to parent (original failed, so safe to mutate)
             hierarchy.anchor = parent_event
 
-            # Inherit the state hash the taintracer attached to the parent's
+            # Inherit the state hash the tracer attached to the parent's
             # MODULE annotation (stripped by parser.py into args['state_hash']).
             # Carrying it on the ModuleInfo lets the signature builder
             # distinguish parents that differ only in runtime-branching

@@ -4,9 +4,6 @@ import glob
 import argparse
 import subprocess
 
-os.environ["PATH"] = f"/usr/local/cuda-13.2/bin:{os.environ.get('PATH', '')}"
-os.environ["LD_LIBRARY_PATH"] = f"/usr/local/cuda-13.2/lib64:{os.path.join(sys.prefix, 'lib')}:{os.environ.get('LD_LIBRARY_PATH', '')}"
-os.environ["CUDA_HOME"] = "/usr/local/cuda-13.2/"
 
 def model_to_dirname(model: str) -> str:
     """Convert model name to a safe directory name."""

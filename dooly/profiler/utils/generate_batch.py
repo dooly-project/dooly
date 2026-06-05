@@ -401,63 +401,6 @@ def generate_random_core_tests(
 
     return batches
 
-def generate_servegen(batching_window_ms = 100, test_limit=500):
-    import os
-    from servegen import Category, ClientPool, generate_workload
-    from servegen.utils import get_constant_rate_fn, get_bounded_rate_fn
-
-    # Change to ServeGen directory to access data files
-    original_cwd = os.getcwd()
-    servegen_dir = "/home/jkim38/ServeGen"
-    os.chdir(servegen_dir)
-
-    try:
-        # copied from ServeGen/examples/generate_realistic.py
-        # Load client pool from JSON data
-        print("Loading client pool...")
-        pool = ClientPool(Category.LANGUAGE, "m-large")
-        print(f"Loaded {len(pool.clients)} clients")
-
-        # Create a view for 18:00-19:00
-        print("\nCreating view for 18:00-19:00...")
-        view = pool.span(64800, 68400)
-        windows = view.get()
-        print(f"View contains {len(windows)} windows")
-
-        # Generate workload with constant rate
-        print("\nGenerating workload with constant rate...")
-        rate_fn = get_constant_rate_fn(view, 100.0)  # 100 requests per second
-        requests = generate_workload(view, rate_fn, duration=3600, seed=0)
-
-        # requests.data is a dictionary of input and output lengths
-        # we can use this to convert to the data structure we use (e.g. input len : output len)
-
-        window_start = requests[0].timestamp
-        batches = []
-        current_batch = []
-        count = 0
-        for req in requests:
-            if (req.timestamp - window_start) * 1000 > batching_window_ms:
-                count+=1
-                if count > test_limit:
-                    break
-                if current_batch:
-                    batches.append([int(r.data['input_tokens'] + r.data['output_tokens'] - 1) for r in current_batch])
-                current_batch = [req]
-                window_start = req.timestamp
-            else:
-                current_batch.append(req)
-
-        # Add the last batch if it has requests
-        if current_batch:
-            batches.append([int(r.data['input_tokens'] + r.data['output_tokens']) for r in current_batch])
-
-        return batches
-
-    finally:
-        # Always restore original working directory
-        os.chdir(original_cwd)
-
 
 def generate_vidur_num_tokens(max_size: int) -> List[int]:
     """

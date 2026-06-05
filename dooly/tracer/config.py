@@ -262,11 +262,11 @@ def patch_autoconfig(verbose=False):
 
     if _original_autoconfig_from_pretrained is not None:
         if verbose:
-            print("[taintracer] patch_autoconfig: Already patched, skipping")
+            print("[tracer] patch_autoconfig: Already patched, skipping")
         return  # Already patched
 
     if verbose:
-        print("[taintracer] patch_autoconfig: Applying patches...")
+        print("[tracer] patch_autoconfig: Applying patches...")
 
     _original_autoconfig_from_pretrained = AutoConfig.from_pretrained
     _original_pretrainedconfig_from_pretrained = PretrainedConfig.from_pretrained
@@ -276,7 +276,7 @@ def patch_autoconfig(verbose=False):
     def patched_autoconfig_from_pretrained(*args, **kwargs):
         raw_config = _original_autoconfig_from_pretrained(*args, **kwargs)
         if verbose:
-            print(f"[taintracer] AutoConfig.from_pretrained called: {type(raw_config).__name__}")
+            print(f"[tracer] AutoConfig.from_pretrained called: {type(raw_config).__name__}")
         return create_tainted_config(raw_config)
 
     @classmethod
@@ -284,7 +284,7 @@ def patch_autoconfig(verbose=False):
         func = _original_pretrainedconfig_from_pretrained.__func__
         raw_config = func(cls, *args, **kwargs)
         if verbose:
-            print(f"[taintracer] PretrainedConfig.from_pretrained called: {type(raw_config).__name__}")
+            print(f"[tracer] PretrainedConfig.from_pretrained called: {type(raw_config).__name__}")
         return create_tainted_config(raw_config)
 
     # Patch from_dict to catch Mistral configs and other direct dict-based loading
@@ -293,14 +293,14 @@ def patch_autoconfig(verbose=False):
         func = _original_pretrainedconfig_from_dict.__func__
         raw_config = func(cls, config_dict, **kwargs)
         if verbose:
-            print(f"[taintracer] PretrainedConfig.from_dict called: {type(raw_config).__name__}")
+            print(f"[tracer] PretrainedConfig.from_dict called: {type(raw_config).__name__}")
         return create_tainted_config(raw_config)
 
     AutoConfig.from_pretrained = patched_autoconfig_from_pretrained
     PretrainedConfig.from_pretrained = patched_pretrainedconfig_from_pretrained
     PretrainedConfig.from_dict = patched_pretrainedconfig_from_dict
     if verbose:
-        print("[taintracer] Patched AutoConfig.from_pretrained, PretrainedConfig.from_pretrained, PretrainedConfig.from_dict")
+        print("[tracer] Patched AutoConfig.from_pretrained, PretrainedConfig.from_pretrained, PretrainedConfig.from_dict")
 
     # Also patch vLLM's get_config as a safety net for any edge cases
     try:
@@ -313,18 +313,18 @@ def patch_autoconfig(verbose=False):
             # Only wrap if not already tainted (avoid double-wrapping)
             if hasattr(raw_config, '_taint_cache'):
                 if verbose:
-                    print(f"[taintracer] vllm.get_config: Already tainted, skipping")
+                    print(f"[tracer] vllm.get_config: Already tainted, skipping")
                 return raw_config
             if verbose:
-                print(f"[taintracer] vllm.get_config called: {type(raw_config).__name__}")
+                print(f"[tracer] vllm.get_config called: {type(raw_config).__name__}")
             return create_tainted_config(raw_config)
 
         vllm_config_mod.get_config = patched_vllm_get_config
         if verbose:
-            print("[taintracer] Patched vllm.transformers_utils.config.get_config")
+            print("[tracer] Patched vllm.transformers_utils.config.get_config")
     except ImportError:
         if verbose:
-            print("[taintracer] vLLM not installed, skipping vllm.get_config patch")
+            print("[tracer] vLLM not installed, skipping vllm.get_config patch")
 
 
 

@@ -34,7 +34,7 @@ class ModuleInfo:
     hierarchy: Optional[OperationHierarchy] = field(default=None, repr=False)
     absorbed_ops: List[str] = field(default_factory=list)  # ops merged into this module by resolver
     # Short hash of the module instance's primitive attrs, captured by the
-    # taintracer via _extract_module_state_hash. Populated only for modules
+    # tracer via _extract_module_state_hash. Populated only for modules
     # (is_module=True) whose MODULE annotation carried a STATE: trailer.
     # Used by _module_signature so two layer instances that differ only in
     # runtime-branching config (e.g. sliding_window=None vs 4096) hash to

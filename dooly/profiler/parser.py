@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
 """
 Hierarchical trace parser that extracts Module→CPU_OP→Kernel hierarchies.
 
-This parser builds a complete hierarchy of nn.Module events, CPU operations,
-and GPU kernels, using temporal containment and External ID linkage.
+Builds a complete hierarchy of nn.Module events, CPU operations,
+and GPU kernels using temporal containment and External ID linkage.
 
 Strategy:
 1. Parse all events: modules (nn.Module), cpu_ops, kernels, taints (user_annotation)
@@ -476,25 +475,6 @@ class HierarchicalTraceParser:
                         args['comm_args'] = args_section.strip('[]')
                     else:
                         event_param = in_section
-
-                # # Create comm event and add to comm_ops list only (not hierarchy)
-                # comm_event = Event(
-                #     cat=event_cat,
-                #     name=event_name,
-                #     params=event_param,
-                #     ts=event_data['ts'],
-                #     dur=event_data['dur'],
-                #     ev_idx=args.get('Ev Idx'),
-                #     external_id=args.get('External id'),
-                #     python_id=args.get('Python id'),
-                #     python_parent_id=args.get('Python parent id'),
-                #     args=args,
-                #     pid=event_data.get('pid'),
-                #     tid=event_data.get('tid')
-                # )
-                # self.comm_ops.append(comm_event)
-                # # Skip adding to self.events - comm ops are separate from hierarchy
-                # continue
 
             elif cat == 'user_annotation':
                 # Taint/user annotation: API:, aten::, etc. (not MODULE: or COMM:)
