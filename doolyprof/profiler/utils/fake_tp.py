@@ -13,14 +13,14 @@ Usage:
     os.environ["VLLM_FAKE_TP"] = "2"
 
     # Then import this module to apply patches:
-    from dooly.profiler.utils.fake_tp import apply_fake_tp_patches, get_fake_tp_size
+    from doolyprof.profiler.utils.fake_tp import apply_fake_tp_patches, get_fake_tp_size
 """
 
 import os
 import torch
 from torch.profiler import record_function
-from dooly.tracer.tensor import TaintedTensor
-from dooly.tracer.types import TaintedInt, TaintedShape
+from doolyprof.tracer.tensor import TaintedTensor
+from doolyprof.tracer.types import TaintedInt, TaintedShape
 
 def format_tensor_shape(tensor):
     if isinstance(tensor, TaintedTensor):

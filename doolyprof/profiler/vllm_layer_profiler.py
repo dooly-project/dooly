@@ -32,12 +32,12 @@ from dataclasses import dataclass
 from tqdm import tqdm
 from contextlib import contextmanager, nullcontext
 
-from dooly.profiler.utils.generate_batch import AttentionBatchConfig
+from doolyprof.profiler.utils.generate_batch import AttentionBatchConfig
 
 # Apply fake TP patches BEFORE importing vLLM so all modules see patched
 # parallel_state at import time. Set VLLM_FAKE_TP env var before importing
 # this module (e.g. in run-profiler.py via --tp flag).
-from dooly.profiler.utils.fake_tp import apply_fake_tp_patches, get_fake_tp_size
+from doolyprof.profiler.utils.fake_tp import apply_fake_tp_patches, get_fake_tp_size
 
 _FAKE_TP_SIZE = get_fake_tp_size()
 if _FAKE_TP_SIZE > 1:

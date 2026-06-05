@@ -13,12 +13,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from dooly.profiler.module import ModuleInfo
-from dooly.profiler.finput import extract_inputs_from_taint
-from dooly.profiler.input_generator import InputGenerator, AttentionBatchConfig
-from dooly.profiler.parser import Event, OperationHierarchy
-from dooly.profiler.importer import OpImporter
-from dooly.profiler.vllm_layer_profiler import make_dict, VLLMLayerProfiler
+from doolyprof.profiler.module import ModuleInfo
+from doolyprof.profiler.finput import extract_inputs_from_taint
+from doolyprof.profiler.input_generator import InputGenerator, AttentionBatchConfig
+from doolyprof.profiler.parser import Event, OperationHierarchy
+from doolyprof.profiler.importer import OpImporter
+from doolyprof.profiler.vllm_layer_profiler import make_dict, VLLMLayerProfiler
 
 
 def _dim_is_tokens(dim) -> bool:
@@ -290,7 +290,7 @@ class ModuleResolver:
         # and both SWA/full variants would profile the same non-SWA layer.
         target_state_hash = (module.state_hash or "").strip()
         if len(paths) > 1 and target_state_hash:
-            from dooly.tracer.hooks import _extract_module_state_hash
+            from doolyprof.tracer.hooks import _extract_module_state_hash
             filtered_paths = []
             for p in paths:
                 try:
@@ -528,7 +528,7 @@ class ModuleResolver:
             #     else:
             #         print(f"[RESOLVER DEBUG]   [{i}] {type(inp).__name__}: {inp}")
 
-            from dooly.profiler.profiler import prepare_op_args
+            from doolyprof.profiler.profiler import prepare_op_args
             args, kwargs = prepare_op_args(callable_obj, module.operation_name, inputs)
 
             forward_context = None
@@ -701,7 +701,7 @@ class ModuleResolver:
             # MODULE: user_annotation events never have "Input Dims" in args — shape info
             # is encoded in event.params (the IN:[...] taint string). Derive shapes from it.
             if not shapes and parent_event.params:
-                from dooly.profiler.taint import parse_taint_string
+                from doolyprof.profiler.taint import parse_taint_string
                 taint_inputs = parse_taint_string(parent_event.params)
                 shapes = [[dim.value for dim in ti.dimensions] for ti in taint_inputs]
 
@@ -797,15 +797,15 @@ class ModuleResolver:
         return absorbed_names, absorbed_from_resolved
 
 # ---------------------------------------------------------------------------
-# Manual test: python -m dooly.profiler.resolver <trace.json> <model>
+# Manual test: python -m doolyprof.profiler.resolver <trace.json> <model>
 # Loads the real vLLM model, then shows which callable each module resolves to.
 # ---------------------------------------------------------------------------
 
 def main():
     import argparse, json
-    from dooly.profiler.trace import TraceParser
-    from dooly.profiler.vllm_layer_profiler import VLLMLayerProfiler, make_dict
-    from dooly.profiler.importer import OpImporter
+    from doolyprof.profiler.trace import TraceParser
+    from doolyprof.profiler.vllm_layer_profiler import VLLMLayerProfiler, make_dict
+    from doolyprof.profiler.importer import OpImporter
 
     parser = argparse.ArgumentParser(description="Test module path disambiguation with real model")
     parser.add_argument("trace", help="Path to .pt.trace.json file")

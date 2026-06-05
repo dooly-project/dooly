@@ -390,7 +390,7 @@ class CommProfiler:
         return needs_profiling
 
     def plan(self, collectives: List[Any]):
-        from dooly.profiler.finput import ProfileInput
+        from doolyprof.profiler.finput import ProfileInput
 
         # extract input shape, dim0, dim1
         self.plan_info: Dict[str, Dict[str, Any]]= {}

@@ -2,8 +2,8 @@ from typing import Dict, List, Any, Optional, Tuple, Callable
 import torch
 import json
 
-from dooly.profiler.module import ModuleInfo, ModuleComparator
-from dooly.profiler.trace import TraceParser
+from doolyprof.profiler.module import ModuleInfo, ModuleComparator
+from doolyprof.profiler.trace import TraceParser
 from vllm.transformers_utils.config import get_config
 
 class ModelInfo:

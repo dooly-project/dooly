@@ -6,8 +6,8 @@ import sqlite3
 import os
 from enum import Enum
 
-from dooly.profiler.finput import ProfileInput
-from dooly.profiler.parser import Event, OperationHierarchy
+from doolyprof.profiler.finput import ProfileInput
+from doolyprof.profiler.parser import Event, OperationHierarchy
 
 def enum_to_string(enum_value) -> str:
     """Convert an enum to its string value for JSON serialization."""
@@ -110,7 +110,7 @@ class ModuleInfo:
         for i, inp in enumerate(self.inputs):
             if inp.type == "Tensor":
                 # Extract MODEL_CONFIG dimensions
-                from dooly.profiler.taint import DimensionType
+                from doolyprof.profiler.taint import DimensionType
                 for j, (dim_type, dim_val) in enumerate(zip(inp.dimensions, inp.actual_shape)):
                     if dim_type == DimensionType.MODEL_CONFIG:
                         # Use a generic name for MODEL_CONFIG dimensions
@@ -145,8 +145,8 @@ class ModuleComparator:
 
         Used when the event doesn't have module_info attached.
         """
-        from dooly.profiler.finput import extract_inputs_from_taint
-        from dooly.profiler.taint import DimensionType
+        from doolyprof.profiler.finput import extract_inputs_from_taint
+        from doolyprof.profiler.taint import DimensionType
 
         params = {}
 

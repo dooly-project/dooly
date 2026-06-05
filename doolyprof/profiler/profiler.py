@@ -22,15 +22,15 @@ def find_free_port() -> int:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         return s.getsockname()[1]
 
-from dooly.profiler.vllm_layer_profiler import VLLMLayerProfiler, make_dict 
-from dooly.profiler.model import ModelInfo as ProfileModel
+from doolyprof.profiler.vllm_layer_profiler import VLLMLayerProfiler, make_dict 
+from doolyprof.profiler.model import ModelInfo as ProfileModel
 from vllm.config import set_current_vllm_config
 from vllm.forward_context import set_forward_context
-from dooly.profiler.importer import OpImporter
-from dooly.profiler.module import ModuleInfo
-from dooly.profiler.input_generator import InputGenerator 
-from dooly.profiler.resolver import ModuleResolver
-from dooly.profiler.utils.generate_batch import AttentionBatchConfig
+from doolyprof.profiler.importer import OpImporter
+from doolyprof.profiler.module import ModuleInfo
+from doolyprof.profiler.input_generator import InputGenerator 
+from doolyprof.profiler.resolver import ModuleResolver
+from doolyprof.profiler.utils.generate_batch import AttentionBatchConfig
 
 
 def wrap_list_args(op_packet, op_name: str, inputs: List) -> List:

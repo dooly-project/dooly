@@ -25,7 +25,7 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
         raise RuntimeError(f"VLLM_FAKE_TP is still set to {fake_tp_val}! Cannot profile comm ops with fake TP.")
 
     # Import comm_profiler (which doesn't set VLLM_FAKE_TP)
-    from dooly.run.comm_profiler import CommProfiler, CommProfilingConfig
+    from doolyprof.run.comm_profiler import CommProfiler, CommProfilingConfig
 
     DTYPE_MAP = {
         "float32": torch.float32,

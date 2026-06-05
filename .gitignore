@@ -2,10 +2,10 @@
 /__pycache__/
 /vllm_traces_tp/
 /local/
-/dooly/__pycache__/
-/dooly/run/__pycache__/
-/dooly/profiler/__pycache__/
-/dooly/taintracer/__pycache__/
+/doolyprof/__pycache__/
+/doolyprof/run/__pycache__/
+/doolyprof/profiler/__pycache__/
+/doolyprof/tracer/__pycache__/
 *.pyc
 test_*
 /database/

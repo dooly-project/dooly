@@ -38,7 +38,7 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
     print(f"[WORKER] LLM initialized successfully")
 
     # Import the KINETO-enabled profiler
-    from dooly.run.comm_profiler_kineto import CommProfiler, CommProfilingConfig, ProfileMethod
+    from doolyprof.run.comm_profiler_kineto import CommProfiler, CommProfilingConfig, ProfileMethod
 
     DTYPE_MAP = {
         "float32": torch.float32,

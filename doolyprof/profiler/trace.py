@@ -6,10 +6,10 @@ import json
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
-from dooly.profiler.module import ModuleInfo
-from dooly.profiler.parser import HierarchicalTraceParser, OperationHierarchy
-from dooly.profiler.finput import ProfileInput, extract_inputs_from_taint
-from dooly.profiler.taint import parse_taint_string
+from doolyprof.profiler.module import ModuleInfo
+from doolyprof.profiler.parser import HierarchicalTraceParser, OperationHierarchy
+from doolyprof.profiler.finput import ProfileInput, extract_inputs_from_taint
+from doolyprof.profiler.taint import parse_taint_string
 
 class TraceLoader:
     @staticmethod

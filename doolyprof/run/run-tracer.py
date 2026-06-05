@@ -21,8 +21,8 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
-# Add project root to path for dooly imports
-# run-tracer.py -> run/ -> dooly/ -> dooly (repo root)
+# Add project root to path for doolyprof imports
+# run-tracer.py -> run/ -> doolyprof/ -> repo root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # Parse arguments BEFORE any heavy imports
@@ -54,10 +54,10 @@ os.environ["VLLM_FAKE_TP"] = str(FAKE_TP)
 # Install taint hooks BEFORE any vLLM imports
 # This patches AutoConfig.from_pretrained to return TaintedConfig objects
 # and installs hooks on tensor factory functions for taint propagation
-from dooly.tracer.hooks import install_hooks
-from dooly.tracer.config import patch_autoconfig, patch_input_buffers
-from dooly.tracer.registry import TAINT_REGISTRY
-from dooly.tracer import disable_taint_tracking, enable_taint_tracking
+from doolyprof.tracer.hooks import install_hooks
+from doolyprof.tracer.config import patch_autoconfig, patch_input_buffers
+from doolyprof.tracer.registry import TAINT_REGISTRY
+from doolyprof.tracer import disable_taint_tracking, enable_taint_tracking
 
 # Disable taint tracking initially - we'll enable it only during the actual generate() call
 # This prevents semantic confusion during warm-up/compilation where values are reused incorrectly
@@ -83,7 +83,7 @@ install_hooks(
 _original_parameter_new = torch.nn.Parameter.__new__
 
 def _patched_parameter_new(cls, data=None, requires_grad=True):
-    from dooly.tracer.tensor import TaintedTensor
+    from doolyprof.tracer.tensor import TaintedTensor
     if isinstance(data, TaintedTensor):
         # Unwrap: get the plain Tensor view of the same storage, so that
         # type(data) is torch.Tensor and Parameter.__new__ takes the
@@ -136,7 +136,7 @@ except ImportError:
 # Debug patch: Track num_tokens in _dummy_run
 try:
     import vllm.v1.worker.gpu_model_runner as gmr_module
-    from dooly.tracer.types import TaintedInt
+    from doolyprof.tracer.types import TaintedInt
 
     _orig_dummy_run = None
     _orig_get_slot_mappings = None
@@ -165,7 +165,7 @@ except Exception as e:
     print(f"[DebugPatch] Could not setup debug patches - {e}", flush=True)
 
 # Apply fake TP patches using shared utility, then import vLLM
-from dooly.profiler.utils.fake_tp import apply_fake_tp_patches
+from doolyprof.profiler.utils.fake_tp import apply_fake_tp_patches
 if FAKE_TP > 1:
     apply_fake_tp_patches(FAKE_TP)
 

@@ -1,8 +1,8 @@
-from dooly.profiler.module import ModuleInfo
+from doolyprof.profiler.module import ModuleInfo
 from typing import List, Dict, Any, Tuple, Optional, Union
 import torch
 
-from dooly.profiler.utils.generate_batch import (generate_vidur_inputs, generate_vidur_num_tokens, AttentionBatchConfig, get_attention_batch_sizes_to_profile)
+from doolyprof.profiler.utils.generate_batch import (generate_vidur_inputs, generate_vidur_num_tokens, AttentionBatchConfig, get_attention_batch_sizes_to_profile)
 
 def is_attention_operation(module: ModuleInfo) -> bool:
     attention_ops = [
@@ -127,7 +127,7 @@ class InputGenerator:
         inputs = []
         trace_dtype = self.dtype
 
-        from dooly.profiler.taint import DimensionType
+        from doolyprof.profiler.taint import DimensionType
 
         # Extract num_tokens and num_requests from workload_config
         if isinstance(workload_config, AttentionBatchConfig):

@@ -8,7 +8,7 @@ with dimension categorization (WORKLOAD vs MODEL_CONFIG).
 from dataclasses import dataclass
 from itertools import zip_longest
 from typing import List, Optional, Dict
-from dooly.profiler.taint import DimensionType, parse_taint_string
+from doolyprof.profiler.taint import DimensionType, parse_taint_string
 
 
 @dataclass

@@ -364,7 +364,7 @@ def run_one(
     log_path = log_dir / f"{safe}__{backend}__gpu{gpu}.log"
 
     cmd = [
-        PY, "-m", "dooly.run.run-e2e",
+        PY, "-m", "doolyprof.run.run-e2e",
         "--models", model,
         "--attention-backend", backend,
         "--dtype", dtype,

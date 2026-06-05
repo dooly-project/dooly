@@ -4,8 +4,8 @@ import sys
 from pathlib import Path
 from time import time
 
-# Add project root to path for dooly imports
-# run-profiler.py -> run/ -> dooly/ -> dooly (repo root)
+# Add project root to path for doolyprof imports
+# run-profiler.py -> run/ -> doolyprof/ -> repo root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # Parse --tp and --gpu early BEFORE importing vLLM / torch / CUDA.
@@ -25,8 +25,8 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import torch
 import multiprocessing as mp
-from dooly.profiler.model import ModelInfo
-from dooly.profiler.profiler import Profiler 
+from doolyprof.profiler.model import ModelInfo
+from doolyprof.profiler.profiler import Profiler 
 
 DTYPE_MAP = {
     "float32": torch.float32,
@@ -97,9 +97,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_model(model, dtype, attention_backend, flash_attn_version, quantization, max_seq_len, result_queue, gpu):
-    from dooly.profiler.importer import OpImporter
-    from dooly.profiler.resolver import ModuleResolver
-    from dooly.profiler.vllm_layer_profiler import VLLMLayerProfiler
+    from doolyprof.profiler.importer import OpImporter
+    from doolyprof.profiler.resolver import ModuleResolver
+    from doolyprof.profiler.vllm_layer_profiler import VLLMLayerProfiler
     
     importer=OpImporter()
 
