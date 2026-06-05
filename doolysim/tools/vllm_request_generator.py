@@ -3,6 +3,7 @@
 This ensures DoolySim and vLLM benchmarks use identical requests.
 """
 
+import os
 from typing import List, Tuple
 from dataclasses import dataclass
 import numpy as np
@@ -520,7 +521,10 @@ def export_vllm_dataset_jsonl(
 if __name__ == "__main__":
     # Long-context synthetic dataset for §7 evaluation:
     #   500 requests, input ~2048-8192 tokens, output fixed at 128, RPS=0.5
-    OUTPUT_PATH = "/home/jkim38/dooly/dataset/longctx_2k-8k_rps0.5_out128.jsonl"
+    OUTPUT_PATH = os.environ.get(
+        "DOOLYSIM_DATASET_PATH",
+        "./dataset/longctx_2k-8k_rps0.5_out128.jsonl",
+    )
 
     llm = LLM(model="meta-llama/Llama-3.1-8B", load_format="dummy", enforce_eager=True)
 

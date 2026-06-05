@@ -1,3 +1,4 @@
+import os
 import torch
 import time
 
@@ -6,7 +7,7 @@ from ..request import RequestConfig, make_request, create_mock_output
 from ..emulator import emulate_init
 from .simulation_predictor import SimulationPredictor
 
-from typing import Dict, Iterator
+from typing import Dict, Iterator, Optional
 
 # Import vLLM components for process_outputs
 try:
@@ -24,13 +25,19 @@ class DoolySim:
         args: Dict = {"max_model_len": 16384, "gpu_memory_utilization": 0.9, "max_num_seqs": 10, "max_num_batched_tokens": 512},
         tensor_parallel_size: int = 1,
         step_duration_ms: float = 10.0,  # Simulated time per forward pass (fallback)
-        cache_dir: str = "/home/jkim38/dooly/cache/tp1/meta-llama/Llama-3.1-8B/",
-        db_path: str = "/home/jkim38/dooly/profiler/database/dooly_data_new_new.db",
+        cache_dir: Optional[str] = None,
+        db_path: Optional[str] = None,
         backend: str = "FLASHINFER",
         topology: str = "mew1",  # GPU interconnect topology for collective operations
         cpu_overhead: float = 10.0,
         use_actual_process_outputs: bool = True  # Use actual vLLM process_outputs for CPU overhead
     ):
+        cache_dir = cache_dir or os.environ.get("DOOLYSIM_CACHE_DIR")
+        db_path = db_path or os.environ.get("DOOLYSIM_DB_PATH")
+        if cache_dir is None:
+            raise ValueError("cache_dir must be provided (or set DOOLYSIM_CACHE_DIR env var)")
+        if db_path is None:
+            raise ValueError("db_path must be provided (or set DOOLYSIM_DB_PATH env var)")
         self.cpu_overhead = cpu_overhead
         self.use_actual_process_outputs = use_actual_process_outputs
         self.llm= emulate_init(model=model, args=args)

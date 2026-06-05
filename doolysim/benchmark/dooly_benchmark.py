@@ -60,7 +60,7 @@ def run_vllm_benchmark(max_num_batched_tokens: int, input_len: int, output_len: 
     dataset_file = f"dataset/syn-{arrival_rate}rps-uniform-{input_len}-{output_len}.jsonl"
 
     cmd = [
-        "/home/jkim38/miniforge3/envs/utns_sim/bin/python", "-m", "simulator.benchmark.measure_vllm_streaming",
+        sys.executable, "-m", "doolysim.benchmark.measure_vllm_streaming",
         "--num-requests", "100",
         "--input-len", str(int(input_len)),
         "--output-len", str(int(output_len)),
@@ -79,7 +79,7 @@ def run_vllm_benchmark(max_num_batched_tokens: int, input_len: int, output_len: 
 
     try:
         # Remove capture_output=True to show stdout in real-time
-        result = subprocess.run(cmd, check=True, text=True, cwd="/home/jkim38/dooly")
+        result = subprocess.run(cmd, check=True, text=True)
         return dataset_file
     except subprocess.CalledProcessError as e:
         print(f"✗ vLLM benchmark failed: {e}")
@@ -88,12 +88,14 @@ def run_vllm_benchmark(max_num_batched_tokens: int, input_len: int, output_len: 
 def run_dooly_benchmark(max_num_batched_tokens: int, input_len: int, output_len: int, arrival_rate: float, dataset_file: str):
     """Run Dooly benchmark using the generated dataset"""
 
+    db_path = os.environ.get("DOOLYSIM_DB_PATH", "")
+    cache_dir = os.environ.get("DOOLYSIM_CACHE_DIR", "./cache/tp4/meta-llama/Llama-3.1-70B")
     cmd = [
-        "/home/jkim38/miniforge3/envs/utns_sim/bin/python", "-m", "simulator.cli",
+        sys.executable, "-m", "doolysim.cli",
         "--model", "meta-llama/Llama-3.1-70B",
         "--backend", "FLASHINFER",
-        "--cache-dir", "./cache/tp4/meta-llama/Llama-3.1-70B",
-        "--db-path", "/home/jkim38/dooly/profiler/database/dooly.db",
+        "--cache-dir", cache_dir,
+        "--db-path", db_path,
         "--tp", "4",  # Add TP=4 to match vLLM benchmark
         "--num-requests", "100",
         "--max-num-batched-tokens", str(max_num_batched_tokens),
@@ -112,18 +114,16 @@ def run_dooly_benchmark(max_num_batched_tokens: int, input_len: int, output_len:
 
     try:
         # Remove capture_output=True to show stdout in real-time
-        result = subprocess.run(cmd, check=True, text=True, cwd="/home/jkim38/dooly")
+        result = subprocess.run(cmd, check=True, text=True)
         print(f"✓ Dooly benchmark completed")
     except subprocess.CalledProcessError as e:
         print(f"✗ Dooly benchmark failed: {e}")
 
 def main():
     """Main execution function"""
-    config_file = "/home/jkim38/dooly/comparison/comparison-configs.json"
-
     import argparse
     parser = argparse.ArgumentParser(description="Run vLLM and Dooly benchmarks based on comparison-configs.json")
-    parser.add_argument("--config-file", type=str, default=config_file, help="Path to comparison-configs.json")
+    parser.add_argument("--config-file", type=str, required=True, help="Path to comparison-configs.json")
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192, help="Maximum number of batched tokens for Dooly benchmark")
     args = parser.parse_args()
 

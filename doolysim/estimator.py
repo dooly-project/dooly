@@ -22,9 +22,10 @@ from sklearn.model_selection import GridSearchCV
 class EstimatorConfig:
     """Configuration for the execution time estimator."""
 
-    # Database paths
-    db_path: str = "/home/jkim38/dooly/profiler/database/results.db"
-    cache_dir: str = "/home/jkim38/dooly/simulator/cache"
+    # Database paths. Read from env vars at instantiation time so tests can
+    # override; raise at runtime if both unset and not passed explicitly.
+    db_path: str = ""
+    cache_dir: str = ""
 
     # Model/Backend filtering
     model_name: Optional[str] = None  # e.g., "meta-llama/Llama-3.1-8B"
@@ -989,12 +990,19 @@ def main(model_name=None, backend=None, db_path=None, cache_dir=None,
          train_comm=False, train_comm_only=False, tp_size=None, embedding_dim=4096,
          topology="DGX", collective_backend="NCCL"):
 
-    # Initialize estimator with optional filtering
+    # Initialize estimator with optional filtering. Resolution order:
+    # explicit arg > DOOLYSIM_CACHE_DIR/DB_PATH env var > error.
+    resolved_cache = cache_dir or os.environ.get("DOOLYSIM_CACHE_DIR")
+    resolved_db = db_path or os.environ.get("DOOLYSIM_DB_PATH")
+    if not resolved_cache:
+        raise ValueError("cache_dir must be provided (or set DOOLYSIM_CACHE_DIR env var)")
+    if not resolved_db:
+        raise ValueError("db_path must be provided (or set DOOLYSIM_DB_PATH env var)")
     config = EstimatorConfig(
-        cache_dir=cache_dir if cache_dir else "/home/jkim38/dooly/simulator/model_cache_v2",
+        cache_dir=resolved_cache,
         model_name=model_name,
         backend=backend,
-        db_path=db_path if db_path else "/home/jkim38/dooly/profiler/database/dooly.db",
+        db_path=resolved_db,
         no_cache=False,
         train_comm_models=train_comm or train_comm_only,  # Enable if either flag is set
         train_comm_only=train_comm_only,
@@ -1034,8 +1042,10 @@ if __name__ == "__main__":
                        help="Model name to filter (e.g., 'meta-llama/Llama-3.1-8B')")
     parser.add_argument("--backend", type=str, default=None,
                        help="Backend to filter (e.g., 'FLASHINFER' or 'FLASH_ATTN')")
-    parser.add_argument("--db-path", type=str, default="/home/jkim38/dooly/profiler/database/dooly.db", help="Path to SQLite database for results")
-    parser.add_argument("--cache-dir", type=str, default="/home/jkim38/dooly/simulator/cache", help="Directory for caching trained models")
+    parser.add_argument("--db-path", type=str, default=os.environ.get("DOOLYSIM_DB_PATH"),
+                       help="Path to SQLite database for results (or set DOOLYSIM_DB_PATH env var)")
+    parser.add_argument("--cache-dir", type=str, default=os.environ.get("DOOLYSIM_CACHE_DIR"),
+                       help="Directory for caching trained models (or set DOOLYSIM_CACHE_DIR env var)")
     parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--max-token-count", type=int, default=16384)
     parser.add_argument("--train-comm", action="store_true", help="Train collective communication models")

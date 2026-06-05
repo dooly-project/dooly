@@ -24,11 +24,13 @@ def main():
                        help="GPU interconnect topology for collective operations (default: mew1)")
     # Paths ################################################
     parser.add_argument("--cache-dir", type=str,
-                       default="/home/jkim38/dooly/simulator/core/cache/llama-3.1-8b-FLASHINFER/",
-                       help="Directory containing cached regression models")
+                       default=os.environ.get("DOOLYSIM_CACHE_DIR"),
+                       help="Directory containing cached regression models "
+                            "(or set DOOLYSIM_CACHE_DIR env var)")
     parser.add_argument("--db-path", type=str,
-                       default="/home/jkim38/dooly/profiler/database/dooly_data.db",
-                       help="Path to profiling database")
+                       default=os.environ.get("DOOLYSIM_DB_PATH"),
+                       help="Path to profiling database "
+                            "(or set DOOLYSIM_DB_PATH env var)")
 
     # vLLM configuration
     parser.add_argument("--max-num-seqs", type=int, default=256,

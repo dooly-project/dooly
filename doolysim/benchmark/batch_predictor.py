@@ -8,6 +8,7 @@ Uses pre-trained models and CSV prediction caches.
 
 import argparse
 import json
+import os
 import sys
 import torch
 from pathlib import Path
@@ -402,8 +403,8 @@ Examples:
     parser.add_argument('--cache-dir', type=str, required=True,
                         help='Directory containing CSV prediction caches')
     parser.add_argument('--db-path', type=str,
-                        default='/home/jkim38/dooly/profiler/database/dooly-new.db',
-                        help='Path to profiling database')
+                        default=os.environ.get('DOOLYSIM_DB_PATH'),
+                        help='Path to profiling database (or set DOOLYSIM_DB_PATH env var)')
 
     # Output options
     parser.add_argument('--verbose', action='store_true',
