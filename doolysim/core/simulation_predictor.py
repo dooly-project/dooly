@@ -120,8 +120,8 @@ class SimulationPredictor:
             if str(simulator_dir) not in sys.path:
                 sys.path.insert(0, str(simulator_dir))
 
-            from simulator.core.prediction_cache import load_all_predictions
-            from simulator.operation_time_predictor import OperationTimePredictor
+            from doolysim.core.prediction_cache import load_all_predictions
+            from doolysim.operation_time_predictor import OperationTimePredictor
 
             print(f"Loading CSV prediction cache from {cache_dir}...")
             cache = load_all_predictions(cache_dir)

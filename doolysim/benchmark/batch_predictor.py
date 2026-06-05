@@ -17,7 +17,7 @@ from dataclasses import dataclass
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from simulator.core.simulation_predictor import SimulationPredictor
+from doolysim.core.simulation_predictor import SimulationPredictor
 
 
 @dataclass

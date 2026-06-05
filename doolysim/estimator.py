@@ -475,7 +475,7 @@ class SimplifiedExecutionTimeEstimator:
 
         # Automatically save predictions to CSV cache
         print(f"\n=== Saving Predictions to CSV Cache ===")
-        from simulator.core.prediction_cache import generate_prediction_cache_from_estimator
+        from doolysim.core.prediction_cache import generate_prediction_cache_from_estimator
         generate_prediction_cache_from_estimator(
             estimator=self,
             cache_dir=self.config.cache_dir,

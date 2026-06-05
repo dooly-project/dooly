@@ -25,8 +25,8 @@ from typing import Dict, List, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 
-from simulator.tools.plot_comparison import load_json
-from simulator.tools.plot_configs_cdf import (
+from doolysim.tools.plot_comparison import load_json
+from doolysim.tools.plot_configs_cdf import (
     CONFIG_COLORS, SOURCE_LABELS, find_result_file, read_config_model_name,
 )
 

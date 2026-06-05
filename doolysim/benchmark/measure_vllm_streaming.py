@@ -53,7 +53,7 @@ simulator_dir = Path(__file__).parent.parent
 if str(simulator_dir) not in sys.path:
     sys.path.insert(0, str(simulator_dir))
 
-from tools.vllm_request_generator import (
+from doolysim.tools.vllm_request_generator import (
     generate_vllm_requests_from_instance,
     generate_sharegpt_requests_from_instance,
     generate_hf_conversation_requests_from_instance,
@@ -700,7 +700,7 @@ def main():
 
         # Export requests if requested
         if args.export_requests:
-            from tools.vllm_request_generator import export_vllm_dataset_jsonl
+            from doolysim.tools.vllm_request_generator import export_vllm_dataset_jsonl
             arrival_times = [r.arrival_time for r in dooly_requests]
             export_vllm_dataset_jsonl(vllm_requests, arrival_times, args.export_requests)
 
@@ -737,7 +737,7 @@ def main():
         )
 
         if args.export_requests:
-            from tools.vllm_request_generator import export_vllm_dataset_jsonl
+            from doolysim.tools.vllm_request_generator import export_vllm_dataset_jsonl
             arrival_times = [r.arrival_time for r in dooly_requests]
             export_vllm_dataset_jsonl(vllm_requests, arrival_times, args.export_requests)
 
@@ -768,7 +768,7 @@ def main():
 
         # Export requests if requested
         if args.export_requests:
-            from tools.vllm_request_generator import export_vllm_dataset_jsonl
+            from doolysim.tools.vllm_request_generator import export_vllm_dataset_jsonl
             arrival_times = [r.arrival_time for r in dooly_requests]
             export_vllm_dataset_jsonl(vllm_requests, arrival_times, args.export_requests)
 

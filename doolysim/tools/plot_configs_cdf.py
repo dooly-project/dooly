@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
 
-from simulator.tools.plot_comparison import extract_metric, load_json, compute_cdf
+from doolysim.tools.plot_comparison import extract_metric, load_json, compute_cdf
 
 
 # Colorblind-friendly palette; extend if more configs are needed.
