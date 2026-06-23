@@ -601,6 +601,24 @@ _original_builtin_import = None
 _in_sweep = False  # re-entrancy guard: the sweep itself triggers no imports,
                    # but defensive — keeps us safe if any helper is changed
                    # later to do a lazy import.
+_INT_PATCH_EXCLUDED_PREFIXES = (
+    # Pydantic evaluates annotations while these modules are still importing.
+    # Rebinding int there turns fields like ``tp_rank: int`` into
+    # _PreservingInt and breaks schema generation.
+    "sglang.srt.utils.weight_checker",
+    "sglang.srt.model_loader.weight_utils",
+)
+
+
+def _should_patch_int_module(name, mod):
+    if any(name == p or name.startswith(p + ".") for p in _INT_PATCH_EXCLUDED_PREFIXES):
+        return False
+    # If a module has already imported pydantic's BaseModel, leave its globals
+    # alone so later model classes keep standard builtin annotations.
+    base_model = getattr(mod, "BaseModel", None)
+    if getattr(base_model, "__module__", "").startswith("pydantic"):
+        return False
+    return True
 
 
 def _sweep_and_patch_int():
@@ -620,6 +638,8 @@ def _sweep_and_patch_int():
                 continue
             mod = sys.modules.get(name)
             if mod is None:
+                continue
+            if not _should_patch_int_module(name, mod):
                 continue
             try:
                 _patched_int_modules[name] = getattr(mod, 'int', _real_int)
@@ -2837,28 +2857,93 @@ def _wrap_einsum(original_fn):
 #
 # Problem: TaintedTensor's custom __torch_dispatch__ is incompatible with
 # torch.dynamo tracing, so @torch.compile-decorated functions (e.g.
-# Cohere's layer_norm_func, GemmaRMSNorm._forward_static_*) crash when called
-# with TaintedTensor inputs. The previous mitigation was to disable dynamo
-# entirely (`torch._dynamo.config.disable = True`), which forced compiled
-# functions to run in eager mode — but each constituent ATen op still went
-# through TaintedTensor.__torch_dispatch__, decomposing the function into
-# many primitive ops that the tracer captured separately.
-#
-# Fix: wrap torch.compile so that when its produced callable is invoked with
-# TaintedTensor inputs, we (1) collect input shapes + taints, (2) unwrap to
-# plain tensors and call the original function with custom dispatch disabled
-# (treating the function body as a single black box — no per-op decomposition),
-# (3) apply propagate_taints (shape-matching rules) to compute output taints,
-# (4) re-wrap outputs as TaintedTensors. When the wrapped callable is invoked
-# with non-tainted inputs, we delegate to the real torch.compile path so
-# dynamo can do its normal optimization work.
+# Cohere's layer_norm_func, GemmaRMSNorm._forward_static_*) need a clean
+# boundary. Shape-only taints can also arrive on plain tensors, via the global
+# dimension registry, so the boundary cannot key only on TaintedTensor objects.
+
+def _dim_taint_from_registry(size):
+    """Return DimTaint metadata for a registered dimension value, if any."""
+    from .registry import lookup_taint
+
+    registry_info = lookup_taint(size)
+    if registry_info is None:
+        return None
+    if isinstance(registry_info, dict):
+        return DimTaint(registry_info["taint"], merge_history=registry_info["components"])
+    if isinstance(registry_info, DimTaint):
+        return registry_info
+    return DimTaint.from_taint(registry_info)
+
+
+def _has_semantic_dim_taint(dim_taints):
+    for dim_taint in dim_taints:
+        if dim_taint is None:
+            continue
+        if isinstance(dim_taint, DimTaint):
+            if dim_taint.taint is not None:
+                return True
+        else:
+            return True
+    return False
+
+
+def _tensor_dim_taints_for_compile(tensor):
+    shape = tuple(torch.Tensor.size(tensor))
+    if isinstance(tensor, TaintedTensor):
+        explicit_taints = tuple(tensor._dim_taints)
+    else:
+        explicit_taints = ()
+
+    dim_taints = []
+    for idx, size in enumerate(shape):
+        dim_taint = explicit_taints[idx] if idx < len(explicit_taints) else None
+        if dim_taint is None:
+            dim_taint = _dim_taint_from_registry(size)
+        dim_taints.append(dim_taint)
+    return shape, tuple(dim_taints)
+
+
+def _format_compile_tensor_shape(shape, dim_taints):
+    parts = []
+    for idx, size in enumerate(shape):
+        dim_taint = dim_taints[idx] if idx < len(dim_taints) else None
+        if isinstance(dim_taint, DimTaint):
+            parts.append(dim_taint.display(size))
+        elif dim_taint is not None:
+            parts.append(DimTaint.from_taint(dim_taint).display(size))
+        else:
+            parts.append(f"?({size})")
+    return "[" + ", ".join(parts) + "]"
+
+
+def _plain_tensor_from_tainted(tensor):
+    """Return a plain Tensor view of a TaintedTensor without invoking dispatch."""
+    with torch._C._DisableTorchDispatch():
+        return torch.Tensor._make_subclass(
+            torch.Tensor, tensor, bool(tensor.requires_grad)
+        )
+
+
+def _is_norm_like_compile(original_fn):
+    name = getattr(original_fn, "__qualname__", None) or getattr(
+        original_fn, "__name__", ""
+    )
+    return "norm" in name.lower()
+
+
+def _compile_norm_fallback_taints(input_infos, out_shape):
+    """Norm kernels preserve the activation tensor shape and dimension roles."""
+    for in_shape, in_taints in input_infos:
+        if in_shape == out_shape and _has_semantic_dim_taint(in_taints):
+            return tuple(in_taints)
+    return None
 
 def _make_taint_aware_compiled(original_fn, original_compiled_fn):
-    """Return a callable that handles TaintedTensor inputs without dynamo.
+    """Return a callable that preserves taints across torch.compile.
 
-    For TaintedTensor inputs: bypass compilation, run original_fn as a black
-    box on plain tensors, apply shape-based taint propagation to outputs.
-    For non-tainted inputs: delegate to torch.compile's compiled wrapper.
+    For semantic tensor shapes, collect metadata, pass plain tensors to the
+    compiled callable, and rewrap tensor outputs. For untainted calls, delegate
+    unchanged to torch.compile's compiled wrapper.
     """
     @functools.wraps(original_fn)
     def wrapped(*call_args, **call_kwargs):
@@ -2867,20 +2952,16 @@ def _make_taint_aware_compiled(original_fn, original_compiled_fn):
         input_infos = []
         shape_strs = []
         dtype_strs = []
-        has_tainted = False
+        has_semantic_taint = False
 
         def collect(obj):
-            nonlocal has_tainted
-            if isinstance(obj, TaintedTensor):
-                has_tainted = True
-                shape = tuple(torch.Tensor.size(obj))
-                input_infos.append((shape, obj._dim_taints))
-                shape_strs.append(obj.taint_str_with_history())
-                dtype_strs.append(str(obj.dtype))
-            elif isinstance(obj, torch.Tensor):
-                shape = tuple(torch.Tensor.size(obj))
-                input_infos.append((shape, tuple(None for _ in range(len(shape)))))
-                shape_strs.append("[" + ", ".join(f"?({d})" for d in shape) + "]")
+            nonlocal has_semantic_taint
+            if isinstance(obj, (TaintedTensor, torch.Tensor)):
+                shape, dim_taints = _tensor_dim_taints_for_compile(obj)
+                if _has_semantic_dim_taint(dim_taints):
+                    has_semantic_taint = True
+                input_infos.append((shape, dim_taints))
+                shape_strs.append(_format_compile_tensor_shape(shape, dim_taints))
                 dtype_strs.append(str(obj.dtype))
             elif isinstance(obj, (list, tuple)):
                 for x in obj:
@@ -2892,17 +2973,18 @@ def _make_taint_aware_compiled(original_fn, original_compiled_fn):
         collect(call_args)
         collect(call_kwargs)
 
-        if not has_tainted:
-            # Pure plain-tensor path — let torch.compile do its thing.
+        if not has_semantic_taint:
+            # Pure plain-tensor path with no known semantic dimensions.
             return original_compiled_fn(*call_args, **call_kwargs)
 
-        # TaintedTensor inputs present. Unwrap, run original (uncompiled) fn
-        # with our custom dispatch disabled so its body executes as a single
-        # black box (no per-op TaintedTensor decomposition).
+        # Semantic dimensions are present. Unwrap tensor subclasses and tainted
+        # scalars before crossing into torch.compile, then restore tensor taints
+        # on the outputs.
         def unwrap(x):
             if isinstance(x, TaintedTensor):
-                with torch._C._DisableTorchDispatch():
-                    return x.detach()
+                return _plain_tensor_from_tainted(x)
+            elif isinstance(x, (TaintedInt, TaintedFloat)):
+                return x.value
             elif isinstance(x, (list, tuple)):
                 return type(x)(unwrap(i) for i in x)
             elif isinstance(x, dict):
@@ -2925,8 +3007,11 @@ def _make_taint_aware_compiled(original_fn, original_compiled_fn):
             annotated_name += f" DTYPES:[{', '.join(dtype_strs)}]"
 
         with record_function(annotated_name):
-            with torch._C._DisableTorchDispatch():
-                out = original_fn(*plain_args, **plain_kwargs)
+            try:
+                out = original_compiled_fn(*plain_args, **plain_kwargs)
+            except Exception:
+                with torch._C._DisableTorchDispatch():
+                    out = original_fn(*plain_args, **plain_kwargs)
 
         # Apply shape-based taint propagation to each output tensor.
         def wrap_output(x):
@@ -2935,10 +3020,19 @@ def _make_taint_aware_compiled(original_fn, original_compiled_fn):
                 try:
                     out_taints = propagate_taints(input_infos, out_shape)
                 except Exception:
-                    # Conservative fallback: leave outputs un-tainted if
-                    # shape propagation hits an unexpected case (e.g., a
-                    # dimension-collision raise inside propagate_taints).
-                    out_taints = tuple(None for _ in range(len(out_shape)))
+                    out_taints = None
+                if (
+                    _is_norm_like_compile(original_fn)
+                    and (
+                        out_taints is None
+                        or not _has_semantic_dim_taint(out_taints)
+                    )
+                ):
+                    out_taints = _compile_norm_fallback_taints(input_infos, out_shape)
+                if out_taints is None:
+                    out_taints = tuple(
+                        _dim_taint_from_registry(size) for size in out_shape
+                    )
                 return _wrap_or_retag_tensor(x, out_taints)
             elif isinstance(x, (list, tuple)):
                 return type(x)(wrap_output(i) for i in x)

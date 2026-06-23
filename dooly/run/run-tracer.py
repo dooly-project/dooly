@@ -229,7 +229,11 @@ try:
 
                 model._apply(_convert)
 
-            sglang_loader.post_load_weights(model, model_config)
+            post_load_weights = getattr(sglang_loader, "post_load_weights", None)
+            if post_load_weights is not None:
+                post_load_weights(model, model_config)
+            else:
+                sglang_loader._post_load_weights(model)
 
         return model.eval()
 
