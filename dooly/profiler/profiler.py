@@ -1,5 +1,4 @@
 import os
-import pdb
 import socket
 import sqlite3
 import json
@@ -7,6 +6,7 @@ import csv
 import time
 from datetime import datetime
 from pathlib import Path
+from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 import traceback
@@ -1065,21 +1065,27 @@ class Profiler:
                 run_fn = run_callable
 
                 try:
-                    # For Attention modules, use gpu_busy method for accurate timing
-                    if "Attention" in module.operation_name:
-                        run_results = self._profile_gpu_busy(
-                            run_fn=run_fn,
-                            warmup_runs=5,
-                            profile_runs=20
-                        )
-                    else:
-                        # Use batched CUDA graph profiling for other operations
-                        run_results = self._profile_with_batched_cuda_graph(
-                            run_fn=run_fn,
-                            warmup_runs=5,
-                            profile_runs=20,
-                            iterations_per_graph=10
-                        )
+                    ctx = (
+                        self.module_caller.attention_forward_context()
+                        if fake_forward_batch is not None
+                        else nullcontext()
+                    )
+                    with ctx:
+                        # For Attention modules, use gpu_busy method for accurate timing
+                        if "Attention" in module.operation_name:
+                            run_results = self._profile_gpu_busy(
+                                run_fn=run_fn,
+                                warmup_runs=5,
+                                profile_runs=20
+                            )
+                        else:
+                            # Use batched CUDA graph profiling for other operations
+                            run_results = self._profile_with_batched_cuda_graph(
+                                run_fn=run_fn,
+                                warmup_runs=5,
+                                profile_runs=20,
+                                iterations_per_graph=10
+                            )
 
                     # Use original inputs for shape tracking (before prepare_op_args wraps list args)
                     all_inputs = inputs

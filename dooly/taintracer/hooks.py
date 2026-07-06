@@ -3,6 +3,7 @@
 import copyreg
 import functools
 import importlib
+import os
 import sys
 import threading
 import dataclasses
@@ -221,8 +222,8 @@ def _torch_function_implementation(cls, func, types, args=(), kwargs=None):
                 if isinstance(tensor, TaintedTensor):
                     return tensor.taint_str_with_history()
                 elif isinstance(tensor, torch.Tensor):
-                    dims = [f"?({d})" for d in tensor.shape]
-                    return "[" + ", ".join(dims) + "]"
+                    shape, dim_taints = _tensor_dim_taints_for_compile(tensor)
+                    return _format_compile_tensor_shape(shape, dim_taints)
                 return None
 
             def collect_from(obj):
@@ -246,10 +247,7 @@ def _torch_function_implementation(cls, func, types, args=(), kwargs=None):
                         shape = tuple(torch.Tensor.size(obj))
                         input_infos.append((shape, obj._dim_taints))
                     else:
-                        shape = tuple(torch.Tensor.size(obj))
-                        input_infos.append(
-                            (shape, tuple(None for _ in range(len(shape))))
-                        )
+                        input_infos.append(_tensor_dim_taints_for_compile(obj))
                 elif isinstance(obj, (list, tuple)) and not isinstance(obj, TaintedShape):
                     for item in obj:
                         collect_from(item)
@@ -411,6 +409,127 @@ def _extract_module_state_hash(module: "torch.nn.Module") -> str:
     return hashlib.blake2b(repr(canonical).encode(), digest_size=6).hexdigest()
 
 
+def _has_dim_taint(dim_taint):
+    while isinstance(dim_taint, DimTaint):
+        dim_taint = dim_taint.taint
+    return dim_taint is not None
+
+
+def _is_model_config_dim_taint(dim_taint):
+    taint = dim_taint.taint if isinstance(dim_taint, DimTaint) else dim_taint
+    return taint is not None and str(taint) == "MODEL_CONFIG"
+
+
+_MODULE_MODEL_CONFIG_ATTRS = (
+    "hidden_size",
+    "intermediate_size",
+    "moe_intermediate_size",
+    "intermediate_size_per_partition",
+    "input_size",
+    "input_size_per_partition",
+    "output_size",
+    "num_experts",
+    "num_local_experts",
+    "top_k",
+    "total_num_heads",
+    "num_heads",
+    "num_kv_heads",
+    "head_dim",
+    "head_size",
+    "qk_head_dim",
+    "v_head_dim",
+    "q_size",
+    "kv_size",
+    "q_proj_shard_size",
+    "kv_proj_shard_size",
+    "v_proj_shard_size",
+    "kv_lora_rank",
+    "qk_rope_head_dim",
+    "qk_nope_head_dim",
+    "output_size_per_partition",
+    "num_embeddings",
+    "num_embeddings_padded",
+    "org_vocab_size",
+    "org_vocab_size_padded",
+    "num_embeddings_per_partition",
+    "num_org_embeddings_per_partition",
+    "num_added_embeddings_per_partition",
+    "embedding_dim",
+)
+
+
+def _iter_module_model_config_values(module):
+    values = []
+    branch_intermediate_values = []
+    for attr_name in _MODULE_MODEL_CONFIG_ATTRS:
+        try:
+            attr_value = getattr(module, attr_name)
+        except Exception:
+            continue
+        if isinstance(attr_value, bool):
+            continue
+        if isinstance(attr_value, (int, TaintedInt)):
+            int_value = int(attr_value)
+            if int_value <= 0:
+                continue
+            values.append(int_value)
+            if attr_name in (
+                "intermediate_size",
+                "moe_intermediate_size",
+                "intermediate_size_per_partition",
+            ):
+                branch_intermediate_values.append(int_value)
+
+    # Dense and MoE MLP implementations often fuse gate/up projections into a
+    # single weight whose output dimension is 2x the branch intermediate size.
+    values.extend(2 * value for value in branch_intermediate_values)
+
+    for output_attr_name in ("output_sizes", "output_partition_sizes"):
+        try:
+            output_sizes = getattr(module, output_attr_name)
+        except Exception:
+            output_sizes = None
+        if not isinstance(output_sizes, (list, tuple)):
+            continue
+        try:
+            plain_sizes = [
+                int(v)
+                for v in output_sizes
+                if not isinstance(v, bool) and int(v) > 0
+            ]
+        except Exception:
+            plain_sizes = []
+        values.extend(plain_sizes)
+        if plain_sizes:
+            values.append(sum(plain_sizes))
+
+    return tuple(dict.fromkeys(values))
+
+
+def _register_module_model_config_dims(module):
+    from .registry import register_taint
+
+    for value in _iter_module_model_config_values(module):
+        try:
+            register_taint(value, Taint("MODEL_CONFIG"))
+        except ValueError:
+            # A module-derived hint should not turn logging into a hard failure.
+            continue
+
+
+def _module_dim_taint_from_attrs(module, size):
+    """Recover model-config labels from primitive module size attributes."""
+    if size in _iter_module_model_config_values(module):
+        return DimTaint.from_taint(Taint("MODEL_CONFIG"))
+
+    if module.__class__.__name__.endswith("AndMul") and size % 2 == 0:
+        half_taint = _dim_taint_from_registry(size // 2)
+        if _is_model_config_dim_taint(half_taint):
+            return DimTaint.from_taint(Taint("MODEL_CONFIG"))
+
+    return None
+
+
 def _module_call_wrapper(self, *args, **kwargs):
     """
     Wrapper for nn.Module.__call__ that logs taint information.
@@ -424,6 +543,7 @@ def _module_call_wrapper(self, *args, **kwargs):
     taint_str = "no_inputs"
 
     try:
+        _register_module_model_config_dims(self)
         input_shapes = []
         input_ints = []
         input_dtypes = []  # Collect dtypes for each tensor input
@@ -433,8 +553,14 @@ def _module_call_wrapper(self, *args, **kwargs):
             if isinstance(tensor, TaintedTensor):
                 return tensor.taint_str_with_history()
             elif isinstance(tensor, torch.Tensor):
-                dims = [f"?({d})" for d in tensor.shape]
-                return "[" + ", ".join(dims) + "]"
+                shape, dim_taints = _tensor_dim_taints_for_compile(tensor)
+                dim_taints = tuple(
+                    dim_taint
+                    if _has_dim_taint(dim_taint)
+                    else _module_dim_taint_from_attrs(self, size)
+                    for size, dim_taint in zip(shape, dim_taints)
+                )
+                return _format_compile_tensor_shape(shape, dim_taints)
             return None
 
         def collect_from(obj):
@@ -631,14 +757,17 @@ def _sweep_and_patch_int():
     _in_sweep = True
     try:
         for name in list(sys.modules):
-            if name in _seen_modules_for_int_patch:
-                continue
-            _seen_modules_for_int_patch.add(name)
             if not any(name.startswith(p) for p in _int_patch_prefixes):
                 continue
             mod = sys.modules.get(name)
             if mod is None:
                 continue
+            spec = getattr(mod, "__spec__", None)
+            if getattr(spec, "_initializing", False):
+                continue
+            if name in _seen_modules_for_int_patch:
+                continue
+            _seen_modules_for_int_patch.add(name)
             if not _should_patch_int_module(name, mod):
                 continue
             try:
@@ -969,6 +1098,57 @@ def _wrap_view_reshape(original_fn, fn_name):
     from .registry import register_taint, lookup_taint
     from . import is_taint_tracking_enabled
 
+    def dim_taint_from_registry_value(value):
+        registry_entry = lookup_taint(value)
+        if registry_entry is None:
+            return None
+        if isinstance(registry_entry, dict):
+            return DimTaint(
+                registry_entry['taint'],
+                merge_history=registry_entry['components'],
+            )
+        if isinstance(registry_entry, DimTaint):
+            return registry_entry
+        return DimTaint(registry_entry, merge_history={registry_entry: value})
+
+    def dim_taint_from_shape_arg(arg):
+        value = int(arg)
+        if isinstance(arg, (TaintedInt, TaintedFloat)) and arg.taint:
+            if isinstance(arg.taint, DimTaint):
+                if arg.taint.merge_history:
+                    return DimTaint(arg.taint.taint, merge_history=arg.taint.merge_history)
+                return DimTaint(arg.taint.taint, merge_history={arg.taint.taint: value})
+            base_taint = arg.taint.taint if isinstance(arg.taint, DimTaint) else arg.taint
+            return DimTaint(base_taint, merge_history={base_taint: value})
+        if isinstance(arg, int) and not isinstance(arg, bool):
+            return dim_taint_from_registry_value(value)
+        return None
+
+    def consume_dim_taint(consumed, dim_taint, value):
+        if dim_taint is None or dim_taint.taint is None:
+            return
+        if dim_taint.merge_history:
+            for taint, qty in dim_taint.merge_history.items():
+                if qty is None:
+                    consumed[taint] = None
+                    continue
+                prev = consumed.get(taint, 1)
+                consumed[taint] = None if prev is None else prev * qty
+        else:
+            consumed[dim_taint.taint] = consumed.get(dim_taint.taint, 1) * value
+
+    def merge_history_quantity(target, taint, qty):
+        if taint is None:
+            return
+        if qty is None:
+            target[taint] = None
+            return
+        prev = target.get(taint, 1)
+        target[taint] = None if prev is None else prev * qty
+
+    def history_has_unknown_quantity(history):
+        return any(qty is None for qty in history.values())
+
     @functools.wraps(original_fn)
     def wrapper(self, *shape):
         # Handle special case: view(dtype)
@@ -994,10 +1174,8 @@ def _wrap_view_reshape(original_fn, fn_name):
 
             # If taint tracking is disabled (during init / warmup / dummy_run),
             # skip the shape-analysis path entirely. This prevents warmup-only
-            # tensor shapes (e.g. vLLM's _dummy_run trial num_tokens) from
-            # leaving phantom entries in the global registry that later collide
-            # with real workload values (Qwen3-30B-A3B + FLASHINFER + B=16
-            # was the original symptom: 16 → None registered during warmup).
+            # tensor shapes from leaving phantom entries in the global registry
+            # that later collide with real workload values.
             if not is_taint_tracking_enabled():
                 return result
 
@@ -1024,27 +1202,10 @@ def _wrap_view_reshape(original_fn, fn_name):
                 # No -1, just use arg taints directly 
                 output_taints = []
                 for arg in shape_args:
-                    if isinstance(arg, (TaintedInt, TaintedFloat)) and arg.taint:
-                        # Handle nested DimTaints properly
-                        taint_to_use = arg.taint
-                        while isinstance(taint_to_use, DimTaint) and isinstance(taint_to_use.taint, DimTaint):
-                            taint_to_use = taint_to_use.taint
-
-                        # Extract the plain taint
-                        if isinstance(taint_to_use, DimTaint):
-                            plain_taint = taint_to_use.taint
-                            # If it already has merge history, preserve it
-                            if taint_to_use.has_history:
-                                output_taints.append(taint_to_use)
-                            else:
-                                arg_value = int(arg)
-                                output_taints.append(DimTaint(plain_taint, merge_history={plain_taint: arg_value}))
-                        else:
-                            # Plain Taint
-                            arg_value = int(arg)
-                            output_taints.append(DimTaint(taint_to_use, merge_history={taint_to_use: arg_value}))
+                    arg_dim_taint = dim_taint_from_shape_arg(arg)
+                    if arg_dim_taint is not None and arg_dim_taint.taint is not None:
+                        output_taints.append(arg_dim_taint)
                     else:
-                        # Plain int (untainted)
                         output_taints.append(DimTaint.from_taint(None))
 
                 # Wrap result if we have any taints
@@ -1066,20 +1227,22 @@ def _wrap_view_reshape(original_fn, fn_name):
                     if dim_taint.merge_history:
                         # Use components from merge_history
                         for taint, qty in dim_taint.merge_history.items():
-                            aggregated[taint] = aggregated.get(taint, 1) * qty
+                            merge_history_quantity(aggregated, taint, qty)
                     else:
                         # Simple dimension: use actual size as quantity
                         if dim_taint.taint is not None:
                             if isinstance(dim_taint.taint, DimTaint):
                                 # Extract plain Taint from DimTaint if needed (for dictionary key)
                                 plain_taint = dim_taint.taint.taint if isinstance(dim_taint.taint, DimTaint) else dim_taint.taint
-                                aggregated[plain_taint] = aggregated.get(plain_taint, 1) * dim_size
+                                merge_history_quantity(aggregated, plain_taint, dim_size)
                             else:
-                                aggregated[dim_taint.taint] = aggregated.get(dim_taint.taint, 1) * dim_size
+                                merge_history_quantity(aggregated, dim_taint.taint, dim_size)
                             
                 # print(f"[DEBUG @ _wrap_view_reshape] Step 1 - aggregated input taints: {aggregated}")
 
-                # STEP 2: Extract consumed taints from reshape args (TaintedInt objects)
+                # STEP 2: Extract consumed taints from reshape args. Explicit
+                # shape dimensions can be TaintedInt/TaintedFloat or plain
+                # ints whose values are already known in the registry.
                 consumed = {}
 
                 for i, arg in enumerate(shape_args):
@@ -1087,12 +1250,12 @@ def _wrap_view_reshape(original_fn, fn_name):
                         minus_one_idx = i
                         continue
 
-                    # Extract taint directly from TaintedInt/TaintedFloat
-                    if isinstance(arg, (TaintedInt, TaintedFloat)) and arg.taint:
-                        # Extract plain Taint from DimTaint if needed (for dictionary key)
-                        taint = arg.taint.taint if isinstance(arg.taint, DimTaint) else arg.taint
-                        value = int(arg)
-                        consumed[taint] = consumed.get(taint, 1) * value
+                    value = int(arg)
+                    consume_dim_taint(
+                        consumed,
+                        dim_taint_from_shape_arg(arg),
+                        value,
+                    )
                         
                 # print(f"[DEBUG @ _wrap_view_reshape] Step 2 - consumed taints from reshape args: {consumed}, minus_one_idx: {minus_one_idx}")
 
@@ -1102,6 +1265,9 @@ def _wrap_view_reshape(original_fn, fn_name):
                 for taint, agg_qty in aggregated.items():
                     if taint in consumed:
                         cons_qty = consumed[taint]
+                        if agg_qty is None or cons_qty is None or cons_qty == 0:
+                            remaining[taint] = None
+                            continue
 
                         # Validate: no expansion allowed
                         # if cons_qty > agg_qty:
@@ -1113,7 +1279,7 @@ def _wrap_view_reshape(original_fn, fn_name):
                         division = agg_qty // cons_qty
                         
                         if division < 1:
-                            remaining[taint] = None                            
+                            remaining[taint] = None
                             continue
 
                         # Only keep if not fully consumed (division > 1)
@@ -1159,7 +1325,10 @@ def _wrap_view_reshape(original_fn, fn_name):
                                     output_taints.append(DimTaint(actual_taint, merge_history={actual_taint: resolved_value}))
                                     # print(f"[DEBUG @ _wrap_view_reshape] Found existing entry in registry for value {resolved_value}: {existing_entry}, pure taint")
                                 else:
-                                    raise ValueError("Registry entry is pure taint but we have multiple remaining components. Change number of tokens to prevent overlap.")
+                                    if history_has_unknown_quantity(remaining):
+                                        output_taints.append(DimTaint.from_taint(None))
+                                    else:
+                                        output_taints.append(DimTaint.from_history(remaining))
                         else:
                             # Not in registry - compute from remaining and register
                             # print(f"[DEBUG @ _wrap_view_reshape] No existing entry in registry for value {resolved_value}. Computing from remaining: {remaining}")
@@ -1170,6 +1339,9 @@ def _wrap_view_reshape(original_fn, fn_name):
                                 # Pure taint
                                 taint = list(remaining.keys())[0]
                                 qty = remaining[taint]
+                                if qty is None:
+                                    output_taints.append(DimTaint.from_taint(None))
+                                    continue
 
                                 # Register as pure
                                 # print(f"[DEBUG @ _wrap_view_reshape] Registering {resolved_value} as pure taint {taint} with quantity {qty}")
@@ -1189,6 +1361,10 @@ def _wrap_view_reshape(original_fn, fn_name):
                                 output_taints.append(DimTaint(actual_taint, merge_history=remaining))
                             else:
                                 # MIX taint
+                                if history_has_unknown_quantity(remaining):
+                                    output_taints.append(DimTaint.from_taint(None))
+                                    continue
+
                                 # DEBUG
                                 # if resolved_value == 960:
                                     # print(f"\n[REGISTER MIX DEBUG] Registering 960 as MIX")
@@ -1203,25 +1379,12 @@ def _wrap_view_reshape(original_fn, fn_name):
                                 # Create DimTaint with history for logging
                                 output_taints.append(DimTaint(Taint('MIX'), merge_history=remaining))
 
-                    elif isinstance(arg, (TaintedInt, TaintedFloat)) and arg.taint:
-                        # Explicit tainted dimension - preserve existing history if available
-                        arg_value = int(arg)
-
-                        if isinstance(arg.taint, DimTaint):
-                            # Already a DimTaint - preserve it as-is (including merge_history)
-                            if arg.taint.merge_history:
-                                # Has existing history - use it
-                                output_taints.append(DimTaint(arg.taint.taint, merge_history=arg.taint.merge_history))
-                            else:
-                                output_taints.append(DimTaint(arg.taint.taint, merge_history={arg.taint.taint: arg_value}))
-                        else:
-                            # Plain Taint - create new history
-                            # Safety: ensure arg.taint is a base Taint, not DimTaint
-                            base_taint = arg.taint.taint if isinstance(arg.taint, DimTaint) else arg.taint
-                            output_taints.append(DimTaint(base_taint, merge_history={base_taint: arg_value}))
                     else:
-                        # Plain int (untainted)
-                        output_taints.append(DimTaint.from_taint(None))
+                        arg_dim_taint = dim_taint_from_shape_arg(arg)
+                        if arg_dim_taint is not None and arg_dim_taint.taint is not None:
+                            output_taints.append(arg_dim_taint)
+                        else:
+                            output_taints.append(DimTaint.from_taint(None))
 
             # Wrap result if we have any taints
             if any(t is not None and t.taint is not None for t in output_taints):
@@ -2240,8 +2403,10 @@ def _wrap_linear(original_fn):
             if not isinstance(input, TaintedTensor):
                 return result
 
+            weight_dim_taints = getattr(weight, "_dim_taints", None)
+
             # If weight is not tainted, preserve batch dims and mark last dim as None
-            if not isinstance(weight, TaintedTensor):
+            if not isinstance(weight, TaintedTensor) and weight_dim_taints is None:
                 new_taints = input._dim_taints[:-1] + (None,)
                 return _wrap_or_retag_tensor(result, new_taints)
 
@@ -2257,7 +2422,7 @@ def _wrap_linear(original_fn):
 
             # SEMANTIC RULE: batch dims from input + output dim from weight[0]
             batch_taints = input._dim_taints[:-1]
-            output_dim_taint = weight._dim_taints[0]
+            output_dim_taint = weight_dim_taints[0]
 
             new_taints = batch_taints + (output_dim_taint,)
             return _wrap_or_retag_tensor(result, new_taints)
@@ -2856,9 +3021,8 @@ def _wrap_einsum(original_fn):
 # ---------------------------------------------------------------------------
 #
 # Problem: TaintedTensor's custom __torch_dispatch__ is incompatible with
-# torch.dynamo tracing, so @torch.compile-decorated functions (e.g.
-# Cohere's layer_norm_func, GemmaRMSNorm._forward_static_*) need a clean
-# boundary. Shape-only taints can also arrive on plain tensors, via the global
+# torch.dynamo tracing, so @torch.compile-decorated functions need a clean
+# boundary. Shape-only taints can also arrive on plain tensors via the global
 # dimension registry, so the boundary cannot key only on TaintedTensor objects.
 
 def _dim_taint_from_registry(size):
@@ -2892,13 +3056,13 @@ def _tensor_dim_taints_for_compile(tensor):
     if isinstance(tensor, TaintedTensor):
         explicit_taints = tuple(tensor._dim_taints)
     else:
-        explicit_taints = ()
+        explicit_taints = tuple(getattr(tensor, "_dim_taints", ()))
 
     dim_taints = []
     for idx, size in enumerate(shape):
         dim_taint = explicit_taints[idx] if idx < len(explicit_taints) else None
-        if dim_taint is None:
-            dim_taint = _dim_taint_from_registry(size)
+        if not _has_dim_taint(dim_taint):
+            dim_taint = _dim_taint_from_registry(size) or dim_taint
         dim_taints.append(dim_taint)
     return shape, tuple(dim_taints)
 
@@ -2908,9 +3072,16 @@ def _format_compile_tensor_shape(shape, dim_taints):
     for idx, size in enumerate(shape):
         dim_taint = dim_taints[idx] if idx < len(dim_taints) else None
         if isinstance(dim_taint, DimTaint):
-            parts.append(dim_taint.display(size))
+            if _has_dim_taint(dim_taint):
+                parts.append(dim_taint.display(size))
+            elif size == 1:
+                parts.append("SINGLETON(1)")
+            else:
+                parts.append(f"?({size})")
         elif dim_taint is not None:
             parts.append(DimTaint.from_taint(dim_taint).display(size))
+        elif size == 1:
+            parts.append("SINGLETON(1)")
         else:
             parts.append(f"?({size})")
     return "[" + ", ".join(parts) + "]"
@@ -2937,6 +3108,25 @@ def _compile_norm_fallback_taints(input_infos, out_shape):
         if in_shape == out_shape and _has_semantic_dim_taint(in_taints):
             return tuple(in_taints)
     return None
+
+
+def _call_compiled_with_real_torch_size(compiled_fn, *args, **kwargs):
+    """Run Dynamo/Inductor with the real torch.Size class.
+
+    Dooly's PatchedSize is useful for tainting shape values in eager code, but
+    Dynamo recognizes tensor shape reads by exact torch.Size-like return types.
+    Leaving PatchedSize installed while tracing functions that use x.shape can
+    make Dynamo fail before Inductor sees the graph.
+    """
+    current_size = torch.Size
+    if current_size is _original_torch_size:
+        return compiled_fn(*args, **kwargs)
+    try:
+        torch.Size = _original_torch_size
+        return compiled_fn(*args, **kwargs)
+    finally:
+        torch.Size = current_size
+
 
 def _make_taint_aware_compiled(original_fn, original_compiled_fn):
     """Return a callable that preserves taints across torch.compile.
@@ -2975,7 +3165,9 @@ def _make_taint_aware_compiled(original_fn, original_compiled_fn):
 
         if not has_semantic_taint:
             # Pure plain-tensor path with no known semantic dimensions.
-            return original_compiled_fn(*call_args, **call_kwargs)
+            return _call_compiled_with_real_torch_size(
+                original_compiled_fn, *call_args, **call_kwargs
+            )
 
         # Semantic dimensions are present. Unwrap tensor subclasses and tainted
         # scalars before crossing into torch.compile, then restore tensor taints
@@ -2998,8 +3190,7 @@ def _make_taint_aware_compiled(original_fn, original_compiled_fn):
         # the kernel parent chain and treats them as self-tainted anchors, so
         # kernels inside this scope land on the function as their profiling
         # target — matching what the resolver needs to call back into the real
-        # torch.compile-decorated module (e.g. Cohere's layer_norm_func via
-        # its containing LayerNorm).
+        # torch.compile-decorated module via its containing module.
         fn_name = getattr(original_fn, "__name__", "compiled_fn")
         in_str = " | ".join(shape_strs) if shape_strs else "no_inputs"
         annotated_name = f"COMPILE: {fn_name} IN:[{in_str}]"
@@ -3008,8 +3199,16 @@ def _make_taint_aware_compiled(original_fn, original_compiled_fn):
 
         with record_function(annotated_name):
             try:
-                out = original_compiled_fn(*plain_args, **plain_kwargs)
-            except Exception:
+                out = _call_compiled_with_real_torch_size(
+                    original_compiled_fn, *plain_args, **plain_kwargs
+                )
+            except Exception as exc:
+                if os.environ.get("DOOLY_DEBUG_COMPILE_FALLBACK", "0") == "1":
+                    print(
+                        f"[dooly] torch.compile fallback for {fn_name}: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
                 with torch._C._DisableTorchDispatch():
                     out = original_fn(*plain_args, **plain_kwargs)
 
@@ -3072,11 +3271,10 @@ def install_hooks(int_patch_modules=(), int_patch_prefixes=()):
     import os
 
     # Replace torch.compile with a taint-aware wrapper. TaintedTensor's
-    # __torch_dispatch__ is incompatible with dynamo's tracing, so when a
-    # compiled callable is invoked with TaintedTensor inputs we bypass
-    # compilation, run the original function as a single black box, and
-    # apply shape-based taint propagation on outputs (see propagation.py).
-    # Plain-tensor calls still go through the normal torch.compile path.
+    # __torch_dispatch__ is incompatible with Dynamo tracing, so semantic calls
+    # are unwrapped to plain tensors before entering the compiled callable and
+    # rewrapped afterward with boundary-level shape taints. Plain tensor calls
+    # with no known semantic dimensions still go through torch.compile directly.
     _disable_compile_wrapper = os.environ.get("DISABLE_TAINT_COMPILE_WRAPPER", "0") == "1"
     if _disable_compile_wrapper:
         # Legacy behaviour: globally disable dynamo. Compiled functions run

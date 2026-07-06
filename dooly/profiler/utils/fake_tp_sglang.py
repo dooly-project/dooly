@@ -22,6 +22,7 @@ Usage (called from `tainted_run_scheduler_process`):
 """
 
 import os
+from contextlib import contextmanager
 
 import torch
 from torch.profiler import record_function
@@ -128,6 +129,14 @@ def apply_fake_tp_patches_sglang(tp_size: int) -> None:
         def broadcast_tensor_dict(self, td=None, src=0, group=None, metadata_group=None):
             with record_function(_comm_annotation("broadcast_tensor_dict")):
                 return td if td is not None else {}
+
+        @contextmanager
+        def graph_capture(self, graph_capture_context=None, stream=None):
+            if graph_capture_context is None:
+                if stream is None:
+                    stream = torch.cuda.Stream()
+                graph_capture_context = ps.GraphCaptureContext(stream)
+            yield graph_capture_context
 
         def __getattr__(self, name):
             # Catch-all so unknown method calls (rare SGLang paths) don't crash;

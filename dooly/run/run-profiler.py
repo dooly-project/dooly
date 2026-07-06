@@ -1,5 +1,6 @@
 import argparse
 import os
+import queue
 import sys
 from pathlib import Path
 from time import time
@@ -82,6 +83,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-batch-size", type=int, default=5)
     parser.add_argument("--max-seq-len", type=int, default=128)
     parser.add_argument("--test-counts", type=int, default=1)
+    parser.add_argument("--mem-fraction-static", type=float, default=0.9,
+                        help="SGLang mem_fraction_static used while resolving model modules.")
     parser.add_argument("--force-prefill-kernel", action="store_true", default=True)
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--db-path", type=str, default=None,
@@ -113,6 +116,7 @@ def resolve_model(
     gpu,
     enable_torch_compile,
     torch_compile_max_bs,
+    mem_fraction_static,
 ):
     from dooly.profiler.importer import OpImporter
     from dooly.profiler.resolver import ModuleResolver
@@ -133,7 +137,7 @@ def resolve_model(
         model_name=model.name,
         dtype=str(model.dtype).split(".")[-1],
         enforce_eager=True,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=mem_fraction_static,
         max_model_len=max_model_len,
         attn_backend=attention_backend,
         flash_attn_version=flash_attn_version,
@@ -256,14 +260,27 @@ def main() -> None:
                 args.gpu,
                 args.enable_torch_compile,
                 args.torch_compile_max_bs,
+                args.mem_fraction_static,
             ),
         )
         p.start()
-        model.to_profile_resolved = result_queue.get()
+        resolved = None
+        while p.is_alive():
+            try:
+                resolved = result_queue.get(timeout=1)
+                break
+            except queue.Empty:
+                continue
         p.join()
 
         if p.exitcode != 0:
-            print(f"Run {i + 1} failed with exit code {p.exitcode}")
+            raise RuntimeError(f"Resolver for {model.name} failed with exit code {p.exitcode}")
+        if resolved is None:
+            try:
+                resolved = result_queue.get_nowait()
+            except queue.Empty as exc:
+                raise RuntimeError(f"Resolver for {model.name} exited without results") from exc
+        model.to_profile_resolved = resolved
             
     # Compare modules across models
     models[0].compare_with_many(models[1:], db_path=args.db_path, overwrite=args.overwrite)

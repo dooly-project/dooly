@@ -23,14 +23,14 @@ Usage in ``run-tracer-sglang.py``::
 
 import os
 import time
-import pdb
 import threading
 from .registry import register_taint
 from .types import TaintedInt, TaintedFloat, Taint
 from .tensor import TaintedTensor
 import traceback
 
-os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+if os.environ.get("DOOLY_ALLOW_TORCH_COMPILE") != "1":
+    os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
 # Attributes to taint in SchedulerConfig
 SERVER_ARGS_TAINT_MAP = {
@@ -57,6 +57,30 @@ MODEL_RUNNER_TAINT_MAP = {
 _original_server_args_getattribute = None
 _original_model_runner_getattribute = None
 _original_input_batch_num_reqs = None
+_original_req_to_token_pool_init = None
+
+
+def _try_register_runtime_dim(value, taint_name):
+    """Best-effort shape hint for SGLang runtime helper tensors.
+
+    The registry is value-based, so a runtime value can legitimately collide
+    with a model-config value. Leave the existing entry in place on conflict;
+    validation should use non-colliding runtime sizes and fail explicitly if a
+    trace still labels runtime values as model config.
+    """
+    if isinstance(value, bool):
+        return
+    try:
+        raw = int(value)
+    except (TypeError, ValueError):
+        return
+    try:
+        register_taint(raw, Taint(taint_name))
+    except ValueError:
+        # Runtime hints should improve trace labels, not change execution or
+        # guess through value collisions.
+        pass
+
 
 def patch_server_args(server_args):
     """Patch SchedulerConfig and InputBatch for workload tainting.
@@ -69,7 +93,6 @@ def patch_server_args(server_args):
        and we need the runtime batch dimension to be tainted for LogitsProcessor etc.
 
     """
-    server_args_cls  = type(server_args)
     import os
     global _original_server_args_getattribute
     global _original_input_batch_num_reqs
@@ -89,7 +112,7 @@ def patch_server_args(server_args):
                 if name in SERVER_ARGS_TAINT_MAP and isinstance(value, int):
                     raw = int(value)  # strip any existing taint from propagation
                     taint_name = SERVER_ARGS_TAINT_MAP[name]
-                    register_taint(raw, taint_name)
+                    _try_register_runtime_dim(raw, taint_name)
                     return TaintedInt(raw, taint_name)
                 return value
 
@@ -112,13 +135,39 @@ def patch_server_args(server_args):
                 if name in MODEL_RUNNER_TAINT_MAP and isinstance(value, int) and not isinstance(value, TaintedInt):
                     raw = int(value)
                     taint_name = MODEL_RUNNER_TAINT_MAP[name]
-                    register_taint(raw, taint_name)
+                    _try_register_runtime_dim(raw, taint_name)
                     return TaintedInt(raw, taint_name)
                 return value
 
             ModelRunner.__getattribute__ = patched_model_runner_getattribute
     except ImportError as e:
         print(f"[DEBUG @ patch_input_buffers] ModelRunner ImportError - {e}", flush=True)
+
+    try:
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        global _original_req_to_token_pool_init
+        if _original_req_to_token_pool_init is None:
+            _original_req_to_token_pool_init = ReqToTokenPool.__init__
+
+            def patched_req_to_token_pool_init(
+                self,
+                size,
+                max_context_len,
+                device,
+                enable_memory_saver,
+            ):
+                _try_register_runtime_dim(max_context_len, 'MODEL_CONFIG')
+                return _original_req_to_token_pool_init(
+                    self,
+                    size,
+                    max_context_len,
+                    device,
+                    enable_memory_saver,
+                )
+
+            ReqToTokenPool.__init__ = patched_req_to_token_pool_init
+    except ImportError as e:
+        print(f"[DEBUG @ patch_input_buffers] ReqToTokenPool ImportError - {e}", flush=True)
 
     # Patch SchedulerOutput to taint num_scheduled_tokens and total_num_scheduled_tokens
     try:
@@ -138,7 +187,7 @@ def patch_server_args(server_args):
             #         return TaintedList(value)
             if name == 'extend_num_tokens':
                 if isinstance(value, int) and not isinstance(value, TaintedInt):
-                    register_taint(value, Taint('NUM_TOKS'))
+                    _try_register_runtime_dim(value, 'NUM_TOKS')
                     return TaintedInt(value, 'NUM_TOKS')
             # out_cache_loc is computed at runtime (torch.cat of allocator
             # results); its length equals NUM_TOKS but it has no upstream
@@ -158,7 +207,17 @@ def patch_server_args(server_args):
         def patched_init_new(cls, batch, model_runner):
             ret = _original_init_new(cls, batch, model_runner)
             num_reqs = len(batch.seq_lens)
-            register_taint(num_reqs, Taint('NUM_REQS'))
+            _try_register_runtime_dim(num_reqs, 'NUM_REQS')
+            _try_register_runtime_dim(num_reqs + 1, 'NUM_REQS')
+            for extend_len in getattr(batch, 'extend_lens', None) or ():
+                _try_register_runtime_dim(extend_len, 'NUM_TOKS')
+            try:
+                _try_register_runtime_dim(
+                    model_runner.req_to_token_pool.max_context_len,
+                    'MODEL_CONFIG',
+                )
+            except AttributeError:
+                pass
             if not isinstance(ret.seq_lens, TaintedTensor):
                 ret.seq_lens = TaintedTensor(ret.seq_lens, [Taint('NUM_REQS')])
             if not isinstance(ret.positions, TaintedTensor):
@@ -167,7 +226,7 @@ def patch_server_args(server_args):
             # int. Re-tainting here so `forward_batch.batch_size + 1`
             # propagates to torch.arange(0, batch_size+1) for cu_seqlens_q/k.
             if isinstance(ret.batch_size, int) and not isinstance(ret.batch_size, TaintedInt):
-                register_taint(ret.batch_size, Taint('NUM_REQS'))
+                _try_register_runtime_dim(ret.batch_size, 'NUM_REQS')
                 ret.batch_size = TaintedInt(ret.batch_size, 'NUM_REQS')
             # input_ids is the model's entry-point tensor; its length equals
             # the number of scheduled tokens this step. Without this wrap,
@@ -175,14 +234,13 @@ def patch_server_args(server_args):
             if (isinstance(ret.input_ids, torch.Tensor)
                     and not isinstance(ret.input_ids, TaintedTensor)):
                 num_toks = ret.input_ids.shape[0]
-                register_taint(int(num_toks), Taint('NUM_TOKS'))
+                _try_register_runtime_dim(num_toks, 'NUM_TOKS')
                 ret.input_ids = TaintedTensor(ret.input_ids, [Taint('NUM_TOKS')])
             return ret
         
         ForwardBatch.init_new = patched_init_new  
 
 
-        print("[DEBUG @ patch_input_buffers] SchedulerOutput patch applied", flush=True)
     except ImportError as e:
         print(f"[DEBUG @ patch_input_buffers] SchedulerOutput ImportError - {e}", flush=True)
 

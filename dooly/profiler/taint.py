@@ -74,21 +74,76 @@ def parse_taint_string(taint_name: str) -> List[TaintInput]:
         # - MODEL_CONFIG(value)
         # - ?(value)
 
+        def canonical_label(label: str) -> str:
+            if label in {
+                'NUM_TOKEN',
+                'NUM_TOKENS',
+                'MAX_NUM_TOKEN',
+                'MAX_NUM_TOKENS',
+                'MAX_TOTAL_NUM_TOKENS',
+            }:
+                return 'NUM_TOKS'
+            if label in {
+                'NUM_REQUEST',
+                'NUM_REQUESTS',
+                'MAX_NUM_REQUEST',
+                'MAX_NUM_REQUESTS',
+                'MAX_RUNNING_REQUESTS',
+            }:
+                return 'NUM_REQS'
+            if label == 'MAX_NUM_TOKS':
+                return 'NUM_TOKS'
+            if label == 'MAX_NUM_REQS':
+                return 'NUM_REQS'
+            return label
+
+        def parse_mix_history(history_str: str) -> Dict[str, int]:
+            components = {}
+            for component in history_str.split(','):
+                parts = [part.strip() for part in component.split(':')]
+                if len(parts) != 2:
+                    continue
+                left, right = parts
+                if left.isdigit():
+                    label = canonical_label(right)
+                    qty = int(left)
+                elif right.isdigit():
+                    label = canonical_label(left)
+                    qty = int(right)
+                else:
+                    continue
+                components[label] = components.get(label, 1) * qty
+            return components
+
         # Patterns for different taint types
-        # MIX(value)[hist:qty:taint,qty:taint,...] - with component history
-        mix_pattern = r'MIX\((\d+)\)\[hist:([^\]]+)\]'
-        # MODEL_CONFIG(value)
-        model_config_pattern = r'MODEL_CONFIG\((\d+)\)'
-        # NUM_TOKS(value) or MAX_NUM_TOKS(value)
-        num_toks_pattern = r'(?:MAX_)?NUM_TOKS\((\d+)\)'
-        # NUM_REQS(value) or MAX_NUM_REQS(value)
-        num_reqs_pattern = r'(?:MAX_)?NUM_REQS\((\d+)\)'
+        # MIX(value)[hist:...] - with optional component history
+        mix_pattern = r'MIX\((\d+)\)(?:\[hist:([^\]]+)\])?'
+        # MODEL_CONFIG(value) and display-only singleton dimensions
+        model_config_pattern = r'(?:MODEL_CONFIG|SINGLETON)\((\d+)\)'
+        # NUM_TOKS(value) and public/cap aliases
+        num_toks_pattern = (
+            r'(?:NUM_TOKS|NUM_TOKEN|NUM_TOKENS|MAX_NUM_TOKS|'
+            r'MAX_NUM_TOKEN|MAX_NUM_TOKENS|MAX_TOTAL_NUM_TOKENS)\((\d+)\)'
+        )
+        # NUM_REQS(value) and public/cap aliases
+        num_reqs_pattern = (
+            r'(?:NUM_REQS|NUM_REQUEST|NUM_REQUESTS|MAX_NUM_REQS|'
+            r'MAX_NUM_REQUEST|MAX_NUM_REQUESTS|MAX_RUNNING_REQUESTS)\((\d+)\)'
+        )
         # ?(value) - unknown/untracked dimensions
         unknown_pattern = r'\?\((\d+)\)'
 
         # Find all dimension patterns (including MIX with history)
         # Note: Order matters - check MIX first since it has [hist:...] suffix
-        dim_pattern = r'MIX\(\d+\)\[hist:[^\]]+\]|MODEL_CONFIG\(\d+\)|(?:MAX_)?NUM_TOKS\(\d+\)|(?:MAX_)?NUM_REQS\(\d+\)|\?\(\d+\)'
+        dim_pattern = (
+            r'MIX\(\d+\)(?:\[hist:[^\]]+\])?|'
+            r'(?:MODEL_CONFIG|SINGLETON)\(\d+\)|'
+            r'(?:NUM_TOKS|NUM_TOKEN|NUM_TOKENS|MAX_NUM_TOKS|'
+            r'MAX_NUM_TOKEN|MAX_NUM_TOKENS|MAX_TOTAL_NUM_TOKENS)\(\d+\)|'
+            r'(?:NUM_REQS|NUM_REQUEST|NUM_REQUESTS|MAX_NUM_REQS|'
+            r'MAX_NUM_REQUEST|MAX_NUM_REQUESTS|MAX_RUNNING_REQUESTS)\(\d+\)|'
+            r'\?\(\d+\)'
+        )
         dim_matches = re.findall(dim_pattern, input_str)
 
         # print(f"[DEBUG @ taint.py] dim_matches: {dim_matches}")
@@ -99,17 +154,7 @@ def parse_taint_string(taint_name: str) -> List[TaintInput]:
             if mix_match:
                 value = int(mix_match.group(1))
                 history_str = mix_match.group(2)
-                # Parse history: "qty:taint,qty:taint,..." -> {taint: qty}
-                components = {}
-                for component in history_str.split(','):
-                    parts = component.strip().split(':')
-                    if len(parts) == 2:
-                        qty_str, taint_name = parts
-                        try:
-                            qty = int(qty_str)
-                            components[taint_name] = qty
-                        except ValueError:
-                            pass
+                components = parse_mix_history(history_str) if history_str else None
                 dimensions.append(TaintDimension(DimensionType.MIX, value, components))
                 continue
             # Check if it's MODEL_CONFIG

@@ -10,6 +10,7 @@ all sibling ModuleInfos under that parent are merged to avoid redundant profilin
 """
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from contextlib import nullcontext
 
 import torch
 
@@ -582,10 +583,8 @@ class ModuleResolver:
 
             # SGLang: for attention modules, allocate KV cache slots and
             # configure attn_backend via build_fake_forward_batch once before
-            # the forward call. init_forward_metadata is called inside it, so
-            # no context manager is needed. When get_forward_context() is None,
-            # RadixAttention falls back to attn_backend.forward() directly.
-            # Raw ops and non-attention modules skip this block (layer_name=None).
+            # the forward call. Raw ops and non-attention modules skip this
+            # block (layer_name=None).
             fake_forward_batch = None
             token_indices = None
             if layer_name and isinstance(workload_batch, AttentionBatchConfig):
@@ -620,7 +619,13 @@ class ModuleResolver:
 
             try:
                 # Single forward pass
-                run_callable()
+                ctx = (
+                    self.vlp.attention_forward_context()
+                    if fake_forward_batch is not None
+                    else nullcontext()
+                )
+                with ctx:
+                    run_callable()
 
                 torch.cuda.synchronize()
             finally:

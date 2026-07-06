@@ -18,15 +18,15 @@ What we construct ourselves:
 """
 
 import os
-import pdb
 
 import torch
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, Literal, Union
 from dataclasses import dataclass
 from tqdm import tqdm
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 
+from dooly.sglang_config import patch_sglang_model_loader_rope_parameters
 from dooly.profiler.utils.generate_batch import AttentionBatchConfig
 
 # Apply fake TP patches BEFORE importing SGLang so all modules see patched
@@ -44,8 +44,35 @@ if _FAKE_TP_SIZE > 1:
 # from vllm.v1.attention.backend import CommonAttentionMetadata
 
 from sglang.srt.server_args import ServerArgs, PortArgs
-from sglang.srt.managers.scheduler import Scheduler, configure_scheduler
+try:
+    from sglang.srt.managers.scheduler import Scheduler, configure_scheduler
+except ImportError:
+    from sglang.srt.managers.scheduler import Scheduler, configure_scheduler_process
+
+    def configure_scheduler(
+        server_args,
+        tp_rank,
+        attn_cp_rank,
+        moe_dp_rank,
+        moe_ep_rank,
+        pp_rank,
+        dp_rank,
+    ):
+        return configure_scheduler_process(
+            server_args,
+            0,
+            tp_rank,
+            attn_cp_rank,
+            moe_dp_rank,
+            moe_ep_rank,
+            pp_rank,
+            dp_rank,
+        )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext as ModelForwardContext,
+    forward_context as model_forward_context,
+)
 from sglang.srt.mem_cache.common import write_cache_indices
 
 
@@ -106,6 +133,8 @@ class SgLangLayerProfiler:
         self.device = torch.device("cuda:0")
 
         print(f"[SGLangLayerProfiler] Initializing SgLang with model: {model_name}")
+        if patch_sglang_model_loader_rope_parameters():
+            print("[SGLangLayerProfiler] Enabled nested RoPE config normalization")
 
         # Fake TP size (patches applied at module level, see top of file)
         self.tp_size = _FAKE_TP_SIZE
@@ -336,8 +365,41 @@ class SgLangLayerProfiler:
             self.req_to_token_pool,
         )
 
-        # Build ForwardBatch — the struct init_forward_metadata reads
+        # SGLang no longer stores pools/backend on ForwardBatch; those live on
+        # the attention backend/model runner. Keep only the dataclass fields
+        # accepted by the installed ForwardBatch constructor.
         num_query_tokens = batch_size * num_new_tokens
+        if is_prefill:
+            positions = torch.cat([
+                torch.arange(
+                    kv_cache_size,
+                    total_seq_len,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                for _ in range(batch_size)
+            ])
+            extend_start_loc = torch.zeros(
+                batch_size, dtype=torch.int32, device=self.device
+            )
+            if batch_size > 1:
+                extend_start_loc[1:] = torch.cumsum(
+                    extend_lens_device[:-1].to(torch.int32), dim=0
+                )
+            extend_prefix_lens = prefix_lens_device.to(torch.int32)
+            extend_seq_lens = extend_lens_device.to(torch.int32)
+            extend_prefix_lens_cpu = [kv_cache_size] * batch_size
+            extend_seq_lens_cpu = [num_new_tokens] * batch_size
+            extend_num_tokens = num_query_tokens
+        else:
+            positions = (seq_lens_device - 1).to(torch.int64)
+            extend_start_loc = None
+            extend_prefix_lens = None
+            extend_seq_lens = None
+            extend_prefix_lens_cpu = None
+            extend_seq_lens_cpu = None
+            extend_num_tokens = None
+
         fake_batch = ForwardBatch(
             forward_mode=ForwardMode.EXTEND if is_prefill else ForwardMode.DECODE,
             batch_size=batch_size,
@@ -347,20 +409,19 @@ class SgLangLayerProfiler:
             out_cache_loc=out_cache_loc,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=int(batch_size * total_seq_len),
-            extend_prefix_lens=prefix_lens_device.to(torch.int32),
-            extend_prefix_lens_cpu=[kv_cache_size] * batch_size,
-            extend_num_tokens=num_query_tokens if is_prefill else None,
-            extend_seq_lens=extend_lens_device.to(torch.int32),
-            extend_seq_lens_cpu=[num_new_tokens] * batch_size,
+            positions=positions,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_start_loc=extend_start_loc,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_num_tokens=extend_num_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
             encoder_lens=None,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
             spec_info=None,
             num_token_non_padded=torch.tensor(
                 num_query_tokens, dtype=torch.int32, device=self.device
             ),
             num_token_non_padded_cpu=num_query_tokens,
-            attn_backend=self.attn_backend,
         )
 
         # Configure the shared attn_backend — equivalent to vLLM's builder.build()
@@ -392,6 +453,12 @@ class SgLangLayerProfiler:
     def _free_fake_batch(self, token_indices: torch.Tensor) -> None:
         """Return token KV cache slots to the allocator after a profiling pass."""
         self.model_runner.token_to_kv_pool_allocator.free(token_indices)
+
+    @contextmanager
+    def attention_forward_context(self):
+        """Expose SGLang's per-forward attention backend context for replays."""
+        with model_forward_context(ModelForwardContext(attn_backend=self.attn_backend)):
+            yield
 
 
 def make_dict(model):

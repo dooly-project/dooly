@@ -4,13 +4,16 @@ Trace loading and parsing utilities for vLLM profiler traces.
 
 import json
 from collections import defaultdict
-import pdb
 from typing import Any, Dict, List, Optional
 
 from dooly.profiler.module import ModuleInfo
 from dooly.profiler.parser import HierarchicalTraceParser, OperationHierarchy
 from dooly.profiler.finput import ProfileInput, extract_inputs_from_taint
 from dooly.profiler.taint import parse_taint_string
+
+
+UNSUPPORTED_RAW_REPLAY_OPS = {"sglang::store_cache"}
+
 
 class TraceLoader:
     @staticmethod
@@ -154,6 +157,7 @@ class TraceParser:
             "comm_no_params": _TCounter(),
             "comm_no_dims": _TCounter(),
             "comm_empty_inputs": _TCounter(),
+            "unsupported_raw_op": _TCounter(),
         }
         _accepted_by_op = _TCounter()
         # --- END DEBUG-TRACE ---
@@ -227,6 +231,10 @@ class TraceParser:
                 if len(hierarchy.comm_ops) > 0:
                     print(f"[DEBUG] Module {op_name} has {len(hierarchy.comm_ops)}, nearest_modul_name: {module_name}, comm ops: {[c.name for c in hierarchy.comm_ops]}, module_taint={hierarchy.get_taint_string()[:50] if hierarchy.get_taint_string() else None}, anchor_args={anchor_args if anchor_args else None}")
 
+                if not is_module and op_name in UNSUPPORTED_RAW_REPLAY_OPS:
+                    _drops["unsupported_raw_op"] += 1
+                    _drop_by_op["unsupported_raw_op"][op_name] += 1
+                    continue
 
                 # Non-module (cpu_op) anchored hierarchy: use trace args for input extraction
                 shapes = anchor_args.get("Input Dims", [])

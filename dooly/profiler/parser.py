@@ -14,7 +14,6 @@ Strategy:
 """
 
 import json
-import pdb
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict
@@ -133,8 +132,15 @@ class Event:
 
         result = []
         for tensor_str in tensor_strs:
-            # Extract integers from ?(N) or MODEL_CONFIG(N) patterns
-            dims = re.findall(r'(?:\?|NUM_TOKS|NUM_REQS|MODEL_CONFIG)\((\d+)\)', tensor_str)
+            # Extract integers from taint labels. Keep this in sync with
+            # profiler.taint.parse_taint_string so display-only labels such as
+            # SINGLETON(1) do not silently drop dimensions.
+            dim_label_pattern = (
+                r'\?|MODEL_CONFIG|SINGLETON|MIX|'
+                r'(?:MAX_)?NUM_TOKS|(?:MAX_)?NUM_TOKEN(?:S)?|MAX_TOTAL_NUM_TOKENS|'
+                r'(?:MAX_)?NUM_REQS|(?:MAX_)?NUM_REQUEST(?:S)?|MAX_RUNNING_REQUESTS'
+            )
+            dims = re.findall(rf'(?:{dim_label_pattern})\((\d+)\)', tensor_str)
             result.append([int(d) for d in dims])
 
         return result
@@ -953,25 +959,15 @@ class HierarchicalTraceParser:
                 elif ancestor.cat == 'cpu_op':
                     cpu_op_anchors.add(anchor_id)
 
-        # 2. Deduplicate: Remove anchors that are descendants of other anchors
-        # If A contains B (A is ancestor of B), keep only A and remap B's kernels to A
-        anchor_objects = set(anchor_events.values())
-        canonical_anchors: Dict[int, Event] = {}
-
-        for anchor_id, anchor in anchor_events.items():
-            is_redundant = False
-            curr = anchor.parent
-            while curr:
-                if curr in anchor_objects:
-                    is_redundant = True
-                    # Remap kernels to the canonical parent anchor
-                    parent_id = id(curr)
-                    anchor_to_kernels[parent_id].extend(anchor_to_kernels[anchor_id])
-                    break
-                curr = curr.parent
-
-            if not is_redundant:
-                canonical_anchors[anchor_id] = anchor
+        # 2. Keep the nearest tainted anchor selected for each kernel.
+        #
+        # Some SGLang traces mark both a broad model module and its inner layer
+        # modules. Collapsing descendant anchors into the broad ancestor makes
+        # the profiler lose the actual layer operations (for example attention
+        # and norm modules under a top-level *Model scope). The kernel walk
+        # above already picked the nearest usable anchor per kernel, so preserving
+        # those anchors keeps profiling granular without duplicating kernels.
+        canonical_anchors: Dict[int, Event] = dict(anchor_events)
 
         # --- DEBUG: expose anchor landscape ---
         from collections import Counter as _DbgCounter

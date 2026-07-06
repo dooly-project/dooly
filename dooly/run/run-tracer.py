@@ -8,7 +8,6 @@ Usage:
     python test.py --model meta-llama/Llama-3.1-8B --tp 2 --trace_dir ./traces
 """
 import os
-import pdb
 import sys
 import socket
 import argparse
@@ -44,6 +43,7 @@ parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B",
 parser.add_argument("--tp", "--tensor_parallel_size", type=int, default=1, dest="tensor_parallel_size", help="Fake tensor parallel size (weights sharded but run on 1 GPU)")
 parser.add_argument("--dtype", type=str, default="bfloat16", help="Model dtype")
 parser.add_argument("--prompts", type=str, default="Hello, how are you? I am fine, and ", help="Prompt to run")
+parser.add_argument("--num-prompts", type=int, default=5, help="Number of repeated prompts to send")
 parser.add_argument("--max-tokens", type=int, default=1, help="Max tokens to generate")
 parser.add_argument("--trace_dir", type=str, default="/home/jkim38/dooly/profiler/vllm_traces_tp", help="Directory to save trace")
 parser.add_argument("--gpu", type=str, default="0", help="GPU device index to use")
@@ -57,7 +57,17 @@ parser.add_argument("--context-length", type=int, default=None, help="Override m
 parser.add_argument("--max-running-requests", type=int, default=263, help="Max running requests for the SGLang engine.")
 parser.add_argument("--max-total-tokens", type=int, default=521, help="Max total tokens for the SGLang engine.")
 parser.add_argument("--mem-fraction-static", type=float, default=None, help="Optional mem_fraction_static override for the SGLang engine.")
+parser.add_argument("--watchdog-timeout", type=float, default=None, help="Optional SGLang scheduler watchdog timeout override in seconds.")
 args = parser.parse_args()
+
+if args.enable_torch_compile:
+    # SGLang's scheduler subprocess inherits this environment. Dooly's
+    # subprocess shim uses it to avoid the historical eager-only Dynamo kill
+    # switch when the caller explicitly requested SGLang torch.compile.
+    os.environ["DOOLY_ALLOW_TORCH_COMPILE"] = "1"
+    os.environ.pop("TORCHDYNAMO_DISABLE", None)
+else:
+    os.environ.pop("DOOLY_ALLOW_TORCH_COMPILE", None)
 
 if torch.cuda.is_available():
     torch.cuda.set_device(0)
@@ -127,6 +137,7 @@ os.environ["DOOLY_FAKE_TP"] = str(FAKE_TP)
 # This patches AutoConfig.from_pretrained to return TaintedConfig objects
 # and installs hooks on tensor factory functions for taint propagation
 import tempfile
+from dooly.sglang_config import normalize_nested_rope_parameters_for_sglang
 from dooly.taintracer.hooks import install_hooks
 from dooly.taintracer.config_sglang import patch_autoconfig, patch_input_buffers
 from dooly.taintracer.registry import TAINT_REGISTRY
@@ -160,13 +171,18 @@ _original_parameter_new = torch.nn.Parameter.__new__
 
 def _patched_parameter_new(cls, data=None, requires_grad=True):
     from dooly.taintracer.tensor import TaintedTensor
+    dim_taints = None
     if isinstance(data, TaintedTensor):
+        dim_taints = tuple(data._dim_taints)
         # Unwrap: get the plain Tensor view of the same storage, so that
         # type(data) is torch.Tensor and Parameter.__new__ takes the
         # _make_subclass(cls, ...) path that actually returns `cls`.
         with torch._C._DisableTorchDispatch():
             data = torch.Tensor._make_subclass(torch.Tensor, data, False)
-    return _original_parameter_new(cls, data=data, requires_grad=requires_grad)
+    param = _original_parameter_new(cls, data=data, requires_grad=requires_grad)
+    if dim_taints is not None:
+        object.__setattr__(param, "_dim_taints", dim_taints)
+    return param
 
 torch.nn.Parameter.__new__ = _patched_parameter_new
 
@@ -196,6 +212,7 @@ try:
         target_device = torch.device(device_config.device)
 
         with sglang_loader.set_default_torch_dtype(model_config.dtype):
+            normalize_nested_rope_parameters_for_sglang(model_config)
             with torch.device(device_config.device):
                 model = sglang_loader._initialize_model(
                     model_config,
@@ -327,7 +344,7 @@ if __name__ == "__main__":
         # Set TORCH_TRACE_DIR for sglang_subprocess.py to pick up inside the spawned process.
         os.environ["TORCH_TRACE_DIR"] = args.trace_dir
 
-        prompts = [args.prompts] * 5
+        prompts = [args.prompts] * args.num_prompts
         engine_kwargs = dict(
             model_path=args.model,
             tokenizer_path=args.tokenizer if args.tokenizer else args.model,
@@ -343,6 +360,8 @@ if __name__ == "__main__":
         )
         if args.mem_fraction_static is not None:
             engine_kwargs["mem_fraction_static"] = args.mem_fraction_static
+        if args.watchdog_timeout is not None:
+            engine_kwargs["watchdog_timeout"] = args.watchdog_timeout
         if args.quantization:
             engine_kwargs["quantization"] = args.quantization
         if args.enable_torch_compile:
@@ -356,7 +375,7 @@ if __name__ == "__main__":
                 "CPU",
                 "GPU",
             ], with_stack=False, record_shapes=True, )
-        sampling_params={"max_new_tokens": 0, "temperature": 0.0}
+        sampling_params={"max_new_tokens": args.max_tokens, "temperature": 0.0}
         outputs = llm.generate(prompt=prompts, sampling_params=sampling_params)
         llm.stop_profile()
 
