@@ -1,6 +1,6 @@
 """Direct-from-DB latency predictor.
 
-Drop-in replacement for `simulator.benchmark.batch_predictor` that bypasses
+Drop-in replacement for `doolysim.benchmark.batch_predictor` that bypasses
 the trained estimator entirely. For each operation profiled for the
 (model, backend) pair, we look up the median per-call latency at the
 matching shape directly in `results`, then sum count * per_call across all

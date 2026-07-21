@@ -5,7 +5,7 @@ vLLM bar is 1.0. A percentage-error tag (DoolySim vs vLLM) sits on top of the
 DoolySim bar so it's easy to spot simulator accuracy per model.
 
 Usage:
-    python -m simulator.tools.plot_throughput_bars \\
+    python -m doolysim.tools.plot_throughput_bars \\
         --configs comparison/openchat-0.5rps/Qwen/Qwen3-4B \\
                   comparison/openchat-0.5rps/meta-llama/Llama-3.1-8B \\
                   comparison/openchat-0.5rps/Qwen/Qwen3-32B \\

@@ -15,7 +15,7 @@ A red ★ marks the row winner; arrows mark "winner inversions" — places
 where the fastest configuration changes between adjacent rows.
 
 Data source: a `validation_summary.json` produced by
-`simulator.tools.validate_predictions`. Each row has fields:
+`doolysim.tools.validate_predictions`. Each row has fields:
     model, backend, tp, length, predicted_ms, measured_ms, ...
 
 Decode-heavy data is not yet present in the summary file (validate_predictions
@@ -25,7 +25,7 @@ empty (with a notice in the title) until a future run populates them.
 
 Usage
 -----
-    python -m simulator.tools.plot_validation_chess \
+    python -m doolysim.tools.plot_validation_chess \
         --summary /home/jkim38/dooly/results/scenario_a_validation_locked_1700_v2_dense/validation_summary.json \
         --output-dir /home/jkim38/dooly/results/scenario_a_validation_locked_1700_v2_dense \
         --workload prefill                # or 'decode' or 'both' (default: prefill)

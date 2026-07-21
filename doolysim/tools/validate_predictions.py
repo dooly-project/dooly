@@ -6,7 +6,7 @@ For every (model, backend, tp) profiled in a Dooly DB, runs:
      measured latency.
 Then prints a side-by-side comparison and saves all results to JSON.
 
-Workload modes (mirrors `simulator.benchmark.run_comparison`):
+Workload modes (mirrors `doolysim.benchmark.run_comparison`):
   - prefill : single prefill of length L  (--lengths picks L; default flow)
   - decode  : single decode step at KV cache size K  (--kv-sizes picks K)
   - both    : sweep both axes back-to-back
@@ -14,18 +14,18 @@ Workload modes (mirrors `simulator.benchmark.run_comparison`):
 Typical usage (after `sudo nvidia-smi -lgc 1700` if you want locked clocks):
 
     # Prefill-only (unchanged from before):
-    python -m simulator.tools.validate_predictions \\
+    python -m doolysim.tools.validate_predictions \\
         --db-path  /home/jkim38/dooly/profiler/database/clean/dooly-scenario-a-locked-1700.db \\
         --output-dir /home/jkim38/dooly/results/validation_locked_1700 \\
         --lengths 1024 2048 4096 8192 16384
 
     # Decode-only:
-    python -m simulator.tools.validate_predictions \\
+    python -m doolysim.tools.validate_predictions \\
         --db-path .../dooly.db --output-dir .../validation_decode \\
         --workload decode --kv-sizes 1024 2048 4096 8192 16384
 
     # Both axes in one run:
-    python -m simulator.tools.validate_predictions \\
+    python -m doolysim.tools.validate_predictions \\
         --db-path .../dooly.db --output-dir .../validation_both \\
         --workload both \\
         --lengths  512 1024 2048 4096 8192 16384 \\
@@ -194,7 +194,7 @@ def run_vllm_direct(combo: Combo, batch_cfg: Path, out_dir: Path,
     if out_file.exists():
         return json.loads(out_file.read_text())
     cmd = [
-        python_exe, "-m", "simulator.benchmark.measure_vllm_direct",
+        python_exe, "-m", "doolysim.benchmark.measure_vllm_direct",
         "--batch-config", str(batch_cfg),
         "--tensor-parallel-size", str(combo.tp),
         "--attention-backend", combo.backend,

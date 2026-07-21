@@ -2,7 +2,7 @@
 """End-to-end Dooly validation pipeline.
 
 Runs (or re-uses) a Dooly profile DB across multiple (model, backend) pairs,
-then drives `simulator.tools.validate_predictions` over the resulting DB to
+then drives `doolysim.tools.validate_predictions` over the resulting DB to
 compare predicted vs vLLM-measured latencies, optionally streaming GPU clock
 samples to a CSV in parallel.
 
@@ -10,7 +10,7 @@ Stages:
     1. (optional) Profile every (model, backend, tp) pair into the target DB.
        Wraps `profiler.run_scenario_a.py` — pairs are read from the PAIRS
        constant in that file unless --models / --backends override.
-    2. (optional) Run `simulator.tools.validate_predictions` over the DB.
+    2. (optional) Run `doolysim.tools.validate_predictions` over the DB.
     3. (optional) Plot the standard latency + inversion + chess figures via
        the matching plot_validation* tools.
 
@@ -20,7 +20,7 @@ This is the Python replacement for the older bash recipe at
 Usage examples:
 
     # Full pipeline at locked 1700 MHz (assumes you already locked the GPU)
-    python -m simulator.tools.run_validation_pipeline \\
+    python -m doolysim.tools.run_validation_pipeline \\
         --db-path        /home/jkim38/dooly/profiler/database/dooly-locked-1700.db \\
         --workspace-dir  /home/jkim38/dooly/profiler/workspaces/locked_1700 \\
         --results-dir    /home/jkim38/dooly/results/validation_locked_1700 \\
@@ -28,10 +28,10 @@ Usage examples:
         --backends FLASHINFER FLASH_ATTN TRITON_ATTN
 
     # Skip profiling (DB already populated), just validate + plot
-    python -m simulator.tools.run_validation_pipeline ... --skip-profile
+    python -m doolysim.tools.run_validation_pipeline ... --skip-profile
 
     # Validate at a denser grid, no plots
-    python -m simulator.tools.run_validation_pipeline ... \\
+    python -m doolysim.tools.run_validation_pipeline ... \\
         --lengths 256 512 768 1024 1280 1536 1792 2048 2560 3072 \\
                   3584 4096 5120 6144 7168 8192 10240 12288 14336 16384 \\
         --no-plots
@@ -231,7 +231,7 @@ def stage_profile(args: argparse.Namespace, env: dict) -> None:
 
 def stage_validate(args: argparse.Namespace, env: dict) -> None:
     cmd = [
-        args.python, "-m", "simulator.tools.validate_predictions",
+        args.python, "-m", "doolysim.tools.validate_predictions",
         "--db-path", str(args.db_path),
         "--output-dir", str(args.results_dir),
         "--lengths", *(str(L) for L in args.lengths),
@@ -269,13 +269,13 @@ def stage_plots(args: argparse.Namespace, env: dict) -> None:
 
     # Latency + inversion overlay
     # _run(
-    #     [args.python, "-m", "simulator.tools.plot_validation",
+    #     [args.python, "-m", "doolysim.tools.plot_validation",
     #      "--summary", str(summary)],
     #     cwd=REPO, env=env, tail=4,
     # )
     # Chess heatmap
     _run(
-        [args.python, "-m", "simulator.tools.plot_validation_chess",
+        [args.python, "-m", "doolysim.tools.plot_validation_chess",
          "--summary", str(summary),
          "--output-dir", str(args.results_dir),
          "--workload", "prefill",

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Run DoolySim (simulator.cli) and vLLM streaming (simulator.benchmark.measure_vllm_streaming)
+"""Run DoolySim (doolysim.cli) and vLLM streaming (doolysim.benchmark.measure_vllm_streaming)
 across multiple configurations on the same dataset, writing matched JSON outputs
 into a `comparison/<run>/<model>/` layout that `plot_configs_cdf.py` can consume.
 
 Edit the CONFIGS list (or pass --config) and the common settings at the top of
 main(), then:
 
-    python -m simulator.benchmark.run_streaming_comparison \\
+    python -m doolysim.benchmark.run_streaming_comparison \\
         --dataset ./dataset/openchat-1.0rps.jsonl \\
         --run-name openchat-1.0rps \\
         --results-root ./comparison
@@ -127,7 +127,7 @@ def dooly_cmd(
     verbose: bool,
 ) -> List[str]:
     cmd = [
-        sys.executable, "-m", "simulator.cli",
+        sys.executable, "-m", "doolysim.cli",
         "--model", cfg.model,
         "--backend", cfg.backend,
         "--tp", str(cfg.tp),
@@ -163,7 +163,7 @@ def vllm_cmd(
     verbose: bool,
 ) -> List[str]:
     cmd = [
-        sys.executable, "-m", "simulator.benchmark.measure_vllm_streaming",
+        sys.executable, "-m", "doolysim.benchmark.measure_vllm_streaming",
         "--model", cfg.model,
         "--backend", cfg.backend,
         "--tp", str(cfg.tp),

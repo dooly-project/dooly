@@ -5,7 +5,7 @@ One subplot per model. Each backend gets a color; dashed = Dooly predicted,
 thick solid = real vLLM measurement.
 
 Usage:
-    python -m simulator.tools.plot_validation \
+    python -m doolysim.tools.plot_validation \
         --summary /home/jkim38/dooly/results/scenario_a_validation_locked_1700_v2_dense/validation_summary.json \
         --output  /home/jkim38/dooly/results/scenario_a_validation_locked_1700_v2_dense/latency_curves.png
 """

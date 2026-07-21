@@ -192,7 +192,7 @@ def main():
 
                 # Dooly prediction
                 dooly_cmd = [
-                    sys.executable, "-m", "simulator.benchmark.batch_predictor",
+                    sys.executable, "-m", "doolysim.benchmark.batch_predictor",
                     "--batch-config", config_file,
                     "--cache-dir", cache_dir,
                     "--db-path", DB_PATH,
@@ -202,7 +202,7 @@ def main():
 
                 # vLLM measurement
                 vllm_cmd = [
-                    sys.executable, "-m", "simulator.benchmark.measure_vllm_direct",
+                    sys.executable, "-m", "doolysim.benchmark.measure_vllm_direct",
                     "--batch-config", config_file,
                     "--warmup", str(WARMUP),
                     "--iterations", str(ITERATIONS),

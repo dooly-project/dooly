@@ -5,7 +5,7 @@ CSV prediction caches and estimates latency for each simulation step based on
 batch composition and operation counts.
 
 This is a runtime-only component - it does NOT train models. Training must be
-done separately using simulator.estimator.
+done separately using doolysim.estimator.
 """
 
 from typing import Dict, Tuple, Optional, List
@@ -46,7 +46,7 @@ class SimulationPredictor:
     - Operation counts from profiling
     - Collective communication configurations
 
-    NOTE: This class does NOT train models. Use simulator.estimator for training.
+    NOTE: This class does NOT train models. Use doolysim.estimator for training.
     """
 
     def __init__(
@@ -131,7 +131,7 @@ class SimulationPredictor:
                     f"\n{'='*80}\n"
                     f"ERROR: No CSV predictions found in {cache_dir}\n"
                     f"\nPlease run training first:\n"
-                    f"  python -m simulator.estimator \\\n"
+                    f"  python -m doolysim.estimator \\\n"
                     f"    --model {self.model_name} \\\n"
                     f"    --backend {self.backend} \\\n"
                     f"    --tp-size {self.tp_size} \\\n"

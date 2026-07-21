@@ -20,7 +20,7 @@ controls execution via `engine.step()` directly:
   Phase 5: parse the trace, aggregate per-module GPU kernel time, save JSON.
 
 Usage:
-  python -m simulator.benchmark.run_mixed_batch \\
+  python -m doolysim.benchmark.run_mixed_batch \\
       --config batch_config.json \\
       --out-dir results/mixed_batch/ \\
       [--enforce-eager] [--moe-routing-sim uniform_random]
