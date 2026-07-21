@@ -1,0 +1,24 @@
+# .publishignore — dev-only paths to keep OUT of the public repo.
+#
+# Used by publish.sh as `rsync --exclude-from`. Patterns are relative to each
+# published path (PUBLISH_PATHS in publish.sh, i.e. the doolysim/ package root)
+# and use rsync filter syntax, which is close to .gitignore:
+#   - leading slash anchors to the package root:  /tools/foo.py
+#   - trailing slash matches directories:          scratch/
+#   - glob:                                        *_wip.py
+#
+# These plotting / validation / comparison scripts are internal dev tooling and
+# are intentionally absent from doolysim-public. Keep this list in sync if you
+# add or rename dev-only scripts inside the package.
+
+/benchmark/run_comparison.py
+/benchmark/run_streaming_comparison.py
+/tools/plot_comparison.py
+/tools/plot_configs_cdf.py
+/tools/plot_prefill_bars.py
+/tools/plot_throughput_bars.py
+/tools/plot_validation.py
+/tools/plot_validation_chess.py
+/tools/run_validation_pipeline.py
+/tools/trace_parser.py
+/tools/validate_predictions.py
