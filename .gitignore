@@ -18,5 +18,6 @@ hierarchy_output.json
 *.csv
 *.png
 *.pdf
+*.bak 
 *.yaml
 /workspaces/
