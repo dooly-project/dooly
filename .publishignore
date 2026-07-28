@@ -11,3 +11,4 @@
 # tests/, etc.) live at the repo ROOT, outside the published doolyprof/ package,
 # so they are never copied. Add patterns here only if you introduce dev-only
 # files INSIDE doolyprof/ that should not be published.
+*.bak
