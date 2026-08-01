@@ -3,30 +3,30 @@ import unittest
 
 import torch
 
-from dooly.taintracer.hooks import (
+from doolyprof.tracer.hooks import (
     _iter_module_model_config_values,
     _original_tensor_unflatten,
     _wrap_arange,
     _wrap_unflatten,
 )
-from dooly.profiler.finput import ProfileInput
-from dooly.profiler.module import ModuleInfo
-from dooly.profiler.parser import Event, OperationHierarchy
-from dooly.profiler.resolver import (
+from doolyprof.profiler.finput import ProfileInput
+from doolyprof.profiler.module import ModuleInfo
+from doolyprof.profiler.parser import Event, OperationHierarchy
+from doolyprof.profiler.resolver import (
     ModuleResolver,
     _is_aggregate_model_name,
     _is_attention_replay_target,
     _tensor_call_signature,
 )
-from dooly.profiler.taint import DimensionType
-from dooly.taintracer.propagation import propagate_taints
-from dooly.taintracer.registry import register_taint
-from dooly.taintracer.sglang_subprocess import (
+from doolyprof.profiler.taint import DimensionType
+from doolyprof.tracer.propagation import propagate_taints
+from doolyprof.tracer.registry import register_taint
+from doolyprof.tracer.sglang_subprocess import (
     _retag_forward_batch_runtime_tensors,
     _retag_runtime_tensor,
 )
-from dooly.taintracer.tensor import TaintedTensor
-from dooly.taintracer.types import DimTaint, Taint, TaintedInt
+from doolyprof.tracer.tensor import TaintedTensor
+from doolyprof.tracer.types import DimTaint, Taint, TaintedInt
 
 
 def profile_input(shape, dtype="torch.bfloat16"):

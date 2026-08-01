@@ -87,23 +87,39 @@ def merge_dedup_table(
 
 def merge_profiled_models(src, dst) -> Dict[int, int]:
     """Copy profiled_models rows. Shards profile disjoint (model, backend) sets,
-    but we still INSERT OR IGNORE on (model_name, backend, tp_degree) to stay safe."""
+    but we still dedup on (model_name, backend, tp_degree, dtype) to stay safe.
+
+    dtype is part of the identity key so multi-dtype shards merge correctly
+    (e.g., shard A profiled bf16, shard B profiled fp16 — both rows preserved
+    rather than collapsed). Falls back to a 3-key match for shards from older
+    schemas that don't have a dtype column.
+    """
     if not table_exists(src, "profiled_models"):
         return {}
     cols = fetch_columns(src, "profiled_models")
     insert_cols = [c for c in cols if c != "model_id"]
     placeholders = ",".join("?" for _ in insert_cols)
+    src_has_dtype = "dtype" in cols
+    dst_has_dtype = "dtype" in fetch_columns(dst, "profiled_models")
     id_map: Dict[int, int] = {}
     rows = src.execute(f"SELECT {','.join(cols)} FROM profiled_models").fetchall()
     for row in rows:
         row_dict = dict(zip(cols, row))
         old_id = row_dict["model_id"]
         # Check for existing row first.
-        existing = dst.execute(
-            "SELECT model_id FROM profiled_models "
-            "WHERE model_name=? AND backend=? AND tp_degree=?",
-            (row_dict["model_name"], row_dict["backend"], row_dict["tp_degree"]),
-        ).fetchone()
+        if src_has_dtype and dst_has_dtype:
+            existing = dst.execute(
+                "SELECT model_id FROM profiled_models "
+                "WHERE model_name=? AND backend=? AND tp_degree=? AND dtype=?",
+                (row_dict["model_name"], row_dict["backend"],
+                 row_dict["tp_degree"], row_dict["dtype"]),
+            ).fetchone()
+        else:
+            existing = dst.execute(
+                "SELECT model_id FROM profiled_models "
+                "WHERE model_name=? AND backend=? AND tp_degree=?",
+                (row_dict["model_name"], row_dict["backend"], row_dict["tp_degree"]),
+            ).fetchone()
         if existing:
             id_map[old_id] = existing[0]
             continue
