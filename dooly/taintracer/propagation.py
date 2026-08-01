@@ -9,8 +9,33 @@ def _to_dim_taint(t) -> Optional[DimTaint]:
     if t is None:
         return None
     if isinstance(t, DimTaint):
-        return t
+        history = t.merge_history
+        base = t.taint
+        while isinstance(base, DimTaint):
+            history = history or base.merge_history
+            base = base.taint
+        return DimTaint(base, merge_history=history)
     return DimTaint.from_taint(t)
+
+
+def _base_taint(t):
+    while isinstance(t, DimTaint):
+        t = t.taint
+    return t
+
+
+def _choose_aligned_taint(taints):
+    """Preserve the first explicit taint for an aligned tensor axis.
+
+    Operand order is the only structural signal available here. Choosing by
+    semantic name corrupts model axes when a workload value happens to equal a
+    model dimension (for example Gemma's four tokens and four query heads).
+    Runtime tensors are made authoritative at the SGLang boundary instead.
+    """
+    candidates = [taint for taint in taints if _base_taint(taint) is not None]
+    if not candidates:
+        return None
+    return _to_dim_taint(candidates[0])
 
 def propagate_taints(
     input_infos: List[Tuple[Tuple[int, ...], Tuple[Optional[Taint], ...]]],
@@ -31,7 +56,7 @@ def propagate_taints(
     # These are typically auxiliary inputs (like empty perm tensors) that shouldn't affect taint propagation
     input_infos = [(shape, taints) for shape, taints in input_infos if 0 not in shape]
 
-    input_dim_taints = {}  
+    input_dim_candidates = {}
     view_claimed_dims = set()
     slice_claimed_dims = set()
 
@@ -44,33 +69,32 @@ def propagate_taints(
                 if taint_val is None:
                     continue
 
-                if input_dim_taints.get(size) is None:
-                    input_dim_taints[size] = taint
-                else:
-                    # Check if taints are semantically the same (compare values, not object identity)
-                    existing = input_dim_taints[size]
-                    existing_val = existing.taint if isinstance(existing, DimTaint) else existing
-                    new_val = taint.taint if isinstance(taint, DimTaint) else taint
+                input_dim_candidates.setdefault(size, []).append(taint)
 
-                    # If either is None, keep the non-None one
-                    if existing_val is None and new_val is not None:
-                        input_dim_taints[size] = taint
-                    elif existing_val is not None and new_val is None:
-                        pass  # Keep existing non-None
-                    elif existing_val != new_val:
-                        # simple check added to prevent error when testing whether decode has different call path
-                        # if existing_val == Taint("NUM_TOKS") and new_val == Taint("NUM_REQS") or existing_val == Taint("NUM_REQS") and new_val == Taint("NUM_TOKS"):
-                        #     print(f"[DEBUG] Allowing NUM_REQ/NUM_TOK overlap for input dimension size {size} due to prefill/decode phase change")
-                        # else:   
-                        # Only raise error if both are non-None and different
-                        raise ValueError(f"Multiple different taints for input dimension size {size}: {input_dim_taints[size]} vs {taint}")
+    # A concrete size is only a safe fallback key when every occurrence has
+    # the same semantic role. Equal runtime and model dimensions are common.
+    input_dim_taints = {}
+    for size, candidates in input_dim_candidates.items():
+        names = {_base_taint(taint).name for taint in candidates}
+        if len(names) == 1:
+            input_dim_taints[size] = candidates[0]
 
     out_taints: List[Optional[DimTaint]] = [None] * len(output_shape)
-    if len(input_infos) > 0 and input_infos[0][0] == output_shape:
-        # copy the tuple of taints, converting to DimTaint
-        first_taints = input_infos[0][1]
-        if len(first_taints) == len(output_shape):
-            out_taints = [_to_dim_taint(t) for t in first_taints]
+    aligned_inputs = [
+        taints
+        for shape, taints in input_infos
+        if shape == output_shape and len(taints) == len(output_shape)
+    ]
+    aligned_axes = set()
+    if aligned_inputs:
+        out_taints = [
+            _choose_aligned_taint(taints[axis] for taints in aligned_inputs)
+            for axis in range(len(output_shape))
+        ]
+        # Exact shape alignment is structural evidence for every axis,
+        # including an intentional None/singleton. Do not refill those axes
+        # later from unrelated inputs that happen to use the same size.
+        aligned_axes.update(range(len(output_shape)))
 
 
     if _debug_propagate:
@@ -83,7 +107,7 @@ def propagate_taints(
     # CONSERVATIVE: Direct match using input_dim_taints dictionary
     # Only propagate if output dimension exactly matches an input dimension
     for out_idx, out_size in enumerate(output_shape):
-        if out_taints[out_idx] is None:  # Only fill if not already set
+        if out_taints[out_idx] is None and out_idx not in aligned_axes:
             if out_size in input_dim_taints:
                 taint_to_use = input_dim_taints[out_size]
                 # Check if we somehow have a string instead of a Taint/DimTaint

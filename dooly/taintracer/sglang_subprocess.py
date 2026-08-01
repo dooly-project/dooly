@@ -25,7 +25,7 @@ import os
 import time
 import threading
 from .registry import register_taint
-from .types import TaintedInt, TaintedFloat, Taint
+from .types import DimTaint, TaintedInt, TaintedFloat, Taint
 from .tensor import TaintedTensor
 import traceback
 
@@ -56,6 +56,8 @@ MODEL_RUNNER_TAINT_MAP = {
 
 _original_server_args_getattribute = None
 _original_model_runner_getattribute = None
+_original_eager_fb_view = None
+_original_piecewise_replay_prepare = None
 _original_input_batch_num_reqs = None
 _original_req_to_token_pool_init = None
 
@@ -80,6 +82,45 @@ def _try_register_runtime_dim(value, taint_name):
         # Runtime hints should improve trace labels, not change execution or
         # guess through value collisions.
         pass
+
+
+def _retag_runtime_tensor(value, taint_name, dim=-1):
+    """Make one SGLang runtime-boundary tensor dimension authoritative."""
+    import torch
+
+    if not isinstance(value, torch.Tensor):
+        return value
+    if not isinstance(value, TaintedTensor):
+        value = TaintedTensor(value, [None] * value.ndim)
+    target_dim = dim if dim >= 0 else value.ndim + dim
+    if target_dim < 0 or target_dim >= value.ndim:
+        raise IndexError(
+            f"runtime taint dimension {dim} is invalid for rank {value.ndim}"
+        )
+    dim_taints = list(value._dim_taints)
+    for index, size in enumerate(value.shape):
+        if index != target_dim and int(size) == 1:
+            dim_taints[index] = None
+    dim_taints[target_dim] = DimTaint.from_taint(Taint(taint_name))
+    object.__setattr__(value, "_dim_taints", tuple(dim_taints))
+    return value
+
+
+def _retag_forward_batch_runtime_tensors(forward_batch):
+    """Restore workload roles after SGLang copies a ForwardBatch into buffers."""
+    forward_batch.input_ids = _retag_runtime_tensor(
+        forward_batch.input_ids, "NUM_TOKS"
+    )
+    forward_batch.positions = _retag_runtime_tensor(
+        forward_batch.positions, "NUM_TOKS"
+    )
+    forward_batch.out_cache_loc = _retag_runtime_tensor(
+        forward_batch.out_cache_loc, "NUM_TOKS"
+    )
+    forward_batch.seq_lens = _retag_runtime_tensor(
+        forward_batch.seq_lens, "NUM_REQS"
+    )
+    return forward_batch
 
 
 def patch_server_args(server_args):
@@ -127,6 +168,7 @@ def patch_server_args(server_args):
     try:
         from sglang.srt.model_executor.model_runner import ModelRunner
         global _original_model_runner_getattribute
+        global _original_eager_fb_view
         if _original_model_runner_getattribute is None:
             _original_model_runner_getattribute = ModelRunner.__getattribute__
 
@@ -140,8 +182,48 @@ def patch_server_args(server_args):
                 return value
 
             ModelRunner.__getattribute__ = patched_model_runner_getattribute
+        if _original_eager_fb_view is None:
+            _original_eager_fb_view = ModelRunner._eager_fb_view
+
+            def patched_eager_fb_view(self, forward_batch, pp_proxy_tensors=None):
+                ret = _original_eager_fb_view(
+                    self,
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+                return _retag_forward_batch_runtime_tensors(ret)
+
+            ModelRunner._eager_fb_view = patched_eager_fb_view
     except ImportError as e:
         print(f"[DEBUG @ patch_input_buffers] ModelRunner ImportError - {e}", flush=True)
+
+    try:
+        from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+            PiecewiseCudaGraphRunner,
+        )
+        global _original_piecewise_replay_prepare
+        if _original_piecewise_replay_prepare is None:
+            _original_piecewise_replay_prepare = (
+                PiecewiseCudaGraphRunner.replay_prepare
+            )
+
+            def patched_piecewise_replay_prepare(self, forward_batch, **kwargs):
+                ret = _original_piecewise_replay_prepare(
+                    self,
+                    forward_batch,
+                    **kwargs,
+                )
+                return _retag_forward_batch_runtime_tensors(ret)
+
+            PiecewiseCudaGraphRunner.replay_prepare = (
+                patched_piecewise_replay_prepare
+            )
+    except ImportError as e:
+        print(
+            f"[DEBUG @ patch_input_buffers] PiecewiseCudaGraphRunner "
+            f"ImportError - {e}",
+            flush=True,
+        )
 
     try:
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -193,8 +275,7 @@ def patch_server_args(server_args):
             # results); its length equals NUM_TOKS but it has no upstream
             # tainted scalar to propagate from, so wrap on read.
             if name == 'out_cache_loc':
-                if isinstance(value, torch.Tensor) and not isinstance(value, TaintedTensor):
-                    return TaintedTensor(value, [Taint('NUM_TOKS')])
+                return _retag_runtime_tensor(value, 'NUM_TOKS')
             return value
 
         ScheduleBatch.__getattribute__ = patched_scheduler_output_getattribute
@@ -218,10 +299,7 @@ def patch_server_args(server_args):
                 )
             except AttributeError:
                 pass
-            if not isinstance(ret.seq_lens, TaintedTensor):
-                ret.seq_lens = TaintedTensor(ret.seq_lens, [Taint('NUM_REQS')])
-            if not isinstance(ret.positions, TaintedTensor):
-                ret.positions = TaintedTensor(ret.positions, [Taint('NUM_REQS')])
+            _retag_forward_batch_runtime_tensors(ret)
             # batch_size is set as `len(batch.seq_lens)` at init_new — a plain
             # int. Re-tainting here so `forward_batch.batch_size + 1`
             # propagates to torch.arange(0, batch_size+1) for cu_seqlens_q/k.
@@ -231,11 +309,9 @@ def patch_server_args(server_args):
             # input_ids is the model's entry-point tensor; its length equals
             # the number of scheduled tokens this step. Without this wrap,
             # VocabParallelEmbedding / LlamaModel see [?(N)] on their input.
-            if (isinstance(ret.input_ids, torch.Tensor)
-                    and not isinstance(ret.input_ids, TaintedTensor)):
+            if isinstance(ret.input_ids, torch.Tensor):
                 num_toks = ret.input_ids.shape[0]
                 _try_register_runtime_dim(num_toks, 'NUM_TOKS')
-                ret.input_ids = TaintedTensor(ret.input_ids, [Taint('NUM_TOKS')])
             return ret
         
         ForwardBatch.init_new = patched_init_new  

@@ -99,6 +99,33 @@ def _extract_num_requests_from_inputs(inputs) -> Optional[int]:
     return None
 
 
+def _tensor_call_signature(inputs) -> Tuple[Tuple[str, Tuple[int, ...]], ...]:
+    """Return the traced tensor contract used to select a module instance."""
+    return tuple(
+        (
+            str(getattr(inp, "dtype", "")),
+            tuple(int(dim) for dim in (getattr(inp, "actual_shape", None) or ())),
+        )
+        for inp in inputs
+        if getattr(inp, "type", None) == "Tensor"
+    )
+
+
+def _is_aggregate_model_name(name: str) -> bool:
+    """Return whether a module is an aggregate model profiling target."""
+    parts = name.rsplit("_", 1)
+    base = parts[0] if len(parts) == 2 and parts[1].isdigit() else name
+    return base.endswith(("Model", "ForCausalLM", "ForConditionalGeneration"))
+
+
+def _is_attention_replay_target(module: ModuleInfo) -> bool:
+    """Return whether this module target needs SGLang attention metadata."""
+    if not module.is_module:
+        return False
+    operation_name = (module.operation_name or "").lower()
+    return "attention" in operation_name or "attn" in operation_name
+
+
 class ModuleResolver:
     """Validates and merges ModuleInfo objects before profiling.
     
@@ -126,9 +153,9 @@ class ModuleResolver:
         self.max_seq_len = max_seq_len
         # Build module name → path dict once
         self._name_to_module = make_dict(vlp.model) if vlp else {}
-        # Cache path selection keyed by (class_name, target_kernel_tuple) so
-        # dummy-with-capture runs at most once per distinct kernel variant.
-        self._path_cache: Dict[Tuple[str, Tuple[str, ...]], str] = {}
+        # Path selection depends on the traced call contract as well as class,
+        # kernel, and module state. Same-class modules can have different widths.
+        self._path_cache: Dict[Tuple[Any, ...], str] = {}
         # Trace-time TAINT_REGISTRY (value -> taint name), passed in by the
         # profiler driver after TraceParser extracted it from the trace file.
         # Used to look up semantic dimension values (e.g. NUM_REQS) that are
@@ -175,7 +202,13 @@ class ModuleResolver:
             if module.module_name == "None":
                 print(f"[RESOLVER]   Skipping module with name 'None'")
                 continue
-            
+            if module.is_module and _is_aggregate_model_name(module.operation_name):
+                print(
+                    f"[RESOLVER]   Skipping aggregate model target "
+                    f"'{module.operation_name}'"
+                )
+                continue
+
             # Try importing the op/module as-is
             callable_obj = self.try_import(module)
 
@@ -201,6 +234,11 @@ class ModuleResolver:
             curr_event = module.hierarchy.anchor.parent
 
             while curr_event:
+                if curr_event.cat == "module" and _is_aggregate_model_name(
+                    curr_event.name
+                ):
+                    curr_event = curr_event.parent
+                    continue
                 parent_module = self._build_module_info_from_event(curr_event, module.hierarchy, module)
                 if parent_module is None:
                     curr_event = curr_event.parent
@@ -346,25 +384,30 @@ class ModuleResolver:
                 paths = filtered_paths
                 callable_path = paths[0]
 
+        kernel_matched = False
         if len(paths) > 1 and target_kernels:
-            cache_key = (lookup_name, target_kernels, target_state_hash)
+            cache_key = (
+                lookup_name,
+                target_kernels,
+                target_state_hash,
+                _tensor_call_signature(module.inputs),
+            )
             cached = self._path_cache.get(cache_key)
             if cached is not None and cached in paths:
                 callable_path = cached
+                kernel_matched = True
                 print(f"[RESOLVER]   Kernel-match cache hit → {callable_path}")
             else:
-                matched = self._pick_path_by_kernels(paths, module, set(target_kernels))
+                matched = self._pick_path_by_kernels(
+                    paths, module, set(target_kernels)
+                )
                 if matched is not None:
                     callable_path = matched
+                    kernel_matched = True
                     self._path_cache[cache_key] = matched
                     print(f"[RESOLVER]   Kernel-match picked {callable_path}")
 
-        # Remember the picked path on the ModuleInfo so the outer dummy run
-        # (post-import) uses it to key forward_context / build_layer_metadata
-        # instead of defaulting to paths[0] via get_layer_name_by_module.
-        module._resolved_path = callable_path
-
-        if callable_path == paths[0] and len(paths) > 1 and module.hierarchy is not None:
+        if not kernel_matched and len(paths) > 1 and module.hierarchy is not None:
             ancestor = module.hierarchy.anchor.parent  # parent of the GemmaRMSNorm event
             while ancestor is not None:
                 if ancestor.cat == 'module':
@@ -380,6 +423,10 @@ class ModuleResolver:
                         callable_path = filtered[0]
                         break
                 ancestor = ancestor.parent
+
+        # Commit only the final path. Dummy replay and profiling context lookup
+        # must refer to the same candidate returned below.
+        module._resolved_path = callable_path
 
         try:
             submodule = self.vlp.model.get_submodule(callable_path)
@@ -475,17 +522,15 @@ class ModuleResolver:
         For attention modules, uses SgLangLayerProfiler to allocate KV cache
         slots and configure the attn_backend before the forward call.
 
-        layer_name_override lets path disambiguation (kernel-match) drive the
-        forward-context key. Without it, get_layer_name_by_module always
-        returns paths[0]'s layer_name, and running submodules at other paths
-        trips a KeyError inside vLLM's per-layer metadata lookup.
+        For attention targets, layer_name_override lets path disambiguation
+        drive the forward-context key. Non-attention targets ignore it.
         """
         try:
-            # Use get_layer_name_by_module to determine if forward context is needed
+            requires_attention = _is_attention_replay_target(module)
             layer_name = None
-            if layer_name_override is not None:
+            if requires_attention and layer_name_override is not None:
                 layer_name = layer_name_override
-            elif module.is_module and self.vlp is not None:
+            elif requires_attention and self.vlp is not None:
                 # Prefer the path that _import_module picked (set in
                 # module._resolved_path during import), so that kernel-matched
                 # layer selections flow into forward_context / metadata lookup.
@@ -514,7 +559,7 @@ class ModuleResolver:
             trace_num_tokens = _extract_num_tokens_from_inputs(module.inputs)
             trace_num_requests = _extract_num_requests_from_inputs(module.inputs)
 
-            if layer_name is not None:
+            if requires_attention:
                 # Attention-style module needs AttentionBatchConfig. Every knob
                 # we DON'T derive from the trace will push FlashInfer (and
                 # similar backends) toward a different tile-heuristic template

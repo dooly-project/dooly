@@ -44,6 +44,7 @@ _original_copy = torch.Tensor.copy_
 _original_tensor_view = torch.Tensor.view
 _original_torch_reshape = torch.reshape  # torch.reshape EXISTS!
 _original_tensor_reshape = torch.Tensor.reshape
+_original_tensor_unflatten = torch.Tensor.unflatten
 
 # Transpose/Permute operations
 _original_tensor_permute = torch.Tensor.permute
@@ -434,6 +435,9 @@ _MODULE_MODEL_CONFIG_ATTRS = (
     "total_num_heads",
     "num_heads",
     "num_kv_heads",
+    "tp_q_head_num",
+    "tp_k_head_num",
+    "tp_v_head_num",
     "head_dim",
     "head_size",
     "qk_head_dim",
@@ -461,6 +465,7 @@ _MODULE_MODEL_CONFIG_ATTRS = (
 def _iter_module_model_config_values(module):
     values = []
     branch_intermediate_values = []
+    attention_head_values = []
     for attr_name in _MODULE_MODEL_CONFIG_ATTRS:
         try:
             attr_value = getattr(module, attr_name)
@@ -479,10 +484,27 @@ def _iter_module_model_config_values(module):
                 "intermediate_size_per_partition",
             ):
                 branch_intermediate_values.append(int_value)
+            if attr_name in (
+                "total_num_heads",
+                "num_heads",
+                "num_kv_heads",
+                "tp_q_head_num",
+                "tp_k_head_num",
+                "tp_v_head_num",
+            ):
+                attention_head_values.append(int_value)
 
     # Dense and MoE MLP implementations often fuse gate/up projections into a
     # single weight whose output dimension is 2x the branch intermediate size.
     values.extend(2 * value for value in branch_intermediate_values)
+
+    # ALiBi slope construction splits a non-power-of-two head count into the
+    # largest power of two and its remainder (for example 28 -> 16 + 12).
+    for value in attention_head_values:
+        power_of_two = 1 << (value.bit_length() - 1)
+        values.append(power_of_two)
+        if value > power_of_two:
+            values.append(value - power_of_two)
 
     for output_attr_name in ("output_sizes", "output_partition_sizes"):
         try:
@@ -937,6 +959,18 @@ def _wrap_arange(original_fn):
                 # Ideally we might merge them if multiple exist, but single source is common.
                 if taint_label is None:
                     taint_label = val.taint
+            elif isinstance(val, int) and not isinstance(val, bool):
+                from .registry import lookup_taint
+
+                registry_taint = lookup_taint(val)
+                if isinstance(registry_taint, dict):
+                    registry_taint = registry_taint.get("taint")
+                if isinstance(registry_taint, DimTaint):
+                    registry_taint = registry_taint.taint
+                if registry_taint is not None:
+                    has_taint = True
+                    if taint_label is None:
+                        taint_label = registry_taint
         
         for arg in args:
             check_taint(arg)
@@ -1396,6 +1430,79 @@ def _wrap_view_reshape(original_fn, fn_name):
             if not was_already_in_hook:
                 TaintedTensor._inside_hook.active = False
     
+    return wrapper
+
+
+def _wrap_unflatten(original_fn):
+    """Propagate the split axis through ``Tensor.unflatten``.
+
+    Unlike generic output-size matching, unflatten identifies exactly which
+    input axis is being replaced. Explicit tainted sizes remain authoritative;
+    a MODEL_CONFIG source axis also remains MODEL_CONFIG when split into plain
+    integer factors.
+    """
+    from . import is_taint_tracking_enabled
+
+    def base_taint(dim_taint):
+        value = dim_taint
+        while isinstance(value, DimTaint):
+            value = value.taint
+        return value
+
+    def from_size(size):
+        if not isinstance(size, (TaintedInt, TaintedFloat)) or not size.taint:
+            return None
+        taint = size.taint
+        if isinstance(taint, DimTaint):
+            return DimTaint(taint.taint, merge_history=taint.merge_history)
+        return DimTaint.from_taint(taint)
+
+    @functools.wraps(original_fn)
+    def wrapper(self, dim, sizes):
+        was_already_in_hook = getattr(TaintedTensor._inside_hook, "active", False)
+        TaintedTensor._inside_hook.active = True
+        try:
+            plain_sizes = tuple(int(size) for size in sizes)
+            result = original_fn(self, int(dim), plain_sizes)
+            if (
+                was_already_in_hook
+                or not is_taint_tracking_enabled()
+                or not isinstance(self, TaintedTensor)
+            ):
+                return result
+
+            source_dim = int(dim)
+            if source_dim < 0:
+                source_dim += self.ndim
+            if source_dim < 0 or source_dim >= self.ndim:
+                return result
+
+            source_taint = self._dim_taints[source_dim]
+            source_is_model_config = (
+                getattr(base_taint(source_taint), "name", None) == "MODEL_CONFIG"
+            )
+            split_taints = []
+            for size in sizes:
+                size_taint = from_size(size)
+                if size_taint is not None:
+                    split_taints.append(size_taint)
+                elif source_is_model_config:
+                    split_taints.append(source_taint)
+                else:
+                    split_taints.append(None)
+
+            output_taints = (
+                list(self._dim_taints[:source_dim])
+                + split_taints
+                + list(self._dim_taints[source_dim + 1 :])
+            )
+            if len(output_taints) != result.ndim:
+                return result
+            return _wrap_or_retag_tensor(result, tuple(output_taints))
+        finally:
+            if not was_already_in_hook:
+                TaintedTensor._inside_hook.active = False
+
     return wrapper
 
 
@@ -3300,6 +3407,7 @@ def install_hooks(int_patch_modules=(), int_patch_prefixes=()):
         torch.Tensor.view = _wrap_view_reshape(_original_tensor_view, 'view')
         torch.reshape = _wrap_torch_reshape(_original_torch_reshape)  # Use module-level wrapper
         torch.Tensor.reshape = _wrap_view_reshape(_original_tensor_reshape, 'reshape')
+        torch.Tensor.unflatten = _wrap_unflatten(_original_tensor_unflatten)
 
         # Wrap permute and transpose to use explicit dimension indices
         torch.Tensor.permute = _wrap_permute(_original_tensor_permute, 'permute')
@@ -3442,6 +3550,7 @@ def uninstall_hooks():
     torch.Tensor.view = _original_tensor_view
     torch.reshape = _original_torch_reshape
     torch.Tensor.reshape = _original_tensor_reshape
+    torch.Tensor.unflatten = _original_tensor_unflatten
     torch.Tensor.permute = _original_tensor_permute
     torch.transpose = _original_torch_transpose
     torch.Tensor.transpose = _original_tensor_transpose

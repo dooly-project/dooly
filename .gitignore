@@ -14,3 +14,6 @@ test_*
 *.pt.trace.json
 hierarchy_output.json
 /tests/
+!/tests/
+!/tests/__init__.py
+!/tests/test_sglang_replay.py
