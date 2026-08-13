@@ -749,6 +749,8 @@ _original_builtin_import = None
 _in_sweep = False  # re-entrancy guard: the sweep itself triggers no imports,
                    # but defensive — keeps us safe if any helper is changed
                    # later to do a lazy import.
+_int_import_depth = 0
+_last_int_patch_module_count = -1
 _INT_PATCH_EXCLUDED_PREFIXES = (
     # Pydantic evaluates annotations while these modules are still importing.
     # Rebinding int there turns fields like ``tp_rank: int`` into
@@ -769,12 +771,14 @@ def _should_patch_int_module(name, mod):
     return True
 
 
-def _sweep_and_patch_int():
+def _sweep_and_patch_int(force=False):
     """Walk sys.modules once; rebind `int` in any module whose name starts
     with one of the registered prefixes. Each module is processed at most
     once via _seen_modules_for_int_patch."""
-    global _in_sweep
+    global _in_sweep, _last_int_patch_module_count
     if _in_sweep or not _int_patch_prefixes:
+        return
+    if not force and len(sys.modules) == _last_int_patch_module_count:
         return
     _in_sweep = True
     try:
@@ -798,6 +802,7 @@ def _sweep_and_patch_int():
             except (AttributeError, TypeError):
                 pass
     finally:
+        _last_int_patch_module_count = len(sys.modules)
         _in_sweep = False
 
 
@@ -814,7 +819,7 @@ def patch_int_in_packages(prefixes):
     reinstalling the import hook.
     """
     import builtins
-    global _int_patch_prefixes, _original_builtin_import
+    global _int_patch_prefixes, _original_builtin_import, _int_import_depth
 
     new_prefixes = tuple(prefixes)
     _int_patch_prefixes = tuple(set(_int_patch_prefixes + new_prefixes))
@@ -823,20 +828,29 @@ def patch_int_in_packages(prefixes):
         _original_builtin_import = builtins.__import__
 
         def _hooked_import(name, globals=None, locals=None, fromlist=(), level=0):
-            mod = _original_builtin_import(name, globals, locals, fromlist, level)
-            # Skip the sweep while one is already running: the sweep does no
-            # imports itself, but Python's import machinery may import
-            # submodules transitively, and we don't want nested sweeps.
-            if not _in_sweep:
-                _sweep_and_patch_int()
-            return mod
+            global _int_import_depth
+            _int_import_depth += 1
+            try:
+                return _original_builtin_import(
+                    name, globals, locals, fromlist, level
+                )
+            finally:
+                _int_import_depth -= 1
+                # One outer import can load many transitive modules. Sweep once
+                # after that import completes, and only if sys.modules changed.
+                if (
+                    _int_import_depth == 0
+                    and not _in_sweep
+                    and len(sys.modules) != _last_int_patch_module_count
+                ):
+                    _sweep_and_patch_int()
 
         _hooked_import._dooly_int_hooked = True
         builtins.__import__ = _hooked_import
 
     # Sweep already-loaded modules so callers can install prefixes after some
     # of the matching modules are already in sys.modules.
-    _sweep_and_patch_int()
+    _sweep_and_patch_int(force=True)
 
 
 def unpatch_int_in_packages():
@@ -844,10 +858,13 @@ def unpatch_int_in_packages():
     rebindings are reverted by :func:`unpatch_int_in_modules`."""
     import builtins
     global _int_patch_prefixes, _original_builtin_import
+    global _int_import_depth, _last_int_patch_module_count
     if _original_builtin_import is not None:
         builtins.__import__ = _original_builtin_import
         _original_builtin_import = None
     _int_patch_prefixes = ()
+    _int_import_depth = 0
+    _last_int_patch_module_count = -1
     _seen_modules_for_int_patch.clear()
 
 

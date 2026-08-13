@@ -51,6 +51,11 @@ SERVER_ARGS_TAINT_MAP = {
 #                          [MAX_NUM_REQS(263), MODEL_CONFIG(131076)].
 MODEL_RUNNER_TAINT_MAP = {
     'max_total_num_tokens': 'MAX_NUM_TOKS',
+    # Hybrid attention uses separate physical pools instead of the aggregate
+    # capacity above. They are still maximum-token capacities and must enter
+    # the same normal arithmetic/factory propagation path.
+    'full_max_total_num_tokens': 'MAX_NUM_TOKS',
+    'swa_max_total_num_tokens': 'MAX_NUM_TOKS',
     'max_running_requests': 'MAX_NUM_REQS',
 }
 

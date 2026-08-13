@@ -148,10 +148,45 @@ def apply_fake_tp_patches_sglang(tp_size: int) -> None:
 
     fake_group = FakeTPGroup()
 
+    # SGLang performs a post-load monitored barrier on the TP CPU group. Fake
+    # TP has one real NCCL rank and no Gloo CPU group, so PyTorch rejects that
+    # call even though there is no peer to synchronize with.
+    if hasattr(torch.distributed, "monitored_barrier"):
+        torch.distributed.monitored_barrier = lambda *args, **kwargs: None
+
     # Regular TP
     ps.get_tp_group = lambda: fake_group
     ps.get_tensor_model_parallel_world_size = lambda: tp_size
     ps.get_tensor_model_parallel_rank = lambda: 0
+
+    # MoE tensor parallelism has its own group in current SGLang. With the
+    # default EP=1 configuration, real TP shards every expert's intermediate
+    # dimension through this group. Leaving it at the real single-rank size
+    # causes fake-TP runs to materialize full expert weights.
+    if hasattr(ps, "get_moe_tp_group"):
+        ps.get_moe_tp_group = lambda: fake_group
+    if hasattr(ps, "get_moe_tensor_parallel_world_size"):
+        ps.get_moe_tensor_parallel_world_size = lambda: tp_size
+    if hasattr(ps, "get_moe_tensor_parallel_rank"):
+        ps.get_moe_tensor_parallel_rank = lambda: 0
+
+    # sglang.srt.distributed re-exports parallel_state functions by value.
+    # Patch that namespace so model modules imported after this point cache the
+    # fake accessors instead of the original single-rank group functions.
+    try:
+        import sglang.srt.distributed as dist
+
+        dist.get_tp_group = lambda: fake_group
+        dist.get_tensor_model_parallel_world_size = lambda: tp_size
+        dist.get_tensor_model_parallel_rank = lambda: 0
+        if hasattr(dist, "get_moe_tp_group"):
+            dist.get_moe_tp_group = lambda: fake_group
+        if hasattr(dist, "get_moe_tensor_parallel_world_size"):
+            dist.get_moe_tensor_parallel_world_size = lambda: tp_size
+        if hasattr(dist, "get_moe_tensor_parallel_rank"):
+            dist.get_moe_tensor_parallel_rank = lambda: 0
+    except ImportError:
+        pass
 
     # Attention TP (SGLang has a separate _ATTN_TP group; if user-set
     # attn_tp matches tp this is straightforward, otherwise the caller
@@ -175,6 +210,8 @@ def apply_fake_tp_patches_sglang(tp_size: int) -> None:
             comm_op.get_tp_group = lambda: fake_group
         if hasattr(comm_op, "get_attn_tp_group"):
             comm_op.get_attn_tp_group = lambda: fake_group
+        if hasattr(comm_op, "get_moe_tp_group"):
+            comm_op.get_moe_tp_group = lambda: fake_group
     except ImportError:
         pass
 

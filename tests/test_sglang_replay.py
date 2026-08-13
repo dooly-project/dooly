@@ -1,3 +1,6 @@
+import subprocess
+import sys
+import textwrap
 import types
 import unittest
 
@@ -38,7 +41,131 @@ def profile_input(shape, dtype="torch.bfloat16"):
     )
 
 
+class SGLangFakeTensorParallelTests(unittest.TestCase):
+    def test_moe_uses_fake_tensor_parallel_group(self):
+        probe = textwrap.dedent(
+            """
+            from doolyprof.profiler.utils.fake_tp_sglang import apply_fake_tp_patches_sglang
+
+            apply_fake_tp_patches_sglang(4)
+
+            import torch.distributed as torch_dist
+            import sglang.srt.distributed as dist
+            import sglang.srt.distributed.communication_op as comm_op
+            import sglang.srt.distributed.parallel_state as ps
+            from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer
+
+            assert ps.get_tp_group().world_size == 4
+            assert ps.get_moe_tp_group().world_size == 4
+            assert ps.get_moe_tensor_parallel_world_size() == 4
+            assert ps.get_moe_tensor_parallel_rank() == 0
+            assert dist.get_moe_tensor_parallel_world_size() == 4
+            assert fused_moe_layer.get_moe_tensor_parallel_world_size() == 4
+            assert fused_moe_layer.get_moe_tensor_parallel_rank() == 0
+            assert fused_moe_layer.get_tp_group().world_size == 4
+            assert comm_op.get_moe_tp_group().world_size == 4
+            assert torch_dist.monitored_barrier() is None
+            """
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+
+class IntImportHookTests(unittest.TestCase):
+    def test_repeated_imports_do_not_rescan_unchanged_modules(self):
+        probe = textwrap.dedent(
+            """
+            import sys
+            import types
+
+            import doolyprof.tracer.hooks as hooks
+
+            hooks.patch_int_in_packages(["dooly_test_int_patch."])
+            original_sweep = hooks._sweep_and_patch_int
+            sweep_calls = 0
+
+            def counted_sweep(*args, **kwargs):
+                global sweep_calls
+                sweep_calls += 1
+                return original_sweep(*args, **kwargs)
+
+            hooks._sweep_and_patch_int = counted_sweep
+            for _ in range(100):
+                __import__("errno")
+            assert sweep_calls == 0, sweep_calls
+
+            module_name = "dooly_test_int_patch.lazy_module"
+            lazy_module = types.ModuleType(module_name)
+            sys.modules[module_name] = lazy_module
+            __import__("errno")
+
+            assert sweep_calls == 1, sweep_calls
+            assert lazy_module.int is hooks._preserving_int
+            """
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+
 class SGLangRuntimeTaintTests(unittest.TestCase):
+    def test_hybrid_kv_pool_capacities_are_taint_sources(self):
+        probe = textwrap.dedent(
+            """
+            from types import SimpleNamespace
+
+            from doolyprof.tracer.sglang_subprocess import patch_server_args
+            from doolyprof.tracer.types import TaintedInt
+
+            patch_server_args(SimpleNamespace())
+
+            from sglang.srt.model_executor.model_runner import ModelRunner
+
+            runner = object.__new__(ModelRunner)
+            runner.full_max_total_num_tokens = 11000
+            runner.swa_max_total_num_tokens = 8800
+
+            full_slots = runner.full_max_total_num_tokens + 1
+            swa_slots = runner.swa_max_total_num_tokens + 1
+
+            assert isinstance(full_slots, TaintedInt)
+            assert isinstance(swa_slots, TaintedInt)
+            assert str(full_slots.taint) == "MAX_NUM_TOKS"
+            assert str(swa_slots.taint) == "MAX_NUM_TOKS"
+            """
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
     def test_runtime_boundary_overrides_value_registry_collision(self):
         tensor = TaintedTensor(torch.arange(4), [Taint("MODEL_CONFIG")])
 

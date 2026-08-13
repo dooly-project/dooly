@@ -298,12 +298,19 @@ def get_max_model_len(model_name: str, default: int = 4096) -> int:
     """Auto-detect max_model_len from model config."""
     try:
         config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-        # Try common attribute names for max position embeddings
-        for attr in ["max_position_embeddings", "n_positions", "max_seq_len"]:
-            if hasattr(config, attr):
-                val = getattr(config, attr)
+        configs = [("", config)]
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None:
+            configs.append(("text_config.", text_config))
+
+        for prefix, candidate in configs:
+            for attr in ["max_position_embeddings", "n_positions", "max_seq_len"]:
+                val = getattr(candidate, attr, None)
                 if val is not None:
-                    print(f"[Tracer] Auto-detected max_model_len={val} from {attr}")
+                    print(
+                        f"[Tracer] Auto-detected max_model_len={val} "
+                        f"from {prefix}{attr}"
+                    )
                     return int(val)
         print(f"[Tracer] Could not find max position embeddings, using default={default}")
         return default
