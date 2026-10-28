@@ -22,3 +22,6 @@
 /tools/run_validation_pipeline.py
 /tools/trace_parser.py
 /tools/validate_predictions.py
+
+# editor/backup copies are never published
+*.bak

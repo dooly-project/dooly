@@ -68,6 +68,8 @@ class Combo:
     model: str
     backend: str
     tp: int
+    dtype: str = "bfloat16"
+    kv_cache_dtype: str = "auto"
 
     @property
     def safe_model(self) -> str:
@@ -109,15 +111,16 @@ def build_scenarios(workloads: list[str], lengths: list[int],
 
 
 def discover_combos(db_path: str) -> list[Combo]:
-    """Read profiled_models from the DB and return every (model, backend, tp)."""
+    """Read profiled_models from the DB and return every deployment
+    (model, backend, tp, dtype, kv_cache_dtype)."""
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"DB not found: {db_path}")
     with sqlite3.connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT model_name, backend, tp_degree FROM profiled_models "
-            "ORDER BY model_name, backend, tp_degree"
+            "SELECT model_name, backend, tp_degree, dtype, kv_cache_dtype FROM profiled_models "
+            "ORDER BY model_name, backend, tp_degree, dtype, kv_cache_dtype"
         ).fetchall()
-    return [Combo(model=m, backend=b, tp=t) for m, b, t in rows]
+    return [Combo(model=m, backend=b, tp=t, dtype=d, kv_cache_dtype=k) for m, b, t, d, k in rows]
 
 
 def write_batch_config(path: Path, combo: Combo, scenario: Scenario) -> None:
@@ -135,6 +138,8 @@ def write_batch_config(path: Path, combo: Combo, scenario: Scenario) -> None:
         "model": combo.model,
         "backend": combo.backend,
         "tensor_parallel_size": combo.tp,
+        "dtype": combo.dtype,
+        "kv_cache_dtype": combo.kv_cache_dtype,
     }
     if scenario.workload == "prefill":
         cfg["description"] = f"{combo.model} | {combo.backend} | prefill={scenario.axis_value}"

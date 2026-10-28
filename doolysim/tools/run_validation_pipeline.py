@@ -294,15 +294,15 @@ def print_db_contents(db: Path) -> None:
         return
     with sqlite3.connect(str(db)) as con:
         rows = con.execute(
-            "SELECT model_name, backend, tp_degree FROM profiled_models "
+            "SELECT model_name, backend, tp_degree, dtype, kv_cache_dtype FROM profiled_models "
             "ORDER BY model_name, backend"
         ).fetchall()
     if not rows:
         print(f"  (DB exists but is empty: {db})")
         return
-    print(f"  Profiled (model, backend, tp) in {db}:")
+    print(f"  Profiled (model, backend, tp, dtype, kv_cache_dtype) in {db}:")
     for r in rows:
-        print(f"    {r[0]} | {r[1]} | tp={r[2]}")
+        print(f"    {r[0]} | {r[1]} | tp={r[2]} | dtype={r[3]} | kv_cache_dtype={r[4]}")
 
 
 # ---------------------------------------------------------------------------
