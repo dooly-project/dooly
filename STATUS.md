@@ -167,7 +167,9 @@ regressions): Nemotron-51B (DeciLM) fails at model construction,
 `num_attention_heads // n_heads_in_group` with `None` for its 18
 replace-with-linear blocks; Llama-4 Scout fails in the tracer with
 `unhashable type: numpy.ndarray`; Gemma-3-27b (multimodal) rejects
-FLASHINFER and FLASH_ATTN ("partial multimodal token full attention").
+FLASHINFER and FLASH_ATTN ("partial multimodal token full attention") and on
+TRITON_ATTN the traced forward fails with a broadcast error
+(`[336] vs [336, 5376]`) under the taint hooks.
 
 ### Open
 - First KDA layer also carries vLLM's per-forward cached chunk tables; no
