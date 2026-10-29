@@ -45,7 +45,7 @@ if _FAKE_TP_SIZE > 1:
 
 from vllm import LLM
 from vllm.config import set_current_vllm_config
-from vllm.forward_context import set_forward_context
+from doolyprof.profiler.utils.vllm_compat import set_forward_context
 from vllm.v1.attention.backend import CommonAttentionMetadata
 
 
@@ -291,7 +291,7 @@ class VLLMLayerProfiler:
         Get or create a persistent BlockTable for the given kv_cache group.
         The BlockTable is created once and reused across batch configs.
         """
-        from vllm.v1.worker.block_table import BlockTable
+        from doolyprof.profiler.utils.vllm_compat import make_block_table
 
         # Create cache key for this kv_cache group
         cache_key = kv_cache_gid
@@ -311,7 +311,7 @@ class VLLMLayerProfiler:
             max_blocks_per_req = max_num_blocks  # Max possible blocks per sequence
             max_batched_tokens = max_batch_size * 4096  # Conservative estimate
 
-            bt = BlockTable(
+            bt = make_block_table(
                 block_size=block_size,
                 max_num_reqs=max_batch_size,
                 max_num_blocks_per_req=max_blocks_per_req,
@@ -403,10 +403,8 @@ class VLLMLayerProfiler:
             np.arange(start_pos, start_pos + tokens_per_seq, dtype=np.int32),
             batch_size,
         )
-        bt.compute_slot_mapping(req_indices, positions)
-
-        bt.commit_block_table(batch_size)
-        bt.commit_slot_mapping(num_tokens)
+        from doolyprof.profiler.utils.vllm_compat import fill_slot_mapping
+        fill_slot_mapping(bt, batch_size, req_indices, positions, query_start_loc)
 
         # retrieve first batch_size rows (existing + new)
         # each containing block IDs spanning entire KV Sequence
