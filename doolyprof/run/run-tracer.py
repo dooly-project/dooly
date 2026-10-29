@@ -320,6 +320,11 @@ if __name__ == "__main__":
                 # never read by HierarchicalTraceParser.
                 _KEEP = {"cpu_op", "kernel", "user_annotation"}
                 _n_all = len(data.get("traceEvents", []))
+                # Driver-API launches (Triton) carry no External id; link them
+                # to their enclosing CPU event while launch records still exist.
+                from doolyprof.tracer.kineto_links import attach_launch_external_ids
+                _n_linked = attach_launch_external_ids(data.get("traceEvents", []))
+                print(f"[Tracer] Linked {_n_linked} kernels without External id to their enclosing CPU event")
                 data["traceEvents"] = [e for e in data.get("traceEvents", []) if e.get("cat") in _KEEP]
                 print(f"[Tracer] Kept {len(data['traceEvents'])}/{_n_all} trace events ({sorted(_KEEP)})")
                 data["dooly_taint_registry"] = {
