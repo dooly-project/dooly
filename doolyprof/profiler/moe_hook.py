@@ -17,6 +17,17 @@ Expert counts come from ``moe_config``: ``experts_per_token`` (top-k) and
 ``num_local_experts``, the experts this rank holds. Which global expert ids are
 local is read from the layer's ``expert_map`` (global -> local index, -1 for
 experts held by other ranks; None without expert parallelism).
+
+Without expert parallelism every (token, expert) pair is computed here and the
+grid is 2-D: (num_tokens, activated_experts). With it (``enable_expert_parallel``)
+a rank computes only the pairs routed to its own experts -- the *local pairs* --
+and vLLM masks the rest (expert_map -> -1). How many pairs land on a rank
+depends on the routing, not on the token count alone, so the EP grid adds
+``local_pairs`` as a third axis: (num_tokens, local_pairs, activated_experts),
+with ``activated_experts`` counting local experts. The forced routing sends
+exactly ``local_pairs`` pairs to ``activated_experts`` local experts and every
+remaining pair to remote experts, which the engine masks as it would in a real
+deployment.
 """
 from contextlib import contextmanager
 
@@ -71,6 +82,36 @@ def moe_activated_grid(top_k, num_experts, num_tokens):
     return sorted(grid)
 
 
+def _pow2_grid(lo, hi):
+    """Powers of two in [lo, hi] plus both endpoints (empty if lo > hi)."""
+    if lo > hi:
+        return []
+    grid, v = {lo, hi}, 1
+    while v <= hi:
+        if v >= lo:
+            grid.add(v)
+        v *= 2
+    return sorted(grid)
+
+
+def moe_ep_grid(top_k, num_local_experts, num_tokens):
+    """(local_pairs, activated_experts) grid for an expert-parallel rank.
+
+    ``local_pairs`` L: power-of-two grid in [1, num_tokens*top_k] -- from a rank
+    that receives a single pair up to one that receives every pair.
+    ``activated_experts`` A (local experts that receive pairs): power-of-two
+    grid in [ceil(L / num_tokens), min(num_local_experts, L)] -- at least one
+    pair per activated expert, and few enough tokens per expert that each
+    token's local picks are distinct experts.
+    """
+    out = []
+    for pairs in _pow2_grid(1, num_tokens * top_k):
+        lo = -(-pairs // num_tokens)
+        for activated in _pow2_grid(lo, min(num_local_experts, pairs)):
+            out.append((pairs, activated))
+    return out
+
+
 def moe_expert_placement(fused):
     """(local global ids, remote global ids) of the layer's experts, from its
     ``expert_map``; without expert parallelism every expert is local."""
@@ -91,19 +132,53 @@ def _cycle_ids(num_tokens, top_k, activated):
             for t in range(num_tokens)]
 
 
+def _local_pair_ids(num_tokens, top_k, activated, local_pairs, local_ids, remote_ids):
+    """Expert ids with exactly ``local_pairs`` pairs on ``activated`` local
+    experts and every other pair on a remote expert. Local pairs are spread as
+    evenly as possible over tokens and cycle over the first ``activated`` local
+    experts; each token's picks are distinct experts."""
+    base, extra = divmod(local_pairs, num_tokens)
+    ids, c = [], 0
+    for t in range(num_tokens):
+        n_local = base + (1 if t < extra else 0)
+        row = [local_ids[(c + j) % activated] for j in range(n_local)]
+        c += n_local
+        n_remote = top_k - n_local
+        row += [remote_ids[(t * top_k + j) % len(remote_ids)] for j in range(n_remote)]
+        ids.append(row)
+    return ids
+
+
 @contextmanager
-def force_moe_routing(fused, num_tokens, activated_experts):
+def force_moe_routing(fused, num_tokens, activated_experts, local_pairs=None):
     """Patch ``fused.router._compute_routing`` so exactly ``activated_experts`` distinct
     experts fire for a batch of ``num_tokens`` tokens. Router-subclass-agnostic
-    (FusedTopKRouter, GroupedTopKRouter, ...). Restores on exit."""
+    (FusedTopKRouter, GroupedTopKRouter, ...). Restores on exit.
+
+    ``local_pairs`` (expert-parallel layers only): number of (token, expert)
+    pairs routed to this rank's experts; the remaining pairs go to remote
+    experts. None keeps every pair local (the non-EP behaviour)."""
     top_k = moe_top_k(fused)
-    local_ids, _ = moe_expert_placement(fused)
-    if not (top_k <= activated_experts <= num_tokens * top_k):
-        raise ValueError(
-            f"need top_k({top_k}) <= activated({activated_experts}) "
-            f"<= num_tokens*top_k({num_tokens * top_k})")
-    ids_list = [[local_ids[i] for i in row]
-                for row in _cycle_ids(num_tokens, top_k, activated_experts)]
+    local_ids, remote_ids = moe_expert_placement(fused)
+    if local_pairs is None:
+        if not (top_k <= activated_experts <= num_tokens * top_k):
+            raise ValueError(
+                f"need top_k({top_k}) <= activated({activated_experts}) "
+                f"<= num_tokens*top_k({num_tokens * top_k})")
+        ids_list = [[local_ids[i] for i in row]
+                    for row in _cycle_ids(num_tokens, top_k, activated_experts)]
+    else:
+        if not (1 <= local_pairs <= num_tokens * top_k):
+            raise ValueError(f"need 1 <= local_pairs({local_pairs}) <= num_tokens*top_k({num_tokens * top_k})")
+        if not (-(-local_pairs // num_tokens) <= activated_experts <= min(len(local_ids), local_pairs)):
+            raise ValueError(
+                f"need ceil(local_pairs/num_tokens) <= activated({activated_experts}) "
+                f"<= min(local experts {len(local_ids)}, local_pairs {local_pairs})")
+        remote_needed = top_k - local_pairs // num_tokens
+        if remote_needed > 0 and len(remote_ids) < remote_needed:
+            raise ValueError(f"need {remote_needed} distinct remote experts per token, layer has {len(remote_ids)}")
+        ids_list = _local_pair_ids(num_tokens, top_k, activated_experts, local_pairs,
+                                   local_ids, remote_ids)
     dev = next(fused.parameters()).device
     weights = torch.full((num_tokens, top_k), 1.0 / top_k, device=dev, dtype=torch.float32)
     ids_by_dtype = {}

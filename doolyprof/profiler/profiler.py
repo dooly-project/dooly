@@ -468,11 +468,19 @@ class Profiler:
             conn.execute("ALTER TABLE results ADD COLUMN activated_experts INTEGER NULL")
         except sqlite3.OperationalError:
             pass  # column already present
+        # Backward-compat: local_pairs (expert-parallel MoE rows: pairs routed to
+        # this rank's experts). NULL on every other row, where all pairs are local.
+        try:
+            conn.execute("ALTER TABLE results ADD COLUMN local_pairs INTEGER NULL")
+        except sqlite3.OperationalError:
+            pass  # column already present
+        conn.execute("DROP INDEX IF EXISTS idx_results_lookup")
         conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_results_lookup
+            CREATE INDEX IF NOT EXISTS idx_results_lookup_v2
             ON results (signature_hash, num_tokens, num_requests,
                         is_context, is_prefill, kv_cache_size,
-                        prefill_chunk_size, activated_experts, num_tensor_parallel_workers)
+                        prefill_chunk_size, activated_experts, local_pairs,
+                        num_tensor_parallel_workers)
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS profiled_models (
@@ -1010,12 +1018,14 @@ class Profiler:
             # num_experts from the live layer so the InputGenerator builds the
             # (num_tokens, activated_experts) grid and we can force routing when timing.
             from doolyprof.profiler.moe_hook import (
-                find_fused_moe, moe_top_k as _moe_top_k, moe_num_local_experts)
+                find_fused_moe, moe_top_k as _moe_top_k, moe_num_local_experts, moe_expert_placement)
             fused_moe = find_fused_moe(callable_obj) if module.is_module else None
             moe_top_k = _moe_top_k(fused_moe) if fused_moe is not None else None
             # Experts held by this rank: the activated-experts sweep and the
             # forced routing are per rank (equal to all experts without EP).
             moe_num_experts = moe_num_local_experts(fused_moe) if fused_moe is not None else None
+            # Experts held by other ranks (non-zero only with expert parallelism)
+            moe_num_remote = len(moe_expert_placement(fused_moe)[1]) if fused_moe is not None else 0
 
             generator = InputGenerator(
                 module=module,
@@ -1025,6 +1035,7 @@ class Profiler:
                 dtype=self.dtype,
                 moe_top_k=moe_top_k,
                 moe_num_experts=moe_num_experts,
+                moe_num_remote_experts=moe_num_remote,
             )
 
             # Let the InputGenerator classify the op and pick the right sweep.
@@ -1076,6 +1087,13 @@ class Profiler:
                 )
                 if activated_experts is not None:
                     workload_params['activated_experts'] = activated_experts
+                # EP grid: pairs routed to this rank's experts (None = all pairs)
+                local_pairs = (
+                    workload_config.get('local_pairs')
+                    if isinstance(workload_config, dict) else None
+                )
+                if local_pairs is not None:
+                    workload_params['local_pairs'] = local_pairs
 
                 if not inputs:
                     # Invalid config, skip
@@ -1205,7 +1223,8 @@ class Profiler:
                         # replays those exact kernels. _profile_with_batched_cuda_graph
                         # falls back to _profile_standard internally if capture fails.
                         from doolyprof.profiler.moe_hook import force_moe_routing
-                        with force_moe_routing(fused_moe, workload_params.get('num_tokens'), activated_experts):
+                        with force_moe_routing(fused_moe, workload_params.get('num_tokens'), activated_experts,
+                                               local_pairs=workload_params.get('local_pairs')):
                             run_results = self._profile_with_batched_cuda_graph(
                                 run_fn=run_fn,
                                 warmup_runs=5,
@@ -1241,6 +1260,7 @@ class Profiler:
                         "num_tokens": workload_params.get('num_tokens'),
                         "num_requests": workload_params.get('num_requests'),
                         "activated_experts": workload_params.get('activated_experts'),
+                        "local_pairs": workload_params.get('local_pairs'),
                     }
                     results.append(result)
 
@@ -1275,7 +1295,7 @@ class Profiler:
         with open(self.output_path, "w") as f:
             f.write(
                 "module_name,operation_name,num_tensor_parallel_workers,"
-                "num_tokens,num_requests,activated_experts,"
+                "num_tokens,num_requests,activated_experts,local_pairs,"
                 "mean_latency_ms,median_latency_ms,max_latency_ms,min_latency_ms,std_latency_ms,"
                 "input_shapes,workload_params\n"
             )
@@ -1286,9 +1306,12 @@ class Profiler:
                 activated_experts = result.get("activated_experts", "")
                 if activated_experts is None:
                     activated_experts = ""
+                local_pairs = result.get("local_pairs")
+                if local_pairs is None:
+                    local_pairs = ""
                 f.write(
                     f"{result['module_name']},{result['operation_name']},{self.tp_config},"
-                    f"{num_tokens},{num_requests},{activated_experts},"
+                    f"{num_tokens},{num_requests},{activated_experts},{local_pairs},"
                     f"{result['mean_latency_ms']:.4f},{result['median_latency_ms']:.4f},"
                     f"{result['max_latency_ms']:.4f},{result['min_latency_ms']:.4f},{result['std_latency_ms']:.4f},"
                     f"\"{result['input_shapes']}\",\"{workload_params_str}\"\n"
@@ -1562,6 +1585,7 @@ class Profiler:
                 prefill_chunk_size = workload_params.get('prefill_chunk_size', None)
                 kv_cache_size = workload_params.get('kv_cache_size', None)
                 activated_experts = workload_params.get('activated_experts', None)
+                local_pairs = workload_params.get('local_pairs', None)
                 is_context = is_prefill is not None and kv_cache_size is not None and prefill_chunk_size is not None
 
                 # Check if this exact configuration already exists
@@ -1576,6 +1600,7 @@ class Profiler:
                        AND (kv_cache_size = ? OR (kv_cache_size IS NULL AND ? IS NULL))
                        AND (prefill_chunk_size = ? OR (prefill_chunk_size IS NULL AND ? IS NULL))
                        AND (activated_experts = ? OR (activated_experts IS NULL AND ? IS NULL))
+                       AND (local_pairs = ? OR (local_pairs IS NULL AND ? IS NULL))
                        AND num_tensor_parallel_workers = ?""",
                     (sig_hash,
                      num_tokens, num_tokens,
@@ -1585,6 +1610,7 @@ class Profiler:
                      kv_cache_size, kv_cache_size,
                      prefill_chunk_size, prefill_chunk_size,
                      activated_experts, activated_experts,
+                     local_pairs, local_pairs,
                      tp_workers)
                 ).fetchone()
 
@@ -1615,9 +1641,10 @@ class Profiler:
                             num_tokens, num_requests,
                             is_context, is_prefill, kv_cache_size, prefill_chunk_size,
                             activated_experts,
+                            local_pairs,
                             num_tensor_parallel_workers,
                             input_shapes
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             sig_hash,
                             result.get('mean_latency_ms'),
@@ -1632,6 +1659,7 @@ class Profiler:
                             kv_cache_size,
                             prefill_chunk_size,
                             activated_experts,
+                            local_pairs,
                             tp_workers,
                             json.dumps(result.get('input_shapes', [])),
                         )
