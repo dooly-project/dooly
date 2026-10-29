@@ -15,6 +15,7 @@ Conventions
 - Env: `~/miniforge3/envs/dooly/bin/python` with
   `LD_PRELOAD=<env>/lib/libstdc++.so.6`; vLLM 0.17.1, torch 2.10, A100 80GB.
   vLLM 0.32.0: `~/miniforge3/envs/dooly-v32/bin/python` (no LD_PRELOAD), torch 2.13.
+  `python doolyprof/tests/tracer_ops_test.py` covers tracer op wrappers.
 
 ---
 
@@ -33,6 +34,8 @@ engine's own signature / attributes, never from a version string.
 | 2 | resolver/profiler: `set_forward_context() got unexpected 'virtual_engine'` | pipeline virtual engines removed | `utils/vllm_compat.py`: drop optional kwargs the callee does not declare |
 | 3 | `BlockTable.__init__() got unexpected 'kernel_block_size'` | alloc block = kernel block | same helper (`make_block_table`) |
 | 4 | `compute_slot_mapping() missing 'positions'` -> no attention metadata (MLA wrapper unresolvable) | slot mapping now a GPU kernel over `(num_reqs, query_start_loc, positions)` reading the committed device table | `fill_slot_mapping`, contract chosen by parameter names |
+| 5 | first decoder layer untainted (layer-0 norm/QKV missing, 31 of 32 layers) | `VocabParallelEmbedding.forward` ends with `output.view(output_dtype)`; tracer's `view(dtype)` returned a plain tensor | keep taints through `view(dtype)` (last dim untainted if itemsize changes) |
+| 6 | Kimi / Qwen3.5 tracer crash `'<' not supported between tuple and int` | Mamba `bind_kv_cache` calls `squeeze(dim=(1, 2))` | tuple dims in the squeeze wrapper |
 
 Not bugs, recorded: the `Invalid process group specified` traceback at engine
 shutdown is harmless (fake TP group teardown); `_C::vocab_parallel_embedding`
