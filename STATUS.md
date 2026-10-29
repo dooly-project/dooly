@@ -171,13 +171,34 @@ FLASHINFER and FLASH_ATTN ("partial multimodal token full attention") and on
 TRITON_ATTN the traced forward fails with a broadcast error
 (`[336] vs [336, 5376]`) under the taint hooks.
 
+### Kernel names retired (kernel-match and trace dedup)
+Removed the resolver's kernel-match (`_pick_path_by_kernels`,
+`_capture_kernels`, path cache), the kernel-name tuples in the trace dedup
+key, the parser's `descendant_kernels` annotation and the dead
+`_get_*kernel_signature` helpers. Instance choice is now: state-hash filter,
+then the ancestor-class filter for classes without configuration
+(GemmaRMSNorm, LayerNorm). `_resolved_path` is recorded after the final
+choice, and the resolver warns when no instance has the traced state hash.
+History: kernel-match (Apr 20) predates the state hash (Apr 25), which was
+added in front of it for FA2/Triton sliding windows and made it redundant.
+Validation: all 17 GPU-script assertions pass; signatures and per-model op
+counts are identical to the kernel-match databases for Llama (auto, fp8 KV,
+fp16), Llama + Command R7B, Gemma-2-2b, Llama on TRITON_ATTN and Kimi-Linear;
+norm instances picked are unchanged (`model.layers.0.input_layernorm`).
+Kimi-Linear resolution 58 s → 31 s, end to end 3 min 15 s → 2 min 19 s.
+The new warning surfaced a pre-existing mismatch: Kimi-Linear's traced
+`MLAAttention` state hash (3f2c005075bb) matches none of its 7 instances at
+resolve time (kernel-match also failed there, so the first instance was
+already used; the 7 layers are configured identically).
+
 ### Open
+- Kimi-Linear `MLAAttention`: state hash differs between tracer and resolver
+  (see above); find the attribute that changes.
 - First KDA layer also carries vLLM's per-forward cached chunk tables; no
   longer visible in signatures, but that per-forward cost is not recorded
   anywhere.
-- Resolution: skip kernel-match when state-filtered candidates are
-  interchangeable; reuse the resolver's chosen path in the profiling phase;
-  share one engine between resolution and profiling (see audit above).
+- Resolution: reuse the resolver's chosen path in the profiling phase; share
+  one engine between resolution and profiling.
 - Tracer support gaps found by the audit: Nemotron-51B, Llama-4 Scout,
   Gemma-3 multimodal (details above).
 
