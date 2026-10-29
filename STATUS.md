@@ -208,6 +208,25 @@ Qwen3.5-4B. Only the compile-anchor norm signatures changed hash
 (Gemma-2 / Qwen3.5 GemmaRMSNorm, Command R LayerNorm), with unchanged counts;
 all other signatures and per-model op counts identical.
 
+### Resolver uses the instance path recorded at trace time
+The tracer maps every module to its dotted path once after load
+(`hooks.register_module_paths`) and writes `PATH:<path>` as the last field of
+each MODULE annotation. The parser stores it in the event args, trace dedup
+keeps every member's path (`ModuleInfo.instance_paths`, never hashed), and the
+resolver fetches the instance with `get_submodule(path)` instead of inferring
+it from class name, state hash, ancestor class and module order. Before using
+a path it checks the dedup group: every member must exist, carry the traced
+state hash, and have the same fingerprint (state hash + name/shape of every
+parameter in its subtree); otherwise it prints an ERROR naming the differing
+parameters (a missing signature field). The old filters remain only for traces
+without `PATH:`.
+Validation: all 17 GPU-script assertions pass; signatures and per-model op
+counts identical to the previous run on Llama (auto/fp8/fp16), Llama +
+Command R7B, Gemma-2-2b, Kimi-Linear, DeepSeek-V2-Lite, Qwen3.5-4B and
+gpt-oss-20b; zero group-check errors on all of them. Qwen3.5's query norm now
+resolves directly to `layers.3.self_attn.q_norm` (before: wrong
+`input_layernorm` first, recovered only by a failed dummy run).
+
 ### Open
 - Other module attributes vLLM derives from deployment / engine capacity,
   not seen in the 8 models dumped so far but would enter the state hash:
@@ -221,12 +240,12 @@ all other signatures and per-model op counts identical.
 - State hash ignores parameter shapes: Qwen3.5 GemmaRMSNorm with weight 256
   (q_norm / k_norm) and 2560 (layer norms) share a hash; RowParallelLinear
   with and without bias share a hash.
-- Ancestor-class filter on compile anchors: the anchor's first ancestor is
-  its own module event (same class), so the filter keeps every instance and
-  returns the first. Qwen3.5's q_norm anchor was first resolved to
-  `layers.0.input_layernorm` (weight 2560); the dummy run failed on the shape
-  and the walk-up recovered q_norm. A broadcast-compatible mismatch would
-  have been profiled silently.
+- Ancestor-class filter (still used for traces without `PATH:`) is
+  order-dependent and, for compile anchors, sees the module itself as the
+  first ancestor; superseded by recorded paths for new traces.
+- A resolver group-check ERROR (members of one dedup group with different
+  configuration or parameter shapes) currently only reports; splitting the
+  group would need a new signature field. None observed on 8 models.
 - First KDA layer also carries vLLM's per-forward cached chunk tables; no
   longer visible in signatures, but that per-forward cost is not recorded
   anywhere.
