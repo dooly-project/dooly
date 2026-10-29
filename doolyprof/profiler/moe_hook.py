@@ -1,35 +1,55 @@
 """Model-agnostic MoE forced routing +
 the activated_experts grid, for the 2-D (num_tokens, activated_experts) MoE profile.
 
-Every vLLM MoE model routes its expert computation through the common `FusedMoE`
-layer (or its subclass `SharedFusedMoE`, which folds in the shared expert), bound as
-`self.experts` on the model-specific wrapper. So hooking the base `FusedMoE` covers
-Mixtral, Qwen2/3-MoE, Phi-MoE, DeepSeek-V2, GPT-OSS, Llama-4, ... with no per-model
-code. We force the router *instance's* `_compute_routing` (reached from every router
-subclass via `select_experts`) so exactly `activated_experts` distinct experts fire,
+Every vLLM MoE model routes its expert computation through one common layer that
+owns the router and an engine-defined ``FusedMoEConfig`` (``moe_config``): the
+``FusedMoE`` class (or its ``SharedFusedMoE`` subclass) up to vLLM 0.17, the
+``MoERunner`` built by ``FusedMoEFactory`` in vLLM 0.32. Finding that layer by
+its ``moe_config`` covers Mixtral, Qwen2/3-MoE, Phi-MoE, DeepSeek-V2, GPT-OSS,
+Llama-4, ... with no per-model or per-release class name. We force the router
+*instance's* `_compute_routing` (reached from every router subclass via
+`select_experts`) so exactly `activated_experts` distinct experts fire,
 regardless of the (dummy-weight) gate -- LLMServingSim's methodology
-(profiler/core/hooks/moe_hook.py), but keyed on type rather than a per-model class name.
+(profiler/core/hooks/moe_hook.py), but keyed on the layer's contract rather than
+a per-model class name.
+
+Expert counts come from ``moe_config``: ``experts_per_token`` (top-k) and
+``num_local_experts``, the experts this rank holds.
 """
 from contextlib import contextmanager
 
 import torch
 
 
-def find_fused_moe(module):
-    """Return the FusedMoE / SharedFusedMoE instance for ``module`` -- whether the
-    module IS a FusedMoE or a wrapper (e.g. Qwen2MoeSparseMoeBlock) that contains one.
-    Returns None if there is no FusedMoE (i.e. not an MoE module)."""
+def _is_moe_layer(m) -> bool:
     try:
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
     except Exception:
-        return None
-    if isinstance(module, FusedMoE):
+        return False
+    return isinstance(getattr(m, "moe_config", None), FusedMoEConfig) and hasattr(m, "router")
+
+
+def find_fused_moe(module):
+    """Return the MoE layer for ``module`` -- whether the module IS the MoE layer
+    or a wrapper (e.g. Qwen2MoeSparseMoeBlock) that contains one.
+    Returns None if there is no MoE layer (i.e. not an MoE module)."""
+    if _is_moe_layer(module):
         return module
     if hasattr(module, "modules"):
         for m in module.modules():
-            if isinstance(m, FusedMoE):
+            if _is_moe_layer(m):
                 return m
     return None
+
+
+def moe_top_k(fused) -> int:
+    """Experts each token is routed to."""
+    return fused.moe_config.experts_per_token
+
+
+def moe_num_local_experts(fused) -> int:
+    """Experts held by this rank (all of them unless expert parallelism is on)."""
+    return fused.moe_config.num_local_experts
 
 
 def moe_activated_grid(top_k, num_experts, num_tokens):
@@ -60,23 +80,27 @@ def force_moe_routing(fused, num_tokens, activated_experts):
     """Patch ``fused.router._compute_routing`` so exactly ``activated_experts`` distinct
     experts fire for a batch of ``num_tokens`` tokens. Router-subclass-agnostic
     (FusedTopKRouter, GroupedTopKRouter, ...). Restores on exit."""
-    top_k = fused.top_k
+    top_k = moe_top_k(fused)
     if not (top_k <= activated_experts <= num_tokens * top_k):
         raise ValueError(
             f"need top_k({top_k}) <= activated({activated_experts}) "
             f"<= num_tokens*top_k({num_tokens * top_k})")
+    ids_list = _cycle_ids(num_tokens, top_k, activated_experts)
     dev = next(fused.parameters()).device
-    idt = fused.router._get_indices_type()
-    ids = torch.tensor(
-        _cycle_ids(num_tokens, top_k, activated_experts),
-        device=dev, dtype=torch.int32 if idt is None else idt)
     weights = torch.full((num_tokens, top_k), 1.0 / top_k, device=dev, dtype=torch.float32)
+    ids_by_dtype = {}
 
     router = fused.router
     original = router._compute_routing
 
-    def forced(_hidden_states, _router_logits, _indices_type):
-        return weights, ids
+    def forced(hidden_states, router_logits, indices_type=None, *args, **kwargs):
+        # indices_type is the dtype the caller wants the expert ids in (None
+        # means the router's default, int32); extra keyword arguments such as
+        # vLLM 0.32's input_ids are irrelevant to forced routing.
+        dt = torch.int32 if indices_type is None else indices_type
+        if dt not in ids_by_dtype:
+            ids_by_dtype[dt] = torch.tensor(ids_list, device=dev, dtype=dt)
+        return weights, ids_by_dtype[dt]
 
     router._compute_routing = forced
     try:
