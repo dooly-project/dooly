@@ -191,9 +191,42 @@ The new warning surfaced a pre-existing mismatch: Kimi-Linear's traced
 resolve time (kernel-match also failed there, so the first instance was
 already used; the 7 layers are configured identically).
 
+### State hash: compile anchors, MLA workspace size
+- Compile anchors (modules whose forward runs a `torch.compile`d function,
+  e.g. GemmaRMSNorm, Command R LayerNorm) now take the state hash of the
+  containing MODULE event, like their name, inputs and taint string already
+  did; before, they read the COMPILE event's args, which never carry a hash,
+  so these modules had an empty state hash at resolution.
+- `chunked_prefill_workspace_size` excluded: vLLM sizes this MLA scratch buffer
+  from engine capacity (`max_num_seqs x block_size`, `max_model_len`); the
+  tracer engine (max_num_seqs 263) and the resolver engine (256) differ, so
+  the traced hash matched no instance (Kimi-Linear 504,960 vs 491,520,
+  DeepSeek-V2-Lite 65,536 vs 16,384).
+Validation: all GPU-script assertions pass; no resolver state-mismatch
+warnings on Llama, Command R7B, Gemma-2, Kimi-Linear, DeepSeek-V2-Lite,
+Qwen3.5-4B. Only the compile-anchor norm signatures changed hash
+(Gemma-2 / Qwen3.5 GemmaRMSNorm, Command R LayerNorm), with unchanged counts;
+all other signatures and per-model op counts identical.
+
 ### Open
-- Kimi-Linear `MLAAttention`: state hash differs between tracer and resolver
-  (see above); find the attribute that changes.
+- Other module attributes vLLM derives from deployment / engine capacity,
+  not seen in the 8 models dumped so far but would enter the state hash:
+  `sparse_attn_indexer.max_model_len` (DeepSeek V3.2 sparse attention),
+  `static_sink_attention.block_size` / `num_sink_blocks` (cache block size),
+  Phi-3 long-RoPE `use_long_rope` (= max_model_len > original context; this
+  one changes computation, so it may belong in the deployment key), and the
+  `scheduler_config` objects stored by Mamba-family models (not hashed today
+  because not primitive). A general rule (values computed from scheduler /
+  cache capacity are not configuration) would replace name-by-name exclusion.
+- State hash ignores parameter shapes: Qwen3.5 GemmaRMSNorm with weight 256
+  (q_norm / k_norm) and 2560 (layer norms) share a hash; RowParallelLinear
+  with and without bias share a hash.
+- Ancestor-class filter on compile anchors: the anchor's first ancestor is
+  its own module event (same class), so the filter keeps every instance and
+  returns the first. Qwen3.5's q_norm anchor was first resolved to
+  `layers.0.input_layernorm` (weight 2560); the dummy run failed on the shape
+  and the walk-up recovered q_norm. A broadcast-compatible mismatch would
+  have been profiled silently.
 - First KDA layer also carries vLLM's per-forward cached chunk tables; no
   longer visible in signatures, but that per-forward cost is not recorded
   anywhere.
