@@ -14,13 +14,25 @@ from doolyprof.profiler.taint import DimensionType, parse_taint_string
 @dataclass
 class ProfileInput:
     """Input representation for profiling (taint-based)"""
-    type: str  # "Tensor" or "Scalar"
+    type: str  # "Tensor", "TensorList" or "Scalar"
     dtype: str
     dimensions: List[DimensionType]  # MODEL_CONFIG or WORKLOAD for each dimension
     actual_shape: List[int]  # Actual dimension values from trace
     scalar_value: Optional[str] = None  # For scalar inputs
     arg_name: Optional[str] = None  # kwarg name if input was passed as keyword arg
     dimension_components: Optional[List[Optional[Dict[str, int]]]] = None  # For MIX dimensions: components per dim
+    # For TensorList inputs (e.g. aten::cat's tensors): one Tensor ProfileInput
+    # per list element; the list itself has no dimensions of its own.
+    elements: Optional[List['ProfileInput']] = None
+
+    def tensor_parts(self) -> List['ProfileInput']:
+        """The Tensor inputs this argument contributes: itself for a Tensor,
+        its elements for a TensorList, nothing for a Scalar."""
+        if self.type == "Tensor":
+            return [self]
+        if self.type == "TensorList":
+            return list(self.elements or [])
+        return []
 
     def get_model_config_dims(self) -> List[int]:
         """Get indices of MODEL_CONFIG dimensions (fixed, don't sweep)"""
@@ -53,6 +65,8 @@ class ProfileInput:
         }
         if self.arg_name is not None:
             d['arg_name'] = self.arg_name
+        if self.elements is not None:
+            d['elements'] = [e.to_dict() for e in self.elements]
         return d
 
     @classmethod
@@ -65,8 +79,51 @@ class ProfileInput:
             dimensions=dimensions,
             actual_shape=data['actual_shape'],
             scalar_value=data.get('scalar_value'),
-            arg_name=data.get('arg_name')
+            arg_name=data.get('arg_name'),
+            elements=([cls.from_dict(e) for e in data['elements']]
+                      if data.get('elements') is not None else None),
         )
+
+
+def _is_tensor_list_dims(dims) -> bool:
+    """True when a trace input's dims are a list of shapes (a TensorList)."""
+    return bool(dims) and all(isinstance(d, (list, tuple)) for d in dims)
+
+
+def _tensor_input(i, taint_input, dims, dtype) -> 'ProfileInput':
+    """Tensor ProfileInput for one traced tensor of shape ``dims``."""
+    if taint_input is None:
+        # Tensor without taint info: all dims MODEL_CONFIG (never swept)
+        return ProfileInput(
+            type="Tensor",
+            dtype=dtype or "float",
+            dimensions=[DimensionType.MODEL_CONFIG] * len(dims),
+            actual_shape=dims,
+        )
+    dim_types = [dim.dim_type for dim in taint_input.dimensions]
+    dim_components = [dim.components for dim in taint_input.dimensions]
+    # Handle dimension mismatch (broadcasting case)
+    # If taint has fewer dims than trace, the tensor was broadcast
+    # Pad leading dimensions with MODEL_CONFIG (conservative)
+    if len(dim_types) < len(dims):
+        # Broadcasting: taint [N] -> trace [N, D] means we pad leading dims
+        # Actually for broadcasting, trailing dims match, so pad at front
+        num_missing = len(dims) - len(dim_types)
+        dim_types = [DimensionType.MODEL_CONFIG] * num_missing + dim_types
+        dim_components = [None] * num_missing + dim_components
+    elif len(dim_types) > len(dims):
+        # Taint has more dims than trace - unusual, raise error
+        raise ValueError(
+            f"Dimension mismatch for input {i}: "
+            f"taint has {len(dim_types)} dimensions but trace has {len(dims)} dimensions"
+        )
+    return ProfileInput(
+        type="Tensor",
+        dtype=dtype,
+        dimensions=dim_types,
+        actual_shape=dims,
+        dimension_components=dim_components,
+    )
 
 
 def extract_inputs_from_taint(
@@ -109,13 +166,28 @@ def extract_inputs_from_taint(
     # taint_inputs may be shorter than trace data (missing scalars)
     profile_inputs = []
 
-    for i, (taint_input, dims, dtype) in enumerate(zip_longest(
-        taint_inputs, trace_input_dims, trace_input_dtypes, fillvalue=None
+    # Walk the trace inputs with a separate cursor into the taint segments:
+    # the profiler records a TensorList argument (aten::cat's tensors) as one
+    # input whose dims are a list of shapes, while the taint string has one
+    # segment per tensor, so a TensorList consumes several segments.
+    taint_cursor = 0
+    for i, (dims, dtype) in enumerate(zip_longest(
+        trace_input_dims, trace_input_dtypes, fillvalue=None
     )):
-        # Skip if we have more taint inputs than trace data (shouldn't happen)
         if dims is None:
-            # print(f"[DEBUG @ finput] dims is None, skipping.")
             continue
+        if _is_tensor_list_dims(dims):
+            elements = []
+            for shape in dims:
+                seg = taint_inputs[taint_cursor] if taint_cursor < len(taint_inputs) else None
+                taint_cursor += 1
+                elements.append(_tensor_input(i, seg, list(shape), ""))
+            profile_inputs.append(ProfileInput(
+                type="TensorList", dtype=dtype or "TensorList",
+                dimensions=[], actual_shape=[], elements=elements))
+            continue
+        taint_input = taint_inputs[taint_cursor] if taint_cursor < len(taint_inputs) else None
+        taint_cursor += 1
         
         # Get scalar value from concrete inputs if available
         scalar_val = concrete_inputs[i] if concrete_inputs and i < len(concrete_inputs) else None
@@ -179,32 +251,7 @@ def extract_inputs_from_taint(
             )
             
         else:
-            # Tensor with taint info - extract dimension types
-            dim_types = [dim.dim_type for dim in taint_input.dimensions]
-            dim_components = [dim.components for dim in taint_input.dimensions]
-            # Handle dimension mismatch (broadcasting case)
-            # If taint has fewer dims than trace, the tensor was broadcast
-            # Pad leading dimensions with MODEL_CONFIG (conservative)
-            if len(dim_types) < len(dims):
-                # Broadcasting: taint [N] -> trace [N, D] means we pad leading dims
-                # Actually for broadcasting, trailing dims match, so pad at front
-                num_missing = len(dims) - len(dim_types)
-                dim_types = [DimensionType.MODEL_CONFIG] * num_missing + dim_types
-                dim_components = [None] * num_missing + dim_components
-            elif len(dim_types) > len(dims):
-                # Taint has more dims than trace - unusual, raise error
-                raise ValueError(
-                    f"Dimension mismatch for input {i}: "
-                    f"taint has {len(dim_types)} dimensions but trace has {len(dims)} dimensions"
-                )
-
-            profile_input = ProfileInput(
-                type="Tensor",
-                dtype=dtype,
-                dimensions=dim_types,
-                actual_shape=dims,
-                dimension_components=dim_components
-            )
+            profile_input = _tensor_input(i, taint_input, dims, dtype)
         profile_inputs.append(profile_input)
 
     # Assign kwarg names to the inputs that came from kwargs.
