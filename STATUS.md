@@ -14,6 +14,29 @@ Conventions
   Real-CLI GPU check: `python doolyprof/tests/validate_signature_fields_gpu.py --workdir <dir> --gpus 0 1 2 3`.
 - Env: `~/miniforge3/envs/dooly/bin/python` with
   `LD_PRELOAD=<env>/lib/libstdc++.so.6`; vLLM 0.17.1, torch 2.10, A100 80GB.
+  vLLM 0.32.0: `~/miniforge3/envs/dooly-v32/bin/python` (no LD_PRELOAD), torch 2.13.
+
+---
+
+## 2026-10-29 — vLLM 0.32.0 port
+Env: new conda env `dooly-v32` (vLLM 0.32.0, torch 2.13.0+cu130, transformers
+5.19, flashinfer 0.7.0.post1). `dooly` (0.17.1) is untouched and DoolySim still
+uses it. No `LD_PRELOAD` needed in `dooly-v32` (sqlite loads fine after torch).
+The 0.32 wheel registers `KimiK3ForConditionalGeneration` and ships FA2 (sm80).
+All changes below keep 0.17.1 working: each API difference is picked from the
+engine's own signature / attributes, never from a version string.
+
+### What 0.32 broke and the fix
+| # | Symptom on 0.32 | Cause | Fix |
+|---|---|---|---|
+| 1 | `import vllm._C` fails | ops now in `_C_stable_libtorch` / `_moe_C_stable_libtorch` | `current_platform.import_kernels()` (importer.py) |
+| 2 | resolver/profiler: `set_forward_context() got unexpected 'virtual_engine'` | pipeline virtual engines removed | `utils/vllm_compat.py`: drop optional kwargs the callee does not declare |
+| 3 | `BlockTable.__init__() got unexpected 'kernel_block_size'` | alloc block = kernel block | same helper (`make_block_table`) |
+| 4 | `compute_slot_mapping() missing 'positions'` -> no attention metadata (MLA wrapper unresolvable) | slot mapping now a GPU kernel over `(num_reqs, query_start_loc, positions)` reading the committed device table | `fill_slot_mapping`, contract chosen by parameter names |
+
+Not bugs, recorded: the `Invalid process group specified` traceback at engine
+shutdown is harmless (fake TP group teardown); `_C::vocab_parallel_embedding`
+replaces the embedding module entry (one fused kernel now).
 
 ---
 

@@ -2,7 +2,12 @@ import importlib
 import inspect
 from typing import Dict, Callable, Optional, Set
 import os
-import torch, vllm, torch._C, vllm._C
+import torch, vllm, torch._C
+# Register vLLM's custom ops through the platform's own loader: the extension
+# module name is version-specific (vllm._C up to 0.17, vllm._C_stable_libtorch
+# plus _moe_C_stable_libtorch in 0.32).
+from vllm.platforms import current_platform
+current_platform.import_kernels()
 import torch.nn.functional as F
 
 class OpImporter:

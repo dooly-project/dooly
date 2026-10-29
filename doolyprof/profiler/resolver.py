@@ -587,7 +587,7 @@ class ModuleResolver:
 
             def run_callable_with_context():
                 from vllm.config import set_current_vllm_config
-                from vllm.forward_context import set_forward_context
+                from doolyprof.profiler.utils.vllm_compat import set_forward_context
                 with torch.inference_mode():
                     # Same kwarg reconstruction as run_callable()
                     has_named = any(
