@@ -987,12 +987,28 @@ def _wrap_view_reshape(original_fn, fn_name):
     @functools.wraps(original_fn)
     def wrapper(self, *shape):
         # Handle special case: view(dtype)
+        # A dtype view reinterprets the same storage: every dimension keeps its
+        # size and taint, except the last one, which scales by the itemsize
+        # ratio when the element width changes (bf16 -> int8 doubles it).
+        # vLLM 0.32 ends VocabParallelEmbedding.forward with
+        # ``output.view(output_dtype)``, so dropping the taints here untaints
+        # the whole first decoder layer.
         if fn_name == 'view' and len(shape) == 1 and isinstance(shape[0], torch.dtype):
             TaintedTensor._inside_hook.active = True
             try:
-                return original_fn(self, shape[0])
+                out = original_fn(self, shape[0])
             finally:
                 TaintedTensor._inside_hook.active = False
+            in_taints = getattr(self, '_dim_taints', None)
+            if (in_taints is None or isinstance(out, TaintedTensor)
+                    or len(in_taints) != out.dim()):
+                return out
+            out_taints = list(in_taints)
+            if out.dim() and shape[0].itemsize != self.dtype.itemsize:
+                out_taints[-1] = None
+            if not any(t is not None for t in out_taints):
+                return out
+            return TaintedTensor(out, tuple(out_taints))
 
         # Flatten shape args
         if len(shape) == 1 and isinstance(shape[0], (tuple, list, TaintedShape)):
@@ -1795,26 +1811,17 @@ def _wrap_squeeze(original_fn):
                             output_taints.append(None)
                     # else: skip size-1 dimensions
             else:
-                # Mode 2: Remove specific dimension if it has size 1
-                # Normalize negative dim
+                # Mode 2: remove the given dimension(s) that have size 1.
+                # ``dim`` may be an int or, since torch 2.0, a tuple of ints
+                # (vLLM 0.32 Mamba bind_kv_cache: ``squeeze(dim=(1, 2))``).
                 input_ndim = len(input_shape)
-                if dim < 0:
-                    dim = input_ndim + dim
-
-                # Check if the dimension was actually removed (had size 1)
-                if dim < len(input_shape) and input_shape[dim] == 1:
-                    # Build output taints by skipping the specified dimension
-                    output_taints = []
-                    for i in range(input_ndim):
-                        if i != dim:
-                            if i < len(input._dim_taints):
-                                output_taints.append(input._dim_taints[i])
-                            else:
-                                output_taints.append(None)
-                else:
-                    # Dimension was not removed (didn't have size 1)
-                    # Preserve all taints unchanged
-                    output_taints = list(input._dim_taints)
+                dims = dim if isinstance(dim, (tuple, list)) else (dim,)
+                removed = {d + input_ndim if d < 0 else d for d in dims}
+                removed = {d for d in removed if d < input_ndim and input_shape[d] == 1}
+                output_taints = [
+                    (input._dim_taints[i] if i < len(input._dim_taints) else None)
+                    for i in range(input_ndim) if i not in removed
+                ]
 
             return TaintedTensor(result, tuple(output_taints))
 
