@@ -74,12 +74,26 @@ The tracer keeps only `cpu_op`, `kernel`, `user_annotation` events in the
 exported JSON (the parser reads nothing else): 270 MB → 98 MB, ~11 s saved per
 run. Kimi-Linear end-to-end: 21.5 min → 3.3 min.
 
+### MIX dimensions follow the sweep
+A MIX dimension is a product of a workload axis and a model constant (e.g. the
+flattened tokens x heads tensor `MIX(8064)[hist:NUM_TOKS:504,MODEL_CONFIG:16]`).
+Three defects kept its components empty or wrong: the parser read history
+pairs as `qty:taint` while the tracer writes `taint:qty`; `strip('[]')` ate
+the closing bracket of a history that ends an input list; and the generator
+matched component labels by substring, so `MAX_NUM_REQS` buffer bounds would
+have been swept as requests. Now: both pair orders parse, brackets are left
+to the regex, and `input_generator._component_axis` maps labels exactly onto
+the `DimensionType` values (MAX_* and MODEL_CONFIG are fixed factors). The
+trace parser warns when an anchor still has a MIX dim without components.
+Validation: `taint_parse_test.py` drives the real `InputGenerator` on GPU with a
+synthetic `aten::mul.Tensor` over `[MIX(NUM_TOKS*16), 128]` inputs, asserts
+every sweep point produces `[num_tokens*16, 128]` tensors and runs the op; a
+`MAX_NUM_REQS*MODEL_CONFIG` dim stays fixed. On the Kimi-Linear and Llama
+traces all 345 MIX annotations parse with components (0 before). No profiled
+anchor has a MIX input in any trace so far, so databases are unaffected; Llama
+re-profiled identically before/after.
+
 ### Open
-- MIX dimension components: tracer writes `hist:taint:qty`, parser expected
-  `qty:taint`, so components were always empty and MIX dims stayed fixed during
-  sweeps; the generator also matched labels by substring (`MAX_NUM_REQS` would
-  be swept). No profiled anchor has a MIX input in any trace so far. Being
-  fixed next.
 - First KDA layer also carries vLLM's per-forward cached chunk tables; no
   longer visible in signatures, but that per-forward cost is not recorded
   anywhere.

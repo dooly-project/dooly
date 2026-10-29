@@ -46,8 +46,9 @@ def _make_dimension(label: str, value: int, hist: str) -> TaintDimension:
     ``MAX_<label>`` folds onto its base type (MAX_NUM_TOKS -> NUM_TOKENS).
     A label that is not a sweepable workload axis ("?", "SINGLETON", any
     label this profiler does not know) is MODEL_CONFIG: fixed, never swept.
-    MIX history is parsed as "qty:taint" pairs, as before; a pair that does
-    not fit that form is skipped.
+    MIX history pairs are "taint:qty" as the tracer writes them
+    (tensor._format_dim: ``f"{taint}:{qty}"``); the legacy "qty:taint" order
+    is accepted too. A pair with no integer side is skipped.
     """
     base = label[4:] if label.startswith("MAX_") else label
     dim_type = _LABEL_TO_TYPE.get(base, DimensionType.MODEL_CONFIG)
@@ -55,13 +56,13 @@ def _make_dimension(label: str, value: int, hist: str) -> TaintDimension:
     if dim_type == DimensionType.MIX:
         components = {}
         for component in (hist or "").split(","):
-            parts = component.strip().split(":")
-            if len(parts) == 2:
-                qty_str, taint_name = parts
-                try:
-                    components[taint_name] = int(qty_str)
-                except ValueError:
-                    pass
+            parts = [x.strip() for x in component.split(":")]
+            if len(parts) != 2:
+                continue
+            if parts[1].isdigit():          # taint:qty (tracer)
+                components[parts[0]] = int(parts[1])
+            elif parts[0].isdigit():        # qty:taint (legacy)
+                components[parts[1]] = int(parts[0])
     return TaintDimension(dim_type, value, components)
 
 
@@ -92,8 +93,10 @@ def parse_taint_string(taint_name: str) -> List[TaintInput]:
             # print(f"[DEBUG @ taint.py] taint_inputs: {taint_inputs}")
             continue
 
-        # Remove outer brackets if present
-        input_str = input_str.strip('[]')
+        # Do not strip brackets: the outer [[...]] match already consumed the
+        # list's own brackets, and a trailing "]" here belongs to a MIX
+        # history ("MIX(n)[hist:...]" as the last dim) that the regex below
+        # needs intact. _DIM_RE ignores stray brackets anyway.
 
         # print(f"[DEBUG @ taint.py] input_str: {input_str}")
 

@@ -60,10 +60,65 @@ def test_known_labels_and_max_prefix():
     assert _types(inputs[0]) == [NT, NR, NR, MC, MC]
 
 
-def test_mix_history_unchanged():
-    inputs = parse_taint_string("op IN:[[MIX(240)[hist:6:NUM_TOKS,40:MODEL_CONFIG], MODEL_CONFIG(128)]]")
-    d = inputs[0].dimensions[0]
+def test_mix_history_tracer_order_and_legacy_order():
+    # tracer writes taint:qty (tensor._format_dim); older strings had qty:taint
+    d = parse_taint_string("op IN:[[MIX(8064)[hist:NUM_TOKS:504,MODEL_CONFIG:16], MODEL_CONFIG(128)]]")[0].dimensions[0]
+    assert d.dim_type == MIX and d.value == 8064 and d.components == {"NUM_TOKS": 504, "MODEL_CONFIG": 16}, d
+    d = parse_taint_string("op IN:[[MIX(240)[hist:6:NUM_TOKS,40:MODEL_CONFIG], MODEL_CONFIG(128)]]")[0].dimensions[0]
     assert d.dim_type == MIX and d.value == 240 and d.components == {"NUM_TOKS": 6, "MODEL_CONFIG": 40}
+    d = parse_taint_string("op IN:[[MIX(1077248)[hist:MAX_NUM_REQS:1,MODEL_CONFIG:1]]]")[0].dimensions[0]
+    assert d.components == {"MAX_NUM_REQS": 1, "MODEL_CONFIG": 1}
+
+
+def test_mix_component_axis_is_exact_label():
+    from doolyprof.profiler.input_generator import _component_axis
+    assert _component_axis("NUM_TOKS") == "num_tokens"
+    assert _component_axis("NUM_REQS") == "num_requests"
+    assert _component_axis("MAX_NUM_REQS") is None     # buffer bound: fixed, not swept
+    assert _component_axis("MAX_NUM_TOKS") is None
+    assert _component_axis("MODEL_CONFIG") is None and _component_axis("?") is None
+
+
+def _mix_module(taint, dims):
+    from doolyprof.profiler.module import ModuleInfo
+    inputs = extract_inputs_from_taint(taint, trace_input_dims=dims, trace_input_dtypes=["c10::BFloat16"] * len(dims))
+    return ModuleInfo(module_name="synthetic", operation_name="aten::mul.Tensor", inputs=inputs, dtype="bfloat16")
+
+
+def test_generator_sweeps_mix_dimension_with_tokens():
+    """End-to-end through the real generator on GPU: a flattened tokens x heads tensor
+    (MIX = NUM_TOKS * 16) must follow the token sweep, and the op must run on the result."""
+    import torch
+    if not torch.cuda.is_available():
+        print("SKIP (no CUDA)"); return
+    from doolyprof.profiler.input_generator import InputGenerator
+    taint = ("aten::mul.Tensor IN:[[MIX(8064)[hist:NUM_TOKS:504,MODEL_CONFIG:16], MODEL_CONFIG(128)] | "
+             "[MIX(8064)[hist:NUM_TOKS:504,MODEL_CONFIG:16], MODEL_CONFIG(128)]]")
+    module = _mix_module(taint, [[8064, 128], [8064, 128]])
+    assert module.inputs[0].dimensions == [MIX, MC] and module.inputs[0].dimension_components[0] == {"NUM_TOKS": 504, "MODEL_CONFIG": 16}
+    gen = InputGenerator(module, max_num_request=4, max_num_token=256, test_counts=3)
+    configs = gen.prepare_inputs(mode="vidur", use_batch_config=False)
+    assert configs and len({c["num_tokens"] for c in configs}) > 1, configs  # the token axis is swept
+    for cfg in configs:
+        tensors, params = gen._create_tensor_inputs_from_params(cfg)
+        expect = (params["num_tokens"] * 16, 128)
+        assert tuple(tensors[0].shape) == expect and tuple(tensors[1].shape) == expect, (cfg, tensors[0].shape)
+        out = torch.ops.aten.mul.Tensor(tensors[0], tensors[1])
+        assert tuple(out.shape) == expect
+    torch.cuda.synchronize()
+
+
+def test_generator_keeps_max_bound_mix_fixed():
+    import torch
+    if not torch.cuda.is_available():
+        print("SKIP (no CUDA)"); return
+    from doolyprof.profiler.input_generator import InputGenerator
+    taint = "aten::mul.Tensor IN:[[MIX(538624)[hist:MAX_NUM_REQS:263,MODEL_CONFIG:2048]] | [MIX(538624)[hist:MAX_NUM_REQS:263,MODEL_CONFIG:2048]]]"
+    module = _mix_module(taint, [[538624], [538624]])
+    gen = InputGenerator(module, max_num_request=4, max_num_token=256, test_counts=3)
+    for cfg in ({"num_tokens": 8, "num_requests": 1}, {"num_tokens": 256, "num_requests": 4}):
+        tensors, _ = gen._create_tensor_inputs_from_params(cfg)
+        assert tuple(tensors[0].shape) == (538624,), tensors[0].shape  # MAX_* bound: never swept
 
 
 def test_event_dims_from_taint_string_keeps_singleton():
