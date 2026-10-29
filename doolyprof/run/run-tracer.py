@@ -249,6 +249,13 @@ if __name__ == "__main__":
         # Check weight shapes to verify sharding
         print(f"\n=== Checking weight shapes (should be divided by TP={FAKE_TP}) ===")
         model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+        # The V2 model runner (default in vLLM 0.32) samples with a plain class,
+        # not an nn.Module; annotate its calls like a module so the sampling
+        # ops are attributed and profiled (see hooks.annotate_engine_callable).
+        from doolyprof.tracer.hooks import annotate_engine_callable, engine_callables
+        for _name, _obj in engine_callables(llm.llm_engine.model_executor.driver_worker.model_runner).items():
+            if annotate_engine_callable(_obj):
+                print(f"[Tracer] Annotating {type(_obj).__qualname__} calls as MODULE")
         from doolyprof.tracer.hooks import register_module_paths
         print(f"[Tracer] Recorded paths of {register_module_paths(model)} modules for PATH: annotations")
         for name, param in model.named_parameters():

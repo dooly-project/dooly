@@ -39,10 +39,50 @@ engine's own signature / attributes, never from a version string.
 | 7 | Kimi dedup crash `unhashable type: 'list'` | KDA metadata `torch.cat([zero, cu_seqlens])`: Kineto records a TensorList as one input holding a list of shapes, the taint string has one segment per tensor; finput paired them 1:1, misaligning every later argument | `ProfileInput` type `TensorList` with `elements`; finput consumes one taint segment per element; generator builds a list; signature params `input{i}_t{k}_dim{j}` |
 | 8 | MoE profiled 1-D (DSv2 35 rows instead of 168) | `FusedMoE` class replaced by `FusedMoEFactory` -> `MoERunner`; router `_get_indices_type` gone, `_compute_routing` gains `input_ids` | `moe_hook` finds the MoE layer by its `FusedMoEConfig` (`moe_config`) + `router`; top-k / experts from that config; forced routing takes the caller's `indices_type` |
 | 9 | Kimi KDA and Qwen3.5 full-attention compute absent from the profile (274 orphan kernels) | KDA / GDN / gated-norm / fused qk-norm-rope kernels are Triton driver launches outside any aten op; Kineto gives them no `External id` | `tracer/kineto_links.py` rebuilds the link from Kineto's `correlation` (innermost CPU event enclosing the launch) before the export filter drops launch events; parser indexes MODULE/COMPILE events and anchors a kernel whose direct parent is a MODULE to that module |
+| 10 | sampling cost missing from every 0.32 profile | V2 runner (0.32 default) samples with a plain `Sampler` class (Triton Gumbel / block argmax), not an `nn.Module`: no MODULE scope, and the object is on the runner, not in the model | tracer wraps `__call__` of non-Module runner components (`hooks.ENGINE_CALLABLE_ATTRS = ("sampler",)`) in the usual MODULE annotation; resolver falls back to the runner when a MODULE is not in the model and profiles it through `vllm_compat.EngineSamplerCall`, which builds the batch with the runner's own `InputBatch.make_dummy` (as `_dummy_sampler_run` does) |
 
 Not bugs, recorded: the `Invalid process group specified` traceback at engine
 shutdown is harmless (fake TP group teardown); `_C::vocab_parallel_embedding`
 replaces the embedding module entry (one fused kernel now).
+
+### Validation (5 models, 256 tok / batch 2; Llama & Kimi at fake TP 2)
+- Sampler (fix 10): every model on 0.32 / V2 gains one `Sampler` signature
+  (2 rows, swept over requests; Llama 0.033 / 0.040 ms at 1 / 2 requests vs
+  0.04 ms for 0.17's argmax + to.dtype). On 0.17 and on 0.32 with
+  `VLLM_USE_V2_MODEL_RUNNER=0` the sampler is an nn.Module, nothing is wrapped,
+  and the V1 argmax / to.dtype rows are profiled as before (Llama 491 rows on
+  both, identical apart from the fused embedding op).
+- 0.32 vs 0.17 baseline: Llama 491 -> 485 rows before fix 10;
+  DSv2 / gpt-oss MoE rows equal (168 / 134); Kimi MoE 195 = 195, KDA module
+  168 = 168 (now `KimiGatedDeltaNetAttention`), MLA via `MultiHeadLatentAttention`;
+  Qwen3.5 GDN layer now profiled (168 rows; 0 rows on 0.17).
+- 0.17 rerun with the new code vs the original HEAD baseline: identical on all
+  five models except Qwen3.5 gaining `MRotaryEmbedding` (its Triton mrope
+  kernel was an orphan before, fix 9) and Kimi's KDA gate kernel folding into
+  the KDA module (same row count).
+- Unit tests (both envs): signature_fields 12, taint_parse 16, tracer_ops 7
+  (new file: view(dtype), squeeze tuple dims, kernel link repair, engine
+  callable annotation); the tracer_ops tests fail on the unfixed
+  code.
+
+### Open (0.32)
+- Sampler profile covers the greedy path only (the tracer's temperature-0
+  requests; dummy slots default to temperature 0). Random / top-k / top-p /
+  penalties / logprobs paths cost more and are not swept.
+- GemmaRMSNorm (Qwen3.5) runs vLLM IR's native decomposition eagerly (fp32
+  weight fails `vllm_c`'s dtype check) and is profiled as separate
+  pow/mean/rsqrt/mul ops instead of one compiled module.
+- Raw-op dummy runs still fail on `aten::pad` (mode/value order),
+  `_vllm_fa2_C::varlen_fwd` (optional tensor args) and
+  `vllm::moe_forward_shared` (`input_ids`); all recover by walking up.
+- Fix 9 can make a whole module the anchor (Qwen3NextAttention now profiled as
+  one unit incl. its projections), coarser than before.
+- DoolySim on 0.32: its emulator stubs `GPUModelRunner.profile_run` of the V1
+  runner only; with the V2 default it needs `VLLM_USE_V2_MODEL_RUNNER=0` or the
+  same stub on `vllm.v1.worker.gpu.model_runner`. Not changed.
+- Kimi-K3 still needs Blackwell for MXFP4 kernels and its size (~1.56 TB) far
+  exceeds one A100 shard even with EP; layer truncation (`hf_overrides`) is the
+  path to try next on this machine.
 
 ---
 

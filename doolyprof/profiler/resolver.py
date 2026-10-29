@@ -237,6 +237,22 @@ class ModuleResolver:
             print(f"[RESOLVER]   Import error for {module.operation_name}: {e}")
             return None
 
+    def _engine_callable(self, class_name: str) -> Optional[Callable]:
+        """A traced MODULE that is a per-step runner component rather than part
+        of the model (vLLM 0.32 V2-runner Sampler, see hooks.engine_callables),
+        wrapped so it can be called with the traced tensor inputs alone."""
+        runner = getattr(self.vlp, 'model_runner', None)
+        if runner is None:
+            return None
+        from doolyprof.tracer.hooks import engine_callables
+        obj = engine_callables(runner).get(class_name)
+        if obj is None:
+            return None
+        from doolyprof.profiler.utils.vllm_compat import EngineSamplerCall
+        if obj is getattr(runner, 'sampler', None):
+            return EngineSamplerCall(obj, runner)
+        return None
+
     def _import_module(self, module: ModuleInfo) -> Optional[Callable]:
         """Try getting a module callable via make_dict + get_submodule.
 
@@ -257,6 +273,10 @@ class ModuleResolver:
 
         paths = self._name_to_module.get(lookup_name)
         if not paths:
+            engine_obj = self._engine_callable(lookup_name)
+            if engine_obj is not None:
+                print(f"[RESOLVER]   Found '{lookup_name}' on the model runner (not an nn.Module)")
+                return engine_obj
             print(f"[RESOLVER]   Module '{lookup_name}' not found in model dict")
             return None
 
