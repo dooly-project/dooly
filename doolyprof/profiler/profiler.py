@@ -1000,10 +1000,13 @@ class Profiler:
             # MoE 2-D sweep: if this module is (or contains) a FusedMoE, read top_k /
             # num_experts from the live layer so the InputGenerator builds the
             # (num_tokens, activated_experts) grid and we can force routing when timing.
-            from doolyprof.profiler.moe_hook import find_fused_moe
+            from doolyprof.profiler.moe_hook import (
+                find_fused_moe, moe_top_k as _moe_top_k, moe_num_local_experts)
             fused_moe = find_fused_moe(callable_obj) if module.is_module else None
-            moe_top_k = getattr(fused_moe, "top_k", None) if fused_moe is not None else None
-            moe_num_experts = getattr(fused_moe, "global_num_experts", None) if fused_moe is not None else None
+            moe_top_k = _moe_top_k(fused_moe) if fused_moe is not None else None
+            # Experts held by this rank: the activated-experts sweep and the
+            # forced routing are per rank (equal to all experts without EP).
+            moe_num_experts = moe_num_local_experts(fused_moe) if fused_moe is not None else None
 
             generator = InputGenerator(
                 module=module,
