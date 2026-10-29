@@ -66,13 +66,46 @@ missing leading dim was padded as MODEL_CONFIG, and the token count leaked into
 embedding and MLA signatures (504 vs 36 at different trace batches). Verified:
 Kimi-Linear traced at 504 and 300 tokens gives identical signature tables.
 
-### Parser speed
+### Parsing savings
 Taint association uses a per-base-name index with a bisect time window instead
-of scanning all taints for every event (1.34 billion checks → 5,443 candidate
-visits; parse+map 8.5 min → 2.6 s on the same 270 MB trace, identical output).
+of scanning all taints for every event (`HierarchicalTraceParser._taint_index`).
 The tracer keeps only `cpu_op`, `kernel`, `user_annotation` events in the
-exported JSON (the parser reads nothing else): 270 MB → 98 MB, ~11 s saved per
-run. Kimi-Linear end-to-end: 21.5 min → 3.3 min.
+exported JSON; the parser reads nothing else.
+
+Isolated benchmark, same input for both versions: the 270 MB Kimi-Linear-48B
+trace from before the warm-up change (1,329,293 events, 5,489 taint
+annotations, 244,634 events that look up taints), CPU only
+(`doolyprof/tests/parse_benchmark.py`):
+
+| stage | before (25b143a) | after | 
+|---|---|---|
+| JSON load | 4.7 s | 4.7 s |
+| `parse_from_events` (tree, pruning, taint association) | 178.7 s | 1.8 s |
+| `extract_module_to_operation_mapping` | 330.9 s | 0.8 s |
+| parse + mapping | 509.6 s | 2.6 s (196x) |
+| taint overlap checks | 1,342,796,026 | 5,443 |
+| output | 598 hierarchies, 52 distinct | identical |
+
+Pre-filtering the trace did not help the old parser (183.2 s + 339.0 s), so
+the parse-time saving is the index alone. The export filter pays elsewhere:
+file 270 MB → 98 MB, `json.dump` in the tracer 15.3 s → 5.7 s, reload in the
+profiler 4.7 s → 3.0 s, about 11 s per run.
+
+In the pipeline, Kimi-Linear-48B at fake TP 2 with a 256-token sweep (the
+warm-up also removed the ~107k-op autotune burst, so the parsed trace fell
+from 1.33M to 29.5k events; the module count fell with the layer-index
+exclusion):
+
+| stage | before | after |
+|---|---|---|
+| trace export | 126 s | 44 s |
+| parse + dedup | ~8.5 min | 9 s |
+| resolve | ~1.8 min | 58 s |
+| profiling | 550 s (32 modules) | 83 s (13 modules) |
+| end to end | 21 min 34 s | 3 min 15 s |
+
+For Llama-3.1-8B (4 MB traces) parsing was never the bottleneck; end to end
+stays at about 1 min.
 
 ### MIX dimensions follow the sweep
 A MIX dimension is a product of a workload axis and a model constant (e.g. the
