@@ -308,11 +308,17 @@ class HierarchicalTraceParser:
                 # Push this event as potential parent
                 stack.append(event)
 
-        # 3. Pre-build cpu_op index by external_id for faster kernel linking
+        # 3. Pre-build cpu_op index by external_id for faster kernel linking.
+        # MODULE / COMPILE annotations are indexed too: a kernel launched
+        # outside any aten op (Triton driver launch) carries the External id
+        # of its enclosing annotation (see tracer/kineto_links.py).
         cpu_op_by_external_id = defaultdict(list)
         for cpu_op in self.cpu_ops:
             if cpu_op.external_id is not None:
                 cpu_op_by_external_id[cpu_op.external_id].append(cpu_op)
+        for ev in self.events:
+            if ev.cat in ('module', 'compile') and ev.external_id is not None:
+                cpu_op_by_external_id.setdefault(ev.external_id, []).append(ev)
 
         # 4. Link GPU Kernels to CPU Ops using index
         for kernel in self.kernels:
@@ -699,6 +705,14 @@ class HierarchicalTraceParser:
         Returns:
             The nearest tainted ancestor Event, or None if no tainted ancestor is found.
         """
+        # A kernel whose launch sits directly in a MODULE scope, with no cpu op
+        # in between (a Triton driver launch from the module's forward, linked
+        # by tracer/kineto_links.py), anchors to that module: like a compile
+        # scope, the MODULE annotation carries its own input taints. Only the
+        # direct parent qualifies, so kernels under untainted cpu ops still
+        # walk up as before and never promote an outer module to an anchor.
+        if event is not None and event.cat == 'module' and event.params:
+            return event
         current = event
         # print(f"DEBUG: Searching ancestor for {event.name}")
         while current is not None:
