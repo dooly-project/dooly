@@ -57,6 +57,12 @@ tracer now runs one warm-up `generate()` on the exact prompts with taint
 tracking off before the profiled one, and sets `enable_prefix_caching=False`
 (vLLM only disables it for hybrid models; Llama's prefill would otherwise be
 served from cache). `run-e2e.py --trace-batch-size` is the requested minimum.
+Follow-up the same day: with the default 47-token prompt the batch is capped
+at 11 by `max_num_batched_tokens=521`, so models that register every small
+integer (Kimi-Linear 2..27, Llama-4 Scout 2..48) had no admissible batch and
+the tracer raised. `choose_trace_batch` now shortens the prompt to the
+longest length that admits a collision-free batch (prompt content is
+irrelevant to tracing): Kimi-Linear 47 → 18 tokens x 28, Scout 48 → 10 x 51.
 
 ### Taint-string parser keeps every dimension
 `profiler/taint.py` matches the tracer's label shape `LABEL(N)[hist:...]`
@@ -126,10 +132,52 @@ traces all 345 MIX annotations parse with components (0 before). No profiled
 anchor has a MIX input in any trace so far, so databases are unaffected; Llama
 re-profiled identically before/after.
 
+### Kernel-match audit: is the state hash enough to pick a layer instance?
+Resolution maps a traced class to one live submodule path (e.g.
+`model.layers.0.self_attn`). After filtering candidates by state hash the
+resolver runs a "kernel-match": a dummy forward of each candidate under the
+torch profiler until one launches the traced kernel set. For Kimi-Linear that
+single profiled forward costs 38 s (first Triton autotune in the process) and
+is paid again in the profiling phase. Audit (scratch instrumentation, not in
+the repo): capture kernels for EVERY state-filtered candidate and check
+whether the first one already matches.
+
+| model / backend | class | candidates after state filter | first matches | all match |
+|---|---|---|---|---|
+| Llama-3.1-8B / FLASHINFER | Attention | 32 of 32 | yes | 32/32 |
+| Command R7B / FLASH_ATTN | Attention (global, sliding) | 8 of 32, 24 of 32 | yes | all |
+| Gemma-2-2b / FLASHINFER | Attention (global, sliding) | 13 of 26, 13 of 26 | yes | all |
+| gpt-oss-20b / TRITON_ATTN (sinks) | Attention (full, sliding 128) | 12 of 24, 12 of 24 | yes | all |
+| gpt-oss-20b | FusedMoE | 24 | yes | 24/24 |
+| Qwen3-30B-A3B / FLASHINFER | Attention | 48 | yes | 48/48 |
+| Kimi-Linear / TRITON_MLA | KimiDeltaAttention | 20 | yes | 20/20 |
+
+The only kernel-set difference among same-state candidates is a one-time
+elementwise / RNG kernel on the first instance, never part of the traced set.
+Where kernel-match cannot match at all (Gemma / Command R norm layers,
+DeepSeek-V2-Lite and Kimi MLA, DeepSeek / Kimi MoE: dummy routing or
+metadata differs from the trace) the resolver already falls back to the first
+path and resolution succeeds. Conclusion: with the engine-derived state hash,
+kernel-match never changed the chosen path on any audited model; it can be
+skipped when all state-filtered candidates share the hash (fallback only when
+the state hash is empty). Not yet implemented.
+
+Models that could not be audited (pre-existing tracer / backend issues, not
+regressions): Nemotron-51B (DeciLM) fails at model construction,
+`num_attention_heads // n_heads_in_group` with `None` for its 18
+replace-with-linear blocks; Llama-4 Scout fails in the tracer with
+`unhashable type: numpy.ndarray`; Gemma-3-27b (multimodal) rejects
+FLASHINFER and FLASH_ATTN ("partial multimodal token full attention").
+
 ### Open
 - First KDA layer also carries vLLM's per-forward cached chunk tables; no
   longer visible in signatures, but that per-forward cost is not recorded
   anywhere.
+- Resolution: skip kernel-match when state-filtered candidates are
+  interchangeable; reuse the resolver's chosen path in the profiling phase;
+  share one engine between resolution and profiling (see audit above).
+- Tracer support gaps found by the audit: Nemotron-51B, Llama-4 Scout,
+  Gemma-3 multimodal (details above).
 
 ---
 
