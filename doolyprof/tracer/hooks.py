@@ -561,6 +561,12 @@ def _module_call_wrapper(self, *args, **kwargs):
     This allows us to capture taint info at the Module level, so if leaf operations
     don't have taints, we can walk up the hierarchy to find a tainted Module.
     """
+    with record_function(_module_annotation(self, args, kwargs)):
+        return _original_module_call(self, *args, **kwargs)
+
+
+def _module_annotation(self, args, kwargs) -> str:
+    """The ``MODULE: <class> IN:[...] ...`` annotation for one call of ``self``."""
     module_name = self.__class__.__name__
 
     # Collect taint info from input tensors
@@ -640,9 +646,54 @@ def _module_call_wrapper(self, *args, **kwargs):
             annotated_name += f" PATH:{_path}"
     except Exception:
         annotated_name = f"MODULE: {module_name} (Log Error)"
+    return annotated_name
 
-    with record_function(annotated_name):
-        return _original_module_call(self, *args, **kwargs)
+
+# Per-step engine components that live on the model runner, not in the model,
+# named by the runner attribute vLLM stores them under. Only those that are not
+# nn.Modules need anything (the V1 runner's Sampler is one and is traced and
+# resolved like any module op).
+ENGINE_CALLABLE_ATTRS = ("sampler",)
+
+
+def engine_callables(model_runner) -> dict:
+    """``{class name: object}`` for the runner's ENGINE_CALLABLE_ATTRS
+    components that are plain callables rather than nn.Modules."""
+    out = {}
+    for attr in ENGINE_CALLABLE_ATTRS:
+        obj = getattr(model_runner, attr, None)
+        if obj is not None and callable(obj) and not isinstance(obj, torch.nn.Module):
+            out[type(obj).__name__] = obj
+    return out
+
+
+def annotate_engine_callable(obj) -> bool:
+    """Give calls of an engine component that is not an ``nn.Module`` the same
+    MODULE annotation modules get, by wrapping its class's ``__call__``.
+
+    vLLM 0.32's default (V2) model runner samples with a plain ``Sampler``
+    class instead of the V1 ``nn.Module``; without a MODULE scope its ops
+    (argmax, gather, ...) belong to no module and the resolver skips them.
+    The caller passes the object the engine actually uses
+    (``model_runner.sampler``), so no class is named here. Returns True if a
+    wrapper was installed; nn.Modules and already-wrapped classes are left alone.
+    """
+    if obj is None or isinstance(obj, torch.nn.Module):
+        return False
+    cls = type(obj)
+    original = cls.__call__
+    if getattr(original, "_dooly_annotated", False):
+        return False
+
+    @functools.wraps(original)
+    def _annotated_call(self, *args, **kwargs):
+        with record_function(_module_annotation(self, args, kwargs)):
+            return original(self, *args, **kwargs)
+
+    _annotated_call._dooly_annotated = True
+    _annotated_call._dooly_original = original
+    cls.__call__ = _annotated_call
+    return True
 
 def patch_module_call():
     """Patch nn.Module.__call__ to log taint information."""

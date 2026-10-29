@@ -5,6 +5,8 @@ code calls on the hot path.
   ``bind_kv_cache`` raised ``'<' not supported between tuple and int``).
 * Kernels launched through the CUDA driver API outside an aten op (Triton)
   get the External id of the innermost CPU event enclosing their launch.
+* A non-``nn.Module`` engine component (vLLM 0.32 V2-runner ``Sampler``) gets a
+  ``MODULE:`` annotation around its calls; nn.Modules are left alone.
 * ``view(dtype)`` must keep the dimension taints (vLLM 0.32 ends
   ``VocabParallelEmbedding.forward`` with ``output.view(output_dtype)``; losing
   them untainted the first decoder layer's norm and QKV projection).
@@ -90,6 +92,44 @@ def test_driver_launched_kernel_gets_enclosing_external_id():
     assert attach_launch_external_ids(ev) == 2
     by_name = {e["name"]: e["args"].get("External id") for e in ev if e["cat"] == "kernel"}
     assert by_name == {"chunk_kda_fwd": 10, "layer_norm_gated": 11, "gemm": 12}, by_name
+
+
+def test_engine_callable_annotated_like_module():
+    from doolyprof.tracer.hooks import annotate_engine_callable
+
+    class Sampler:  # stands in for vllm.v1.worker.gpu.sample.sampler.Sampler
+        def __call__(self, logits, input_batch=None):
+            return logits.argmax(dim=-1)
+
+    logits = TaintedTensor(torch.zeros(5, 32), (Taint("NUM_REQS"), Taint("MODEL_CONFIG")))
+    sampler = Sampler()
+    assert annotate_engine_callable(sampler)
+    assert not annotate_engine_callable(Sampler())        # already wrapped
+    assert not annotate_engine_callable(torch.nn.Linear(2, 2))
+    from torch.profiler import profile, ProfilerActivity
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
+        out = sampler(logits)
+    assert tuple(out.shape) == (5,)
+    names = [e.name for e in prof.events() if e.name.startswith("MODULE: Sampler")]
+    assert names and "NUM_REQS(5)" in names[0], names
+
+
+def test_engine_callables_skip_modules():
+    from doolyprof.tracer.hooks import engine_callables
+
+    class PlainSampler:
+        def __call__(self, logits, input_batch):
+            return logits
+
+    class V2Runner:
+        sampler = PlainSampler()
+
+    class V1Runner:
+        sampler = torch.nn.Identity()  # V1 runner: Sampler is an nn.Module
+
+    assert list(engine_callables(V2Runner())) == ["PlainSampler"]
+    assert engine_callables(V1Runner()) == {}
+    assert engine_callables(object()) == {}
 
 
 if __name__ == "__main__":

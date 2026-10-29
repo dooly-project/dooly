@@ -75,3 +75,34 @@ def fill_slot_mapping(bt, num_reqs, req_indices, positions, query_start_loc):
         bt.commit_block_table(num_reqs)
         bt.commit_slot_mapping(len(positions))
 
+
+class EngineSamplerCall:
+    """Profiling callable for a model-runner sampler that is not an nn.Module.
+
+    vLLM 0.32's default (V2) runner samples with ``sampler(logits,
+    input_batch)``. The trace records only ``logits`` ([NUM_REQS, vocab]); the
+    batch is runner state. This builds it the way the runner's own
+    ``_dummy_sampler_run`` does, ``InputBatch.make_dummy(n, n,
+    runner.input_buffers)`` with ``InputBatch`` taken from the runner's module,
+    once per batch size (outside the timed call), and then calls
+    ``sampler(logits, batch)``. Slots that never received a request sample
+    greedily (temperature 0), the same path as the tracer's requests.
+    """
+
+    def __init__(self, sampler, model_runner):
+        import sys
+        self.sampler = sampler
+        self.model_runner = model_runner
+        self._input_batch_cls = getattr(sys.modules[type(model_runner).__module__], "InputBatch")
+        self._batch = None
+        self._num_reqs = None
+
+    def __call__(self, logits):
+        n = int(logits.shape[0])
+        if n != self._num_reqs:
+            self._batch = self._input_batch_cls.make_dummy(n, n, self.model_runner.input_buffers)
+            self._num_reqs = n
+        return self.sampler(logits, self._batch)
+
+    def parameters(self):
+        return iter(())
