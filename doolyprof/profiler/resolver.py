@@ -32,6 +32,16 @@ def _dim_is_requests(dim) -> bool:
     return 'NUM_REQ' in name.upper()
 
 
+def _tensor_parts(inputs):
+    """Tensor ProfileInputs among ``inputs``, TensorList elements included."""
+    for inp in inputs:
+        parts = getattr(inp, 'tensor_parts', None)
+        if parts is not None:
+            yield from parts()
+        elif getattr(inp, 'type', None) == 'Tensor':
+            yield inp
+
+
 def _extract_num_tokens_from_inputs(inputs) -> Optional[int]:
     """Find the trace's NUM_TOKS value by inspecting Tensor inputs.
 
@@ -40,9 +50,7 @@ def _extract_num_tokens_from_inputs(inputs) -> Optional[int]:
     Tensor input if no explicit NUM_TOKS tag is present.
     """
     fallback = None
-    for inp in inputs:
-        if getattr(inp, 'type', None) != 'Tensor':
-            continue
+    for inp in _tensor_parts(inputs):
         dims = getattr(inp, 'dimensions', None) or []
         shape = getattr(inp, 'actual_shape', None) or []
         if not shape:
@@ -57,9 +65,7 @@ def _extract_num_tokens_from_inputs(inputs) -> Optional[int]:
 
 def _extract_num_requests_from_inputs(inputs) -> Optional[int]:
     """Same idea as _extract_num_tokens_from_inputs, for NUM_REQS dims."""
-    for inp in inputs:
-        if getattr(inp, 'type', None) != 'Tensor':
-            continue
+    for inp in _tensor_parts(inputs):
         dims = getattr(inp, 'dimensions', None) or []
         shape = getattr(inp, 'actual_shape', None) or []
         for i, d in enumerate(dims):

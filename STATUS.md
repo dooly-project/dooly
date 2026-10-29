@@ -36,6 +36,7 @@ engine's own signature / attributes, never from a version string.
 | 4 | `compute_slot_mapping() missing 'positions'` -> no attention metadata (MLA wrapper unresolvable) | slot mapping now a GPU kernel over `(num_reqs, query_start_loc, positions)` reading the committed device table | `fill_slot_mapping`, contract chosen by parameter names |
 | 5 | first decoder layer untainted (layer-0 norm/QKV missing, 31 of 32 layers) | `VocabParallelEmbedding.forward` ends with `output.view(output_dtype)`; tracer's `view(dtype)` returned a plain tensor | keep taints through `view(dtype)` (last dim untainted if itemsize changes) |
 | 6 | Kimi / Qwen3.5 tracer crash `'<' not supported between tuple and int` | Mamba `bind_kv_cache` calls `squeeze(dim=(1, 2))` | tuple dims in the squeeze wrapper |
+| 7 | Kimi dedup crash `unhashable type: 'list'` | KDA metadata `torch.cat([zero, cu_seqlens])`: Kineto records a TensorList as one input holding a list of shapes, the taint string has one segment per tensor; finput paired them 1:1, misaligning every later argument | `ProfileInput` type `TensorList` with `elements`; finput consumes one taint segment per element; generator builds a list; signature params `input{i}_t{k}_dim{j}` |
 
 Not bugs, recorded: the `Invalid process group specified` traceback at engine
 shutdown is harmless (fake TP group teardown); `_C::vocab_parallel_embedding`

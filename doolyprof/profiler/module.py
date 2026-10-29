@@ -113,14 +113,14 @@ class ModuleInfo:
         # Extract MODEL_CONFIG dimension values and scalars from ProfileInput
         params_dict = {}
         for i, inp in enumerate(self.inputs):
-            if inp.type == "Tensor":
-                # Extract MODEL_CONFIG dimensions
+            if inp.type in ("Tensor", "TensorList"):
+                # Extract MODEL_CONFIG dimensions (per element for a TensorList)
                 from doolyprof.profiler.taint import DimensionType
-                for j, (dim_type, dim_val) in enumerate(zip(inp.dimensions, inp.actual_shape)):
-                    if dim_type == DimensionType.MODEL_CONFIG:
-                        # Use a generic name for MODEL_CONFIG dimensions
-                        param_name = f"input{i}_dim{j}"
-                        params_dict[param_name] = dim_val
+                for prefix, part in _tensor_part_prefixes(i, inp):
+                    for j, (dim_type, dim_val) in enumerate(zip(part.dimensions, part.actual_shape)):
+                        if dim_type == DimensionType.MODEL_CONFIG:
+                            # Use a generic name for MODEL_CONFIG dimensions
+                            params_dict[f"{prefix}_dim{j}"] = dim_val
             elif inp.type == "Scalar" and inp.scalar_value:
                 # Extract scalar value
                 param_name = f"input{i}_scalar"
@@ -136,6 +136,14 @@ class ModuleInfo:
         # if self.hierarchy:
         #     print(self.hierarchy.anchor.name, "params_list :", params_list)
         return params_list
+
+
+def _tensor_part_prefixes(i, inp):
+    """(param-name prefix, Tensor ProfileInput) pairs for input ``i``:
+    ``input{i}`` for a Tensor, ``input{i}_t{k}`` for element k of a TensorList."""
+    if inp.type == "TensorList":
+        return [(f"input{i}_t{k}", el) for k, el in enumerate(inp.tensor_parts())]
+    return [(f"input{i}", inp)]
 
 
 class ModuleComparator:
@@ -169,10 +177,11 @@ class ModuleComparator:
                 )
                 if inputs:
                     for i, inp in enumerate(inputs):
-                        if inp.type == "Tensor":
-                            for j, (dim_type, dim_val) in enumerate(zip(inp.dimensions, inp.actual_shape)):
-                                if dim_type == DimensionType.MODEL_CONFIG:
-                                    params[f"input{i}_dim{j}"] = dim_val
+                        if inp.type in ("Tensor", "TensorList"):
+                            for prefix, part in _tensor_part_prefixes(i, inp):
+                                for j, (dim_type, dim_val) in enumerate(zip(part.dimensions, part.actual_shape)):
+                                    if dim_type == DimensionType.MODEL_CONFIG:
+                                        params[f"{prefix}_dim{j}"] = dim_val
                         elif inp.type == "Scalar" and inp.scalar_value:
                             try:
                                 params[f"input{i}_scalar"] = float(inp.scalar_value)

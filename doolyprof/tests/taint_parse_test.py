@@ -4,6 +4,9 @@
   dimension, including ``SINGLETON(1)`` broadcast dims, so dimension types stay
   aligned with the traced shape (a dropped dim shifted MODEL_CONFIG padding onto
   the token axis and leaked the trace batch size into signatures).
+* A TensorList argument (``aten::cat``'s tensors) is one trace input holding a
+  list of shapes but one taint segment per tensor; the arguments after it must
+  stay aligned and the signature parameters must stay hashable.
 * ``choose_trace_batch_size`` must avoid every registry collision the scheduler
   would otherwise raise as a TAINT CONFLICT.
 
@@ -17,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from doolyprof.profiler.taint import DimensionType, parse_taint_string  # noqa: E402
 from doolyprof.profiler.finput import extract_inputs_from_taint  # noqa: E402
 from doolyprof.profiler.parser import Event  # noqa: E402
+from doolyprof.profiler.module import ModuleInfo  # noqa: E402
 from doolyprof.tracer.registry import choose_trace_batch_size, choose_trace_batch  # noqa: E402
 
 MC, NT, NR, MIX = (DimensionType.MODEL_CONFIG, DimensionType.NUM_TOKENS,
@@ -223,6 +227,46 @@ def test_recorded_path_group_check():
                          instance_paths=["layers.9.self_attn.q_norm", "layers.0.self_attn.q_norm"])
     with contextlib.redirect_stdout(io.StringIO()):
         assert r._pick_recorded_path("Norm", missing) == "layers.0.self_attn.q_norm"
+
+
+_CAT_TAINT = "aten::cat IN:[[SINGLETON(1)] | [NUM_REQS(28)]]"
+_CAT_DIMS = [[[1], [28]], []]
+
+
+def test_tensor_list_input_aligned():
+    inputs = extract_inputs_from_taint(_CAT_TAINT, trace_input_dims=_CAT_DIMS,
+                                       trace_input_dtypes=["TensorList", "Scalar"],
+                                       concrete_inputs=["", "0"])
+    assert [i.type for i in inputs] == ["TensorList", "Scalar"], [i.type for i in inputs]
+    elems = inputs[0].tensor_parts()
+    assert [e.actual_shape for e in elems] == [[1], [28]], [e.actual_shape for e in elems]
+    assert elems[1].dimensions == [DimensionType.NUM_REQUESTS], elems[1].dimensions
+    assert inputs[1].scalar_value == "0", inputs[1]
+    info = ModuleInfo(module_name="KDA", operation_name="aten::cat", inputs=inputs, dtype="int")
+    params = info._semantic_params_list()[0]
+    hash(tuple(sorted(params.items())))  # dedup key must be hashable
+    assert params == {"input0_t0_dim0": 1, "input1_scalar": 0.0}, params
+    rt = type(inputs[0]).from_dict(inputs[0].to_dict())
+    assert [e.actual_shape for e in rt.tensor_parts()] == [[1], [28]]
+
+
+def test_generator_builds_tensor_list_on_request_sweep():
+    import torch
+    if not torch.cuda.is_available():
+        print("SKIP (no CUDA)"); return
+    from doolyprof.profiler.input_generator import InputGenerator
+    inputs = extract_inputs_from_taint(_CAT_TAINT, trace_input_dims=_CAT_DIMS,
+                                       trace_input_dtypes=["TensorList", "Scalar"],
+                                       concrete_inputs=["", "0"])
+    module = ModuleInfo(module_name="KDA", operation_name="aten::cat", inputs=inputs, dtype="bfloat16")
+    gen = InputGenerator(module, max_num_request=4, max_num_token=256, test_counts=3)
+    configs = gen.prepare_inputs(mode="vidur", use_batch_config=False)
+    assert configs and len({c["num_requests"] for c in configs}) > 1, configs
+    for cfg in configs:
+        tensors, params = gen._create_tensor_inputs_from_params(cfg)
+        assert [tuple(t.shape) for t in tensors[0]] == [(1,), (params["num_requests"],)], tensors
+        out = torch.cat(tensors[0], tensors[1])
+        assert tuple(out.shape) == (1 + params["num_requests"],)
 
 
 if __name__ == "__main__":

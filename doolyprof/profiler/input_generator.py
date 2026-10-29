@@ -112,6 +112,10 @@ def classify_op(module: ModuleInfo) -> str:
         return "ssm"
     return "stateless"
 
+class _InvalidShape(Exception):
+    """A generated input shape has a non-positive dimension."""
+
+
 class InputGenerator:
     # for a given ModuleInfo, generate the inputs needed to profile
     def __init__(self, module: ModuleInfo, max_num_request: int=16,
@@ -212,81 +216,93 @@ class InputGenerator:
                 'num_requests': num_requests
             }
 
-        for input_idx, profile_input in enumerate(self.module.inputs):
-            if profile_input.type == "Tensor":
-                # Build shape: replace workload dimensions with sweep values
-                shape = []
-                num_tokens_dim_indices = profile_input.get_toks_dim()
-                num_requests_dim_indices = profile_input.get_reqs_dim()
-                mix_dim_indices = profile_input.get_mix_dims()
+        def build_tensor(profile_input):
+            """Sweep-sized tensor for one Tensor ProfileInput; None for a zero
+            dim (an optional Tensor that was None); raises _InvalidShape."""
+            # Build shape: replace workload dimensions with sweep values
+            shape = []
+            num_tokens_dim_indices = profile_input.get_toks_dim()
+            num_requests_dim_indices = profile_input.get_reqs_dim()
+            mix_dim_indices = profile_input.get_mix_dims()
 
-                for dim_idx, actual_dim_value in enumerate(profile_input.actual_shape):
-                    if dim_idx in num_tokens_dim_indices:
-                        # NUM_TOKENS dimension - use num_tokens from workload config
-                        shape.append(num_tokens)
-                    elif dim_idx in num_requests_dim_indices:
-                        # NUM_REQUESTS dimension - use num_requests from workload config
-                        shape.append(num_requests)
-                    elif dim_idx in mix_dim_indices:
-                        # MIX dimension - calculate size from components
-                        components = profile_input.dimension_components[dim_idx] if profile_input.dimension_components else None
-                        if components:
-                            new_size = 1
-                            for taint_name, qty in components.items():
-                                axis = _component_axis(taint_name)
-                                if axis == "num_tokens":
-                                    new_size *= num_tokens
-                                elif axis == "num_requests":
-                                    new_size *= num_requests
-                                else:
-                                    # MODEL_CONFIG / MAX_* bound / unknown: fixed factor
-                                    new_size *= qty
-                            shape.append(new_size)
-                        else:
-                            # MIX without components - fallback to fixed value (shouldn't happen)
-                            shape.append(actual_dim_value)
+            for dim_idx, actual_dim_value in enumerate(profile_input.actual_shape):
+                if dim_idx in num_tokens_dim_indices:
+                    # NUM_TOKENS dimension - use num_tokens from workload config
+                    shape.append(num_tokens)
+                elif dim_idx in num_requests_dim_indices:
+                    # NUM_REQUESTS dimension - use num_requests from workload config
+                    shape.append(num_requests)
+                elif dim_idx in mix_dim_indices:
+                    # MIX dimension - calculate size from components
+                    components = profile_input.dimension_components[dim_idx] if profile_input.dimension_components else None
+                    if components:
+                        new_size = 1
+                        for taint_name, qty in components.items():
+                            axis = _component_axis(taint_name)
+                            if axis == "num_tokens":
+                                new_size *= num_tokens
+                            elif axis == "num_requests":
+                                new_size *= num_requests
+                            else:
+                                # MODEL_CONFIG / MAX_* bound / unknown: fixed factor
+                                new_size *= qty
+                        shape.append(new_size)
                     else:
-                        # MODEL_CONFIG dimension - keep fixed value from trace
+                        # MIX without components - fallback to fixed value (shouldn't happen)
                         shape.append(actual_dim_value)
+                else:
+                    # MODEL_CONFIG dimension - keep fixed value from trace
+                    shape.append(actual_dim_value)
 
-                # Validate shape. A dim of 0 typically means the original call
-                # had a None here (e.g. optional Tensor args like output_scale /
-                # kv_cache_dummy_dep in unified_attention_with_output). Skip
-                # that single input by substituting None — preserves positional
-                # order for downstream args/kwargs packing — instead of
-                # aborting the whole input list.
-                if not all(isinstance(d, int) and d > 0 for d in shape):
-                    if any(isinstance(d, int) and d == 0 for d in shape):
-                        print(f"[InputGenerator] Shape {shape} has zero dim — treating as None")
-                        inputs.append(None)
-                        continue
-                    print(f"[InputGenerator] Invalid shape {shape}, skipping input")
-                    print(f"[InputGenerator]   actual_shape={profile_input.actual_shape}")
-                    print(f"[InputGenerator]   dimensions={[d.value for d in profile_input.dimensions]}")
-                    print(f"[InputGenerator]   num_requests_dim_indices={num_requests_dim_indices}")
-                    print(f"[InputGenerator]   num_tokens_dim_indices={num_tokens_dim_indices}")
-                    print(f"[InputGenerator]   num_tokens={num_tokens}, num_requests={num_requests}")
+            # Validate shape. A dim of 0 typically means the original call
+            # had a None here (e.g. optional Tensor args like output_scale /
+            # kv_cache_dummy_dep in unified_attention_with_output). Skip
+            # that single input by substituting None — preserves positional
+            # order for downstream args/kwargs packing — instead of
+            # aborting the whole input list.
+            if not all(isinstance(d, int) and d > 0 for d in shape):
+                if any(isinstance(d, int) and d == 0 for d in shape):
+                    print(f"[InputGenerator] Shape {shape} has zero dim — treating as None")
+                    return None
+                print(f"[InputGenerator] Invalid shape {shape}, skipping input")
+                print(f"[InputGenerator]   actual_shape={profile_input.actual_shape}")
+                print(f"[InputGenerator]   dimensions={[d.value for d in profile_input.dimensions]}")
+                print(f"[InputGenerator]   num_requests_dim_indices={num_requests_dim_indices}")
+                print(f"[InputGenerator]   num_tokens_dim_indices={num_tokens_dim_indices}")
+                print(f"[InputGenerator]   num_tokens={num_tokens}, num_requests={num_requests}")
+                raise _InvalidShape
+
+            # Get dtype
+            input_dtype_str = profile_input.dtype
+            if input_dtype_str == "trace_dtype":
+                input_dtype = trace_dtype
+            else:
+                input_dtype = self.dtype_map.get(input_dtype_str, trace_dtype)
+
+            shape_tuple = tuple(shape)
+
+            # Create tensor
+            if input_dtype in (torch.long, torch.int32, torch.int64):
+                if len(shape) == 1:
+                    max_val = shape[0] if shape[0] < 10000 else 1000
+                else:
+                    max_val = 1000
+                tensor = torch.randint(0, max_val, shape_tuple, dtype=input_dtype, device='cuda')
+            else:
+                tensor = torch.randn(shape_tuple, dtype=input_dtype, device='cuda')
+            return tensor
+
+        for input_idx, profile_input in enumerate(self.module.inputs):
+            if profile_input.type == "TensorList":
+                try:
+                    inputs.append([build_tensor(el) for el in profile_input.tensor_parts()])
+                except _InvalidShape:
                     return [], workload_params
-
-                # Get dtype
-                input_dtype_str = profile_input.dtype
-                if input_dtype_str == "trace_dtype":
-                    input_dtype = trace_dtype
-                else:
-                    input_dtype = self.dtype_map.get(input_dtype_str, trace_dtype)
-
-                shape_tuple = tuple(shape)
-
-                # Create tensor
-                if input_dtype in (torch.long, torch.int32, torch.int64):
-                    if len(shape) == 1:
-                        max_val = shape[0] if shape[0] < 10000 else 1000
-                    else:
-                        max_val = 1000
-                    tensor = torch.randint(0, max_val, shape_tuple, dtype=input_dtype, device='cuda')
-                else:
-                    tensor = torch.randn(shape_tuple, dtype=input_dtype, device='cuda')
-                inputs.append(tensor)
+            elif profile_input.type == "Tensor":
+                try:
+                    inputs.append(build_tensor(profile_input))
+                except _InvalidShape:
+                    return [], workload_params
 
             elif profile_input.type == "Scalar":
                 # Use scalar_value directly
@@ -413,17 +429,14 @@ class InputGenerator:
         num_requests_sweep = self._generate_num_requests_sweep()
 
         # Check which dimension types are present in inputs
-        has_num_tokens_dim = any(
-            inp.get_toks_dim() for inp in self.module.inputs if inp.type == "Tensor"
-        )
-        has_num_requests_dim = any(
-            inp.get_reqs_dim() for inp in self.module.inputs if inp.type == "Tensor"
-        )
+        tensor_inputs = [t for inp in self.module.inputs for t in inp.tensor_parts()]
+        has_num_tokens_dim = any(inp.get_toks_dim() for inp in tensor_inputs)
+        has_num_requests_dim = any(inp.get_reqs_dim() for inp in tensor_inputs)
 
         # MIX dimensions with a NUM_TOKS / NUM_REQS component are swept along
         # that axis too (MAX_* bounds are fixed factors, see _component_axis)
-        for inp in self.module.inputs:
-            if inp.type == "Tensor" and inp.dimension_components:
+        for inp in tensor_inputs:
+            if inp.dimension_components:
                 for dim_idx in inp.get_mix_dims():
                     components = inp.dimension_components[dim_idx]
                     if components:
