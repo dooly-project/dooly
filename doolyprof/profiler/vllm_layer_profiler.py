@@ -37,7 +37,7 @@ from doolyprof.profiler.utils.generate_batch import AttentionBatchConfig
 # Apply fake TP patches BEFORE importing vLLM so all modules see patched
 # parallel_state at import time. Set VLLM_FAKE_TP env var before importing
 # this module (e.g. in run-profiler.py via --tp flag).
-from doolyprof.profiler.utils.fake_tp import apply_fake_tp_patches, get_fake_tp_size
+from doolyprof.profiler.utils.fake_tp import apply_fake_tp_patches, get_fake_tp_size, get_fake_ep
 
 _FAKE_TP_SIZE = get_fake_tp_size()
 if _FAKE_TP_SIZE > 1:
@@ -123,6 +123,9 @@ class VLLMLayerProfiler:
             llm_kwargs["attention_config"] = {"flash_attn_version": flash_attn_version}
         if quantization:
             llm_kwargs["quantization"] = quantization
+        if get_fake_ep():
+            # Fake EP: the fake TP group doubles as the EP group (see get_fake_ep)
+            llm_kwargs["enable_expert_parallel"] = True
         self.llm = LLM(**llm_kwargs)
 
         # Extract internals

@@ -3,6 +3,8 @@
 * the module state hash (``doolyprof.tracer.hooks._extract_module_state_hash``), which must
   separate attention layers that differ in KV-cache dtype, logit soft-capping, ALiBi or
   Mamba state dtype while staying identical for ordinary modules, and
+* the MoE parallel layout (``FusedMoEParallelConfig`` on the layer's ``moe_config``), which
+  must separate TP-sharded experts from expert-parallel ones at the same TP degree, and
 * the per-op dtype (``doolyprof.profiler.trace._derive_op_dtype``), derived from the op's own
   traced tensor inputs rather than a run-level constant.
 
@@ -185,6 +187,27 @@ def test_impl_class_in_state_hash():
         pass
     b.impl = OtherImpl(32, 128, 0.088, 8, None, None, "auto", None, b.attn_type, None, None)
     assert _extract_module_state_hash(a) != _extract_module_state_hash(b)
+
+
+def _moe_layer(**layout):
+    import dataclasses
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoEParallelConfig
+    m = torch.nn.Module()
+    m.top_k = 8
+    cfg = object.__new__(FusedMoEConfig)  # only the fields the state hash reads
+    cfg.moe_parallel_config = dataclasses.replace(FusedMoEParallelConfig.make_no_parallel(), **layout)
+    cfg.num_local_experts = 64 // layout.get("ep_size", 1)
+    m.moe_config = cfg
+    return m
+
+
+def test_moe_parallel_layout_in_state_hash():
+    if not HAVE_VLLM:
+        print("SKIP (no vLLM)"); return
+    tp = _extract_module_state_hash(_moe_layer(tp_size=2))
+    ep = _extract_module_state_hash(_moe_layer(ep_size=2, use_ep=True))
+    assert tp and ep and tp != ep, (tp, ep)
+    assert _extract_module_state_hash(_moe_layer(tp_size=2)) == tp  # stable
 
 
 def test_derive_op_dtype():

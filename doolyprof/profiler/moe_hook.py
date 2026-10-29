@@ -14,7 +14,9 @@ regardless of the (dummy-weight) gate -- LLMServingSim's methodology
 a per-model class name.
 
 Expert counts come from ``moe_config``: ``experts_per_token`` (top-k) and
-``num_local_experts``, the experts this rank holds.
+``num_local_experts``, the experts this rank holds. Which global expert ids are
+local is read from the layer's ``expert_map`` (global -> local index, -1 for
+experts held by other ranks; None without expert parallelism).
 """
 from contextlib import contextmanager
 
@@ -69,6 +71,20 @@ def moe_activated_grid(top_k, num_experts, num_tokens):
     return sorted(grid)
 
 
+def moe_expert_placement(fused):
+    """(local global ids, remote global ids) of the layer's experts, from its
+    ``expert_map``; without expert parallelism every expert is local."""
+    expert_map = getattr(fused, "expert_map", None)
+    if expert_map is None:
+        return list(range(moe_num_local_experts(fused))), []
+    m = expert_map.detach().to("cpu")
+    local = [i for i in torch.nonzero(m >= 0).flatten().tolist()]
+    # order local ids by their local index so A experts are the first A slots
+    local.sort(key=lambda g: int(m[g]))
+    remote = torch.nonzero(m < 0).flatten().tolist()
+    return local, remote
+
+
 def _cycle_ids(num_tokens, top_k, activated):
     # ids[t, off] = (t*top_k + off) % activated  -> exactly `activated` distinct experts
     return [[(t * top_k + off) % activated for off in range(top_k)]
@@ -81,11 +97,13 @@ def force_moe_routing(fused, num_tokens, activated_experts):
     experts fire for a batch of ``num_tokens`` tokens. Router-subclass-agnostic
     (FusedTopKRouter, GroupedTopKRouter, ...). Restores on exit."""
     top_k = moe_top_k(fused)
+    local_ids, _ = moe_expert_placement(fused)
     if not (top_k <= activated_experts <= num_tokens * top_k):
         raise ValueError(
             f"need top_k({top_k}) <= activated({activated_experts}) "
             f"<= num_tokens*top_k({num_tokens * top_k})")
-    ids_list = _cycle_ids(num_tokens, top_k, activated_experts)
+    ids_list = [[local_ids[i] for i in row]
+                for row in _cycle_ids(num_tokens, top_k, activated_experts)]
     dev = next(fused.parameters()).device
     weights = torch.full((num_tokens, top_k), 1.0 / top_k, device=dev, dtype=torch.float32)
     ids_by_dtype = {}

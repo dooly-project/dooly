@@ -33,7 +33,7 @@ def find_trace_file(trace_dir: str) -> str | None:
     return files[0] if files else None
 
 
-def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attention_backend: str, tokenizer: str | None = None, quantization: str | None = None, kv_cache_dtype: str = "auto", trace_batch_size: int = 7):
+def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attention_backend: str, tokenizer: str | None = None, quantization: str | None = None, kv_cache_dtype: str = "auto", trace_batch_size: int = 7, enable_expert_parallel: bool = False):
     """Run the tracer as a subprocess (required due to module-level patching)."""
     tracer_script = os.path.join(os.path.dirname(__file__), "run-tracer.py")
     cmd = [
@@ -55,6 +55,8 @@ def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attent
     if quantization:
         cmd.extend(["--quantization", quantization])
     cmd.extend(["--kv-cache-dtype", kv_cache_dtype])
+    if enable_expert_parallel:
+        cmd.append("--enable-expert-parallel")
     print(f"[E2E] Running tracer: {' '.join(cmd)}")
 
     result = subprocess.run(cmd, check=True)
@@ -62,7 +64,7 @@ def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attent
     return result.returncode == 0
 
 
-def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: str, dtype: str, attention_backend: str, max_batch_size: int, max_seq_len: int, gpu: int, db_path: str | None = None, profile_comm: bool = False, quantization: str | None = None, overwrite: bool = False, kv_cache_dtype: str = "auto"):
+def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: str, dtype: str, attention_backend: str, max_batch_size: int, max_seq_len: int, gpu: int, db_path: str | None = None, profile_comm: bool = False, quantization: str | None = None, overwrite: bool = False, kv_cache_dtype: str = "auto", enable_expert_parallel: bool = False):
     """Run the profiler as a subprocess."""
     profiler_script = os.path.join(os.path.dirname(__file__), "run-profiler.py")
     cmd = [
@@ -86,6 +88,8 @@ def run_profiler(models: list[str], traces: list[str], tp: int, profile_output: 
     if overwrite:
         cmd.append("--overwrite")
     cmd.extend(["--kv-cache-dtype", kv_cache_dtype])
+    if enable_expert_parallel:
+        cmd.append("--enable-expert-parallel")
     print(f"[E2E] Running profiler: {' '.join(cmd)}")
     result = subprocess.run(cmd, check=True)
     return result.returncode == 0
@@ -116,6 +120,9 @@ def main():
     parser.add_argument("--kv-cache-dtype", type=str, default="auto",
                         help="vLLM KV-cache dtype literal (auto, fp8, fp8_e4m3, fp8_e5m2, ...), applied to tracing, "
                              "resolving and profiling. Attention gets its own signature per cache dtype; other ops are shared.")
+    parser.add_argument("--enable-expert-parallel", action="store_true",
+                        help="Fake EP: profile rank 0 of a TP+EP deployment (vLLM enable_expert_parallel "
+                             "with the fake TP group as the EP group, no DP); needs every --tp >= 2")
     parser.add_argument("--trace-batch-size", type=int, default=7,
                         help="Requested number of identical prompts in the tracing batch; the tracer raises it "
                              "to the nearest value that does not collide with a registered model-config integer.")
@@ -130,8 +137,9 @@ def main():
     os.makedirs(profile_base, exist_ok=True)
 
     for tp in args.tp:
-        tp_trace_dir = os.path.join(trace_base, f"tp_{tp}")
-        profile_dir = os.path.join(profile_base, f"tp_{tp}")
+        par_dir = f"tp_{tp}_ep" if args.enable_expert_parallel else f"tp_{tp}"
+        tp_trace_dir = os.path.join(trace_base, par_dir)
+        profile_dir = os.path.join(profile_base, par_dir)
         os.makedirs(tp_trace_dir, exist_ok=True)
         os.makedirs(profile_dir, exist_ok=True)
 
@@ -154,6 +162,7 @@ def main():
                     quantization=args.quantization,
                     kv_cache_dtype=args.kv_cache_dtype,
                     trace_batch_size=args.trace_batch_size,
+                    enable_expert_parallel=args.enable_expert_parallel,
                 )
 
         # Step 2: Collect trace files in order matching models list
@@ -188,6 +197,7 @@ def main():
             quantization=args.quantization,
             overwrite=args.overwrite,
             kv_cache_dtype=args.kv_cache_dtype,
+            enable_expert_parallel=args.enable_expert_parallel,
         )
 
     print("\n[E2E] Workflow complete!")

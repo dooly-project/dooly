@@ -18,8 +18,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 _pre_parser = argparse.ArgumentParser(add_help=False)
 _pre_parser.add_argument("--tp", type=int, default=1)
 _pre_parser.add_argument("--gpu", type=str, default="0,1,2,3")
+_pre_parser.add_argument("--enable-expert-parallel", action="store_true")
 _pre_args, _ = _pre_parser.parse_known_args()
 os.environ["VLLM_FAKE_TP"] = str(_pre_args.tp)
+# VLLM_FAKE_EP: every engine this process or its children build sets
+# enable_expert_parallel (see fake_tp.get_fake_ep).
+os.environ["VLLM_FAKE_EP"] = "1" if _pre_args.enable_expert_parallel else "0"
 os.environ["CUDA_VISIBLE_DEVICES"] = _pre_args.gpu
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
@@ -81,6 +85,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-counts", type=int, default=1)
     parser.add_argument("--force-prefill-kernel", action="store_true", default=True)
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--enable-expert-parallel", action="store_true",
+                        help="Fake EP: the fake TP group also serves as the expert-parallel group "
+                             "(vLLM TP+EP without DP); stored as ep_degree = tp in profiled_models")
     parser.add_argument("--db-path", type=str, default=None,
                         help="Path to SQLite database for persistent storage and deduplication")
     parser.add_argument("--gpu", type=str, default="0",
@@ -268,7 +275,7 @@ def main() -> None:
         attention_backend=args.attention_backend,
         flash_attn_version=args.flash_attn_version,
         quantization=args.quantization,
-        world_config={"tp": args.tp, "pp": 1},
+        world_config={"tp": args.tp, "pp": 1, "ep": args.tp if args.enable_expert_parallel else 1},
         dtype=dtype,
         db_path=args.db_path,
         gpu=args.gpu,
