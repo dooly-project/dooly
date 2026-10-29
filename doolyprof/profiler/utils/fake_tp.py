@@ -34,6 +34,29 @@ def get_fake_tp_size() -> int:
     """Return the fake TP size from the VLLM_FAKE_TP environment variable."""
     return int(os.environ.get("VLLM_FAKE_TP", "1"))
 
+
+def get_fake_ep() -> bool:
+    """Whether the fake TP group also serves as the expert-parallel group
+    (VLLM_FAKE_EP=1).
+
+    vLLM's MoE layer derives its parallel layout from the TP world size and
+    ``ParallelConfig.enable_expert_parallel`` (``FusedMoEParallelConfig.make``):
+    with EP on and data parallelism off, ``ep_size = tp_size``, every rank holds
+    ``num_experts / ep_size`` whole experts and the expert weights are not
+    TP-sharded. Because the TP world size is the patched fake one, passing
+    ``enable_expert_parallel=True`` to the engine is all fake EP needs: rank 0
+    of a TP+EP deployment is built and run on one GPU. The MoE output is then
+    all-reduced over the TP group, which fake TP records as a COMM all_reduce,
+    exactly as vLLM does for TP+EP without DP. DP+EP (all2all dispatch through
+    the EP group) is not emulated.
+    """
+    if os.environ.get("VLLM_FAKE_EP", "0") not in ("1", "true", "True"):
+        return False
+    if get_fake_tp_size() < 2:
+        raise ValueError("VLLM_FAKE_EP=1 needs VLLM_FAKE_TP >= 2: vLLM only enables "
+                         "expert parallelism when the TP world size is above 1")
+    return True
+
 def apply_fake_tp_patches(tp_size: int) -> None:
     """
     Patch vLLM internals to simulate tensor parallelism on a single GPU.

@@ -19,7 +19,7 @@ Conventions
 
 ---
 
-## 2026-10-29 — vLLM 0.32.0 port
+## 2026-10-29 — vLLM 0.32.0 port, fake expert parallelism
 Env: new conda env `dooly-v32` (vLLM 0.32.0, torch 2.13.0+cu130, transformers
 5.19, flashinfer 0.7.0.post1). `dooly` (0.17.1) is untouched and DoolySim still
 uses it. No `LD_PRELOAD` needed in `dooly-v32` (sqlite loads fine after torch).
@@ -60,10 +60,35 @@ replaces the embedding module entry (one fused kernel now).
   five models except Qwen3.5 gaining `MRotaryEmbedding` (its Triton mrope
   kernel was an orphan before, fix 9) and Kimi's KDA gate kernel folding into
   the KDA module (same row count).
-- Unit tests (both envs): signature_fields 12, taint_parse 16, tracer_ops 7
+- Unit tests (both envs): signature_fields 13, taint_parse 16, tracer_ops 7
   (new file: view(dtype), squeeze tuple dims, kernel link repair, engine
   callable annotation); the tracer_ops tests fail on the unfixed
   code.
+
+### Fake expert parallelism (`--enable-expert-parallel`)
+vLLM's MoE layer derives its layout from the TP world size and
+`enable_expert_parallel` (`FusedMoEParallelConfig.make`): with EP and no DP,
+`ep_size = tp_size`, each rank holds `E / ep_size` whole experts, and the MoE
+output is all-reduced over the TP group. Fake TP already patches the TP world
+size, so setting `enable_expert_parallel=True` on every engine (env
+`VLLM_FAKE_EP=1`, set by run-e2e / run-tracer / run-profiler) builds rank 0 of
+TP+EP on one GPU; every EP-group call in vLLM's MoE path is guarded by DP>1,
+sequence parallelism or all2all kernels, so nothing else needs patching.
+- Activated-experts sweep and forced routing use `moe_config.num_local_experts`
+  (all experts without EP). Local / remote global expert ids come from the
+  layer's `expert_map` (-1 = held by another rank), not from an assumed
+  placement.
+- State hash adds the MoE layer's `FusedMoEParallelConfig` fields and
+  `num_local_experts` (parameter shapes are not hashed, so TP and EP experts
+  would otherwise share a signature). Changes every MoE signature hash once.
+- DB: `profiled_models.ep_degree` (default 1, unique index v3); trace /
+  profile dirs `tp_<N>_ep`.
+- Checked at fake TP 2 on 0.32: grid capped at the local share (Kimi 256 -> 128,
+  DSv2 64 -> 32, gpt-oss 32 -> 16); per-expert cost matches unsharded experts
+  (DSv2 EP2 @32 experts, 256 tokens 0.462 ms vs TP1 0.473 ms; Kimi EP2 @128
+  1.235 ms vs TP2 0.612 ms, whose experts are half-width).
+- Not emulated: DP+EP (all2all / DeepEP dispatch through the EP group), EPLB.
+  Not yet compared against a real 2-GPU EP run.
 
 ### Open (0.32)
 - Sampler profile covers the greedy path only (the tracer's temperature-0
@@ -79,7 +104,9 @@ replaces the embedding module entry (one fused kernel now).
   one unit incl. its projections), coarser than before.
 - DoolySim on 0.32: its emulator stubs `GPUModelRunner.profile_run` of the V1
   runner only; with the V2 default it needs `VLLM_USE_V2_MODEL_RUNNER=0` or the
-  same stub on `vllm.v1.worker.gpu.model_runner`. Not changed.
+  same stub on `vllm.v1.worker.gpu.model_runner`. DBs gain `ep_degree`; a
+  deployment query that ignores it would see two rows when both TP and EP were
+  profiled. Not changed.
 - Kimi-K3 still needs Blackwell for MXFP4 kernels and its size (~1.56 TB) far
   exceeds one A100 shard even with EP; layer truncation (`hf_overrides`) is the
   path to try next on this machine.

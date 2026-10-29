@@ -203,6 +203,8 @@ class Profiler:
         self.db_path = db_path
         self.world_config = world_config
         self.tp_config = world_config.get("tp", 1)
+        # Expert-parallel degree of the profiled rank (1 = experts TP-sharded)
+        self.ep_config = world_config.get("ep", 1)
         self.pp_config = world_config.get("pp", 1)
         self.gpu = gpu
 
@@ -495,10 +497,17 @@ class Profiler:
         # constraint so it can be added to existing DBs without recreating the
         # table. The pre-kv_cache_dtype index is dropped so two cache dtypes of
         # the same model can coexist.
+        # Backward-compat: rows written before fake EP were all profiled with
+        # experts TP-sharded (ep_degree 1).
+        try:
+            conn.execute("ALTER TABLE profiled_models ADD COLUMN ep_degree INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass  # column already present
         conn.execute("DROP INDEX IF EXISTS ix_profiled_models_unique")
+        conn.execute("DROP INDEX IF EXISTS ix_profiled_models_unique_v2")
         conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS ix_profiled_models_unique_v2
-                ON profiled_models(model_name, backend, tp_degree, dtype, kv_cache_dtype)
+            CREATE UNIQUE INDEX IF NOT EXISTS ix_profiled_models_unique_v3
+                ON profiled_models(model_name, backend, tp_degree, dtype, kv_cache_dtype, ep_degree)
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS model_operations (
@@ -1310,20 +1319,20 @@ class Profiler:
                 cursor = conn.execute(
                     """SELECT model_id FROM profiled_models
                        WHERE model_name = ? AND model_family = ? AND backend = ? AND tp_degree = ? AND dtype = ?
-                       AND kv_cache_dtype = ?""",
-                    (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str, self.kv_cache_dtype)
+                       AND kv_cache_dtype = ? AND ep_degree = ?""",
+                    (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str, self.kv_cache_dtype, self.ep_config)
                 )
                 existing = cursor.fetchone()
 
                 if existing:
                     # Model already exists, use existing model_id
                     model_id = existing[0]
-                    print(f"[PROFILER] Model {model.name} (backend={self.attention_backend}, tp={self.tp_config}, dtype={dtype_str}, kv_cache_dtype={self.kv_cache_dtype}) already exists (model_id={model_id})")
+                    print(f"[PROFILER] Model {model.name} (backend={self.attention_backend}, tp={self.tp_config}, ep={self.ep_config}, dtype={dtype_str}, kv_cache_dtype={self.kv_cache_dtype}) already exists (model_id={model_id})")
                 else:
                     # Insert new model and get the auto-generated model_id
                     cursor = conn.execute(
-                        """INSERT INTO profiled_models (model_name, model_family, backend, tp_degree, dtype, kv_cache_dtype) VALUES (?, ?, ?, ?, ?, ?)""",
-                        (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str, self.kv_cache_dtype)
+                        """INSERT INTO profiled_models (model_name, model_family, backend, tp_degree, dtype, kv_cache_dtype, ep_degree) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str, self.kv_cache_dtype, self.ep_config)
                     )
                     model_id = cursor.lastrowid
                     print(f"[PROFILER] Created new model entry (model_id={model_id}, dtype={dtype_str}, kv_cache_dtype={self.kv_cache_dtype})")

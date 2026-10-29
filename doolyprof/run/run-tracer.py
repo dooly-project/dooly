@@ -39,6 +39,7 @@ parser.add_argument("--attention-backend", type=str, default="FLASH_ATTN", help=
 parser.add_argument("--flash-attn-version", type=int, default=2, choices=[2, 3, 4], help="Pin flash-attention version when --attention-backend=FLASH_ATTN. Without this, vLLM auto-picks FA3 on Hopper / FA4 on Blackwell.")
 parser.add_argument("--quantization", type=str, default=None, choices=["fp8", "awq", "gptq"], help="Optional quantization scheme. 'fp8' requires Hopper+ (H100). With load_format=dummy, vLLM initializes random quantized weights — no quantized checkpoint needed.")
 parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
+parser.add_argument("--enable-expert-parallel", action="store_true", help="Fake EP: the fake TP group also serves as the expert-parallel group (vLLM TP+EP without DP); needs --tp >= 2")
 parser.add_argument("--kv-cache-dtype", type=str, default="auto", help="vLLM KV-cache dtype literal (auto, fp8, fp8_e4m3, fp8_e5m2, ...); recorded in each attention module's state hash")
 args = parser.parse_args()
 
@@ -51,6 +52,7 @@ print(f"[Tracer] Set VLLM_ATTENTION_BACKEND={args.attention_backend}")
 
 FAKE_TP = args.tensor_parallel_size
 os.environ["VLLM_FAKE_TP"] = str(FAKE_TP)
+os.environ["VLLM_FAKE_EP"] = "1" if args.enable_expert_parallel else "0"
 
 # Install taint hooks BEFORE any vLLM imports
 # This patches AutoConfig.from_pretrained to return TaintedConfig objects
@@ -244,6 +246,9 @@ if __name__ == "__main__":
             llm_kwargs["attention_config"] = {"flash_attn_version": args.flash_attn_version}
         if args.quantization:
             llm_kwargs["quantization"] = args.quantization
+        from doolyprof.profiler.utils.fake_tp import get_fake_ep
+        if get_fake_ep():
+            llm_kwargs["enable_expert_parallel"] = True
         llm = LLM(**llm_kwargs)
 
         # Check weight shapes to verify sharding

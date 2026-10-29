@@ -534,6 +534,26 @@ def _engine_config_state(module, attrs, excluded, is_primitive, canonicalize):
         except Exception:
             pass
 
+    # 4. MoE parallel layout. A MoE layer's expert weights are TP-sharded
+    #    (every rank holds every expert) or EP-split (each rank holds whole
+    #    experts) depending on vLLM's FusedMoEParallelConfig, which the layer
+    #    keeps on its FusedMoEConfig. Parameter shapes are not hashed, so the
+    #    layout's own fields keep TP-only and TP+EP profiles apart.
+    moe_config = attrs.get("moe_config")
+    if moe_config is not None:
+        try:
+            import dataclasses
+            from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+            if isinstance(moe_config, FusedMoEConfig):
+                out.append(("moe_config.num_local_experts", moe_config.num_local_experts))
+                mpc = moe_config.moe_parallel_config
+                for f in dataclasses.fields(mpc):
+                    v = getattr(mpc, f.name, None)
+                    if is_primitive(v):
+                        out.append(("moe_parallel_config." + f.name, canonicalize(v)))
+        except Exception:
+            pass
+
     return tuple(out)
 
 
