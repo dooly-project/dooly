@@ -15,7 +15,8 @@ Conventions
 - Env: `~/miniforge3/envs/dooly/bin/python` with
   `LD_PRELOAD=<env>/lib/libstdc++.so.6`; vLLM 0.17.1, torch 2.10, A100 80GB.
   vLLM 0.32.0: `~/miniforge3/envs/dooly-v32/bin/python` (no LD_PRELOAD), torch 2.13.
-  `python doolyprof/tests/tracer_ops_test.py` covers tracer op wrappers.
+  `python doolyprof/tests/tracer_ops_test.py` covers tracer op wrappers,
+  `python doolyprof/tests/moe_routing_test.py` MoE forced routing.
 
 ---
 
@@ -62,7 +63,7 @@ replaces the embedding module entry (one fused kernel now).
   the KDA module (same row count).
 - Unit tests (both envs): signature_fields 13, taint_parse 16, tracer_ops 7
   (new file: view(dtype), squeeze tuple dims, kernel link repair, engine
-  callable annotation); the tracer_ops tests fail on the unfixed
+  callable annotation), moe_routing 4; the tracer_ops tests fail on the unfixed
   code.
 
 ### Fake expert parallelism (`--enable-expert-parallel`)
@@ -78,6 +79,27 @@ sequence parallelism or all2all kernels, so nothing else needs patching.
   (all experts without EP). Local / remote global expert ids come from the
   layer's `expert_map` (-1 = held by another rank), not from an assumed
   placement.
+- Local pairs as a sweep axis (EP layers only): a rank computes only the
+  (token, expert) pairs routed to its own experts, and how many land there
+  depends on routing, not on the token count alone. The EP grid is
+  (num_tokens, local_pairs L, activated local experts A) with L a power-of-two
+  grid in [1, num_tokens*top_k] and A in [ceil(L/num_tokens), min(local
+  experts, L)] (`moe_hook.moe_ep_grid`). Forced routing puts exactly L pairs on
+  A local experts, spread evenly over tokens with distinct picks per token, and
+  every other pair on remote experts, which vLLM masks via `expert_map` as on a
+  real rank. Stored in `results.local_pairs` (NULL on every non-EP row; index
+  `idx_results_lookup_v2`). Without EP the grid, the forced ids and the stored
+  rows are unchanged (verified: identical signatures / row counts on all five
+  models, both vLLM versions; DSv2 MoE latency sum within 0.2%).
+- Result (fake TP 2 + EP, 256 tokens): the all-local corner (L = T*k)
+  reproduces the earlier EP numbers (DSv2 A=32 0.462 vs 0.462 ms); latency
+  vs L is flat while weight traffic dominates and rises once compute does:
+  DSv2 A=32 0.439 -> 0.462 ms over L 32..1536, gpt-oss A=16 0.332 ms at
+  L=512 (fair EP-2 share) vs 0.594 ms at L=1024 (all pairs local), so the
+  all-local routing overestimated an EP rank by up to ~45%. MoE rows grow
+  ~10x (DSv2 136 -> 1442); whole-model profiling stayed at 1.0-1.3 min.
+- DoolySim must pass the expected local pairs for EP rows (about
+  num_tokens*top_k/ep_size for balanced routing, more for a hot rank).
 - State hash adds the MoE layer's `FusedMoEParallelConfig` fields and
   `num_local_experts` (parameter shapes are not hashed, so TP and EP experts
   would otherwise share a signature). Changes every MoE signature hash once.
@@ -89,6 +111,8 @@ sequence parallelism or all2all kernels, so nothing else needs patching.
   1.235 ms vs TP2 0.612 ms, whose experts are half-width).
 - Not emulated: DP+EP (all2all / DeepEP dispatch through the EP group), EPLB.
   Not yet compared against a real 2-GPU EP run.
+- Tests: `python doolyprof/tests/moe_routing_test.py` (non-EP ids unchanged,
+  exact local-pair / activated counts, remote pairs on -1 experts, grid bounds).
 
 ### Open (0.32)
 - Sampler profile covers the greedy path only (the tracer's temperature-0

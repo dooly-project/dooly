@@ -121,7 +121,8 @@ class InputGenerator:
     def __init__(self, module: ModuleInfo, max_num_request: int=16,
                  max_num_token: int=1024, min_num_requests:int=1, test_counts: int=10,
                  dtype: torch.dtype = torch.bfloat16,
-                 moe_top_k: Optional[int] = None, moe_num_experts: Optional[int] = None):
+                 moe_top_k: Optional[int] = None, moe_num_experts: Optional[int] = None,
+                 moe_num_remote_experts: int = 0):
         self.module = module
         self.max_num_request = max_num_request
         self.max_num_token = max_num_token
@@ -134,6 +135,9 @@ class InputGenerator:
         # (input_generator only has the ModuleInfo, not the live module/config).
         self.moe_top_k = moe_top_k
         self.moe_num_experts = moe_num_experts
+        # Experts held by other ranks (expert parallelism): > 0 switches the
+        # MoE sweep to the 3-D (num_tokens, local_pairs, activated_experts) grid.
+        self.moe_num_remote_experts = moe_num_remote_experts
 
         self.dtype_map = TRACE_DTYPE_MAP
 
@@ -387,6 +391,18 @@ class InputGenerator:
         if self.moe_top_k is None or self.moe_num_experts is None:
             self.batches = [
                 {"num_tokens": n, "num_requests": 1} for n in num_tokens_sweep
+            ]
+            return self.batches
+
+        if self.moe_num_remote_experts > 0:
+            # Expert-parallel rank: how many pairs land here is its own axis
+            # (moe_hook.moe_ep_grid); activated_experts counts local experts.
+            from doolyprof.profiler.moe_hook import moe_ep_grid
+            self.batches = [
+                {"num_tokens": n, "num_requests": 1,
+                 "local_pairs": pairs, "activated_experts": activated}
+                for n in num_tokens_sweep
+                for pairs, activated in moe_ep_grid(self.moe_top_k, self.moe_num_experts, n)
             ]
             return self.batches
 
