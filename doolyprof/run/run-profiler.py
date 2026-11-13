@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite-comm", action="store_true",
                         help="Force re-profiling of communication operations")
     parser.add_argument("--no-cuda-graph-comm", action="store_true",
-                        help="Disable CUDA graph profiling for communication operations")
+                        help="No effect: the comm workers always run eager (enforce_eager=True)")
     parser.add_argument("--comm-timing", choices=["isolated", "amortized"], default="isolated",
                         help="Collective timing mode for the comm profiler: 'isolated' "
                              "(default, per-call synced median) or 'amortized' (measure_iters "
@@ -162,7 +162,9 @@ def run_comm_profiler(models, dtype_str, tp_size, db_path, overwrite, profile_me
     print(f"\n{'='*60}")
     print(f"Launching comm profiler via subprocess (REAL TP={tp_size})")
     print(f"Profile method: {profile_method.upper()}")
-    print(f"CUDA Graph: {'ENABLED' if use_cuda_graph else 'DISABLED'}")
+    # Both comm workers build the LLM with enforce_eager=True, so no CUDA graphs are captured
+    # and use_cuda_graph (--no-cuda-graph-comm) has nothing to switch off.
+    print("CUDA Graph: not used (comm workers run with enforce_eager=True)")
     print(f"Clean environment WITHOUT VLLM_FAKE_TP")
     print(f"{'='*60}\n")
 
@@ -187,8 +189,6 @@ def run_comm_profiler(models, dtype_str, tp_size, db_path, overwrite, profile_me
         else:
             # Use the original worker for cuda_event method
             comm_worker_path = os.path.join(os.path.dirname(__file__), 'comm_worker.py')
-            if not use_cuda_graph:
-                cmd.append('--no-cuda-graph')
 
         cmd = [
                 sys.executable, comm_worker_path,
