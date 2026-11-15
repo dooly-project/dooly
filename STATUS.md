@@ -20,6 +20,71 @@ Conventions
 
 ---
 
+## 2026-11-13 — Communication: the fake TP group is the engine's own, every call recorded
+Before: fake TP swapped the TP group for a hand-written `FakeTPGroup` with a
+fixed op set (all_reduce / all_gather / reduce_scatter via vLLM's fake impls;
+gather and broadcast_tensor_dict returned their input). all_gatherv,
+reduce_scatterv, send/recv and dispatch/combine raised AttributeError, and
+gather returned rank 0 the wrong (ungathered) shape. The comm profiler swept
+only all_reduce / all_gather / reduce_scatter with hand-written shapes, one
+variant per op name (`plan_info` keyed by name); anything else got no rows and
+DoolySim priced it at 0 ms.
+
+Change
+- `profiler/utils/comm_emulation.py`: the fake TP group is a real
+  `GroupCoordinator` built lazily by the engine's `init_model_parallel_group`
+  for N ranks, with `torch.distributed.new_group` returning
+  `EmulatedProcessGroup` and `get_device_communicator_cls()` resolving to an
+  emulated instance of the platform's own communicator class
+  (`DeviceCommunicatorBase.__init__`; the attribute its constructor assigns a
+  `PyNcclCommunicator`, found in that constructor's source, holds vLLM's own
+  `PyNcclCommunicator` built over a no-op NCCL library; every other transport
+  absent). `torch.distributed` functions that take a `group` are no-ops on
+  emulated groups. Outputs are allocated, shaped and tainted by the engine's
+  code; no op name or shape rule in DoolyProf. `use_custom_op_call` is off on
+  the emulated group so tainted tensors reach the communicator.
+- Recording: every public device-communicator method called with a payload
+  (tensor, or the shape it will produce) becomes
+  `COMM: <method> IN:[<taints>] ARGS:[<literal>]`, outermost call only. A call
+  that never reaches the transport (or raises first) gets a `COMM_NOOP`
+  marker inside its range and the parser drops it. ARGS is a Python literal
+  (bound arguments; tensors `{'tensor': i}`, tainted ints `{'int', 'taint'}`,
+  shapes, dtypes; plus api / group / world_size / payload dtypes): torch's
+  chrome-trace export does not escape double quotes, so JSON broke the trace.
+- `profiler/comm_args.py` reads ARGS (and legacy text). `dim_param` = first
+  untainted int argument, so existing coll_ops hashes are unchanged.
+- `run/comm_profiler.py`: one plan entry per (operation, dim_param, num_dims);
+  each is replayed through the same engine method on the real TP group with
+  the recorded arguments: swept dims (NUM_TOKS / NUM_REQS) = per-rank
+  workload, per-rank size lists = [workload] * N, a dim traced as such a
+  list's sum = its sum (reduce_scatterv). send/recv: rank 0 sends, rank 1
+  receives. `--profile-send-recv` sweep unchanged; kineto path unchanged.
+
+Validation
+- `python doolyprof/tests/comm_emulation_test.py` (1 GPU): all_reduce,
+  all_gather, all_gatherv, reduce_scatter, reduce_scatterv, gather,
+  broadcast, send, recv return rank-0 shapes with taints, no NCCL kernel runs,
+  one COMM range each, parser drops a raising dispatch. PASS on 0.17.1, 0.32.
+- `python doolyprof/tests/comm_replay_test.py --gpus 0,1`: the same 9 ops
+  planned and measured on a real TP=2 engine (609 sizes each). PASS on 0.17.1, 0.32.
+- Llama-3.1-8B fake TP 2, trace + profile, old vs new code on both versions:
+  same 66 COMM ranges and inputs, identical compute signatures and
+  model_operations, identical coll_ops hashes, model_collectives and
+  configs; latency new/old median 0.97-0.99 (all_reduce now starts at one
+  token rather than a quarter token, since it replays the traced shape).
+- tracer_ops / taint_parse / signature_fields / moe_routing tests pass.
+
+Open
+- Recorded when met, but PP and DP groups are still pinned to size 1, so a
+  model run does not issue PP send/recv or DP+EP dispatch/combine yet.
+- dispatch/combine can be recorded, but the profiler's real TP group has no
+  all2all manager to replay them on.
+- `dim_param` keeps one integer: gather is keyed by `dst`, not `dim`.
+- 0.32 engine shutdown logs `Invalid process group specified` in
+  `destroy_model_parallel` (also with the old code; trace and profile finish).
+
+---
+
 ## 2026-10-29 — vLLM 0.32.0 port, fake expert parallelism
 Env: new conda env `dooly-v32` (vLLM 0.32.0, torch 2.13.0+cu130, transformers
 5.19, flashinfer 0.7.0.post1). `dooly` (0.17.1) is untouched and DoolySim still

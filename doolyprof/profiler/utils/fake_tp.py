@@ -22,13 +22,8 @@ from torch.profiler import record_function
 from doolyprof.tracer.tensor import TaintedTensor
 from doolyprof.tracer.types import TaintedInt, TaintedShape
 
-def format_tensor_shape(tensor):
-    if isinstance(tensor, TaintedTensor):
-        return tensor.taint_str_with_history()
-    elif isinstance(tensor, torch.Tensor):
-        dims = [f"?({d})" for d in tensor.shape]
-        return "[" + ", ".join(dims) + "]"
-    return None
+from doolyprof.profiler.utils.comm_emulation import format_tensor_shape  # noqa: E402,F401
+
 
 def get_fake_tp_size() -> int:
     """Return the fake TP size from the VLLM_FAKE_TP environment variable."""
@@ -61,10 +56,10 @@ def apply_fake_tp_patches(tp_size: int) -> None:
     """
     Patch vLLM internals to simulate tensor parallelism on a single GPU.
 
-    Patches three areas:
-    1. parallel_state — world size, rank, and TP group
-    2. distributed — all-reduce/all-gather become no-ops
-    3. linear layers — world size and rank for column/row parallel
+    Patches:
+    1. parallel_state — world size and rank accessors, and the TP group, which
+       becomes an emulated GroupCoordinator (communication recorded, not run)
+    2. ModelConfig head counts — sharded by the fake TP size
 
     Args:
         tp_size: The simulated tensor parallel world size (e.g. 2, 4, 8).
@@ -75,122 +70,28 @@ def apply_fake_tp_patches(tp_size: int) -> None:
     from vllm.distributed import communication_op
 
     # --- Fake TP group ---------------------------------------------------
-    class FakeTPGroup:
-        _COMM_OPS = {'all_reduce', 'all_gather', 'reduce_scatter', 'gather', 'broadcast_tensor_dict'}
+    # A real vLLM GroupCoordinator for tp_size ranks (this process is rank 0),
+    # built lazily by the engine's own init_model_parallel_group on emulated
+    # transports (comm_emulation): the engine's own code computes the outputs
+    # of every communication it makes on the group (all_reduce, all_gather,
+    # all_gatherv, reduce_scatter(v), gather, send/recv, dispatch/combine, ...),
+    # and each data-moving call is recorded as a COMM range with its tainted
+    # inputs and bound arguments.
+    from doolyprof.profiler.utils.comm_emulation import build_emulated_group
+    emulated_groups = {}
 
-        world_size = tp_size
-        rank_in_group = 0
-        local_rank = 0
-        rank = 0
-        device = torch.device("cuda")
-        cpu_group = None
-        device_group = None
-
-        def __getattribute__(self, name):
-            # Get the actual attribute (avoid infinite recursion)
-            attr = object.__getattribute__(self, name)
-
-            # Don't wrap special attributes
-            if name.startswith('_') or name in {'world_size', 'rank_in_group', 'local_rank', 'rank', 'device', 'cpu_group', 'device_group'}:
-                return attr
-
-            # Check if it's a communication operation
-            comm_ops = object.__getattribute__(self, '_COMM_OPS')
-
-            # If it's a callable comm op, wrap it with logging
-            if name in comm_ops and callable(attr):
-                return self._wrap_comm_call(name, attr)
-
-            return attr
-    
-        def _wrap_comm_call(self, op_name: str, method):
-            def wrapper(*args, **kwargs):
-                # Build annotation (matches API: format)
-                tainted_ints=[]
-                plain_ints=[]
-                input_shapes=[]
-
-                def collect_from(obj, param_name=None):
-                    if isinstance(obj, TaintedInt):
-                        if obj.taint is not None:
-                            tainted_ints.append(f"{obj.taint}={obj.value}")
-                    elif isinstance(obj, int):
-                        # Capture plain ints with parameter name if available
-                        if param_name:
-                            plain_ints.append(f"{param_name}={obj}")
-                        else:
-                            plain_ints.append(str(obj))
-                    elif isinstance(obj, torch.Tensor):
-                        shape_str = format_tensor_shape(obj)
-                        if shape_str:
-                            input_shapes.append(shape_str)
-                    elif isinstance(obj, (list, tuple)) and not isinstance(obj, TaintedShape):
-                        for item in obj:
-                            collect_from(item)
-                    elif isinstance(obj, dict):
-                        for k, v in obj.items():
-                            collect_from(v, param_name=k)
-
-                # Collect from positional args
-                collect_from(args)
-
-                # Collect from keyword args with parameter names
-                for key, value in kwargs.items():
-                    collect_from(value, param_name=key)
-
-                taint_str = " | ".join(input_shapes) if input_shapes else "no_inputs"
-                annotated_name = f"COMM: {op_name} IN:[{taint_str}]"
-
-                # Add ARGS: tainted ints first, then plain ints, then tp_size
-                args_list = []
-                args_list.extend(tainted_ints)
-                args_list.extend(plain_ints)
-                # args_list.append(f"tp={self.world_size}")
-
-                if args_list:
-                    annotated_name += " ARGS:[" + ", ".join(args_list) + "]"
-
-                with record_function(annotated_name):
-                    return method(*args, **kwargs)
-
-            return wrapper
-
-        def all_reduce(self, x):
-            # with record_function(f"COMM: vllm::all_reduce IN:[{format_tensor_shape(x)}])"):
-            return ps.all_reduce_fake(
-                tensor=x, group_name="fake_reduce"
-            )
-
-        def all_gather(self, x, dim):
-            # with record_function(f"COMM: vllm::all_gather IN:[{format_tensor_shape(x)}, dim={dim})]"):
-            return ps.all_gather_fake(
-                tensor=x, dim=dim,
-                world_size=self.world_size,
-                group_name="fake_gather",
-            )
-
-        def reduce_scatter(self, tensor, dim, world_size, group_name):
-            # with record_function(f"COMM: vllm::reduce_scatter(tensor={format_tensor_shape(tensor)}, dim={dim}), world_size={world_size}, group_name={group_name}"):
-            return ps.reduce_scatter_fake(
-                tensor=tensor, dim=dim,
-            world_size=world_size,
-            group_name=group_name,
-        )
-                
-        def gather(self, tensor, dst=0, dim=-1):
-            # No-op in fake TP
-            return tensor
-
-        def broadcast_tensor_dict(self, tensor_dict=None, src=0, group=None, metadata_group=None):
-            # No-op in fake TP
-            return tensor_dict if tensor_dict is not None else {}
-        
-    fake_group = FakeTPGroup()
+    def get_fake_tp_group():
+        group = emulated_groups.get("tp")
+        if group is None:
+            real = getattr(ps, "_TP", None)
+            prefix = real.unique_name.split(":")[0] if real is not None else "tp"
+            group = emulated_groups["tp"] = build_emulated_group(tp_size, prefix)
+        return group
 
     # --- parallel_state --------------------------------------------------
     # TP group functions
-    ps.get_tp_group = lambda: fake_group
-    communication_op.get_tp_group = lambda: fake_group
+    ps.get_tp_group = get_fake_tp_group
+    communication_op.get_tp_group = get_fake_tp_group
     ps.get_tensor_model_parallel_world_size = lambda: tp_size
     ps.get_tensor_model_parallel_rank = lambda: 0
 

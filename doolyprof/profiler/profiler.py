@@ -1431,9 +1431,11 @@ class Profiler:
                 collective_metadata = {}  # Store first occurrence metadata
 
                 for collective_op in model.collective_ops:
-                    # Extract dim_param from trace
-                    dim_param_str = collective_op.hierarchy.anchor.args.get('comm_args')
-                    dim_param = int(dim_param_str) if dim_param_str else None
+                    # dim_param: the call's first untainted integer argument
+                    # (e.g. the gather/scatter dim), read from the COMM
+                    # annotation's ARGS (profiler/comm_args.py)
+                    from doolyprof.profiler.comm_args import parse_comm_args, identity_int
+                    dim_param = identity_int(parse_comm_args(collective_op.hierarchy.anchor.args.get('comm_args')))
 
                     # Get num_dims from tensor shape
                     tensor_shape = collective_op.inputs[0].actual_shape

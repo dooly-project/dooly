@@ -72,6 +72,172 @@ def _time_collective(op_fn, warmup_iters: int, measure_iters: int,
     return float(np.median(latencies))
 
 
+# Point-to-point needs a matching side on the peer rank: the engine's send is
+# matched by its recv. Every other recorded call is a collective and is
+# replayed by all ranks with the recorded arguments.
+_P2P_PEER = {"send": "recv", "recv": "send"}
+
+
+def _variable_labels(entry):
+    return set(entry.get("variable_labels", []))
+
+
+def _rebuild(value, workload, tensors, labels, device):
+    """Recorded argument (comm_args JSON) -> live value at this sweep point."""
+    from doolyprof.profiler.comm_args import is_tensor_ref
+    if is_tensor_ref(value):
+        return tensors[value["tensor"]]
+    if isinstance(value, dict):
+        if "int" in value:
+            return workload if value.get("taint") in labels else value["int"]
+        if "shape" in value:
+            return torch.Size([_rebuild(d, workload, tensors, labels, device) for d in value["shape"]])
+        if "dtype" in value:
+            return getattr(torch, value["dtype"])
+        if "device" in value:
+            return device
+        return {k: _rebuild(v, workload, tensors, labels, device) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_rebuild(v, workload, tensors, labels, device) for v in value]
+    return value
+
+
+def _swept_lists(meta, labels):
+    """Traced values of list arguments made of swept integers (e.g. per-rank
+    ``sizes`` of all_gatherv / reduce_scatterv)."""
+    lists = []
+
+    def visit(v):
+        if isinstance(v, list) and v and all(isinstance(x, dict) and x.get("taint") in labels for x in v):
+            lists.append([x["int"] for x in v])
+        elif isinstance(v, list):
+            for x in v:
+                visit(x)
+        elif isinstance(v, dict) and "int" not in v and "shape" not in v:
+            for x in v.values():
+                visit(x)
+
+    for v in meta.get("args", {}).values():
+        visit(v)
+    return lists
+
+
+def _swept_dim(traced, workload, lists):
+    """A swept payload dim at this sweep point. Every swept integer argument
+    becomes ``workload`` (so a per-rank list becomes [workload] * len); a dim
+    that was traced as the sum of such a list keeps being its sum (e.g. the
+    reduce_scatterv input), any other swept dim is ``workload``."""
+    for traced_list in lists:
+        if traced == sum(traced_list) and len(traced_list) > 1 and traced not in traced_list:
+            return workload * len(traced_list)
+    return workload
+
+
+def _payload_tensors(entry, workload, dtype, device):
+    """Inputs at the traced shapes with every swept (NUM_TOKS / NUM_REQS) dim
+    rebuilt for ``workload`` (_swept_dim). Floating payloads use the profiled
+    dtype, others keep the traced dtype."""
+    traced = entry["meta"].get("dtypes", [])
+    lists = _swept_lists(entry["meta"], _variable_labels(entry))
+    tensors = []
+    for i, inp in enumerate(entry["inputs"]):
+        shape = [_swept_dim(size, workload, lists) if var else size
+                 for size, var in zip(inp["shape"], inp["variable"])]
+        tdt = getattr(torch, traced[i], None) if i < len(traced) else None
+        if tdt is None or tdt.is_floating_point:
+            tdt = dtype
+        if tdt.is_floating_point:
+            tensors.append(torch.randn(shape, dtype=tdt, device=device))
+        else:
+            tensors.append(torch.zeros(shape, dtype=tdt, device=device))
+    return tensors
+
+
+def _payload_bytes(tensors, kwargs, dtype):
+    if tensors:
+        return sum(t.numel() * t.element_size() for t in tensors)
+    # Receiving side: the payload is the shape it will produce (e.g. recv(size, dtype)).
+    shapes = [v for v in kwargs.values() if isinstance(v, torch.Size)]
+    dtypes = [v for v in kwargs.values() if isinstance(v, torch.dtype)] or [dtype]
+    return sum(int(np.prod(s)) * torch.empty((), dtype=dtypes[0]).element_size() for s in shapes)
+
+
+def _build_call(entry, workload, comm, tp_rank, dtype, device):
+    """(no-arg callable replaying the recorded call on the real group, payload bytes)."""
+    import inspect
+    op = entry["operation"]
+    meta = entry["meta"]
+    labels = _variable_labels(entry)
+    tensors = _payload_tensors(entry, workload, dtype, device)
+    kwargs = {k: _rebuild(v, workload, tensors, labels, device) for k, v in meta.get("args", {}).items()}
+    size_bytes = _payload_bytes(tensors, kwargs, dtype)
+
+    if op in _P2P_PEER:
+        # Rank 0 sends the recorded payload to rank 1, which receives it, through
+        # the engine's own send/recv (dst/src are local ranks).
+        if tensors:
+            payload = tensors[0]
+            shape, pdtype = payload.shape, payload.dtype
+        else:
+            shape = next(v for v in kwargs.values() if isinstance(v, torch.Size))
+            pdtype = next((v for v in kwargs.values() if isinstance(v, torch.dtype)), dtype)
+            payload = torch.randn(shape, dtype=pdtype, device=device) if pdtype.is_floating_point \
+                else torch.zeros(shape, dtype=pdtype, device=device)
+
+        def _call():
+            if tp_rank == 0:
+                comm.send(payload, dst=1)
+            elif tp_rank == 1:
+                comm.recv(shape, pdtype, src=0)
+        return _call, size_bytes
+
+    if meta.get("api") == "torch.distributed":
+        fn = getattr(torch.distributed, op)
+        kwargs["group"] = comm.device_group
+    else:
+        fn = getattr(comm, op)
+    params = inspect.signature(fn).parameters
+    accepts_any = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    call_kwargs = {k: v for k, v in kwargs.items() if accepts_any or k in params}
+    return (lambda: fn(**call_kwargs)), size_bytes
+
+
+def _profile_recorded(entry, sizes, comm, tp_rank, tp_world_size, dtype, device,
+                      warmup_iters, measure_iters, comm_timing, tp_size, backend, topology, dtype_str):
+    op = entry["operation"]
+    tag = f"{op} (dim={entry['dim_param']}, ndims={entry['num_dims']})"
+    if op in _P2P_PEER and tp_world_size < 2:
+        print(f"[WARN] Skipping {tag}: point-to-point needs >= 2 ranks")
+        return []
+    if entry["meta"].get("api") != "torch.distributed" and not callable(getattr(comm, op, None)):
+        print(f"[WARN] Skipping {tag}: the real group's device communicator has no '{op}'")
+        return []
+    model_dims = max(1, int(entry.get("model_config_dims") or 1))
+    workloads = sorted({s // model_dims for s in sizes} - {0})
+    if not workloads:
+        return []
+    # Calls that moved no data on the emulated group were already dropped at
+    # trace time (COMM_NOOP), so every planned entry is a real transfer.
+    print(f"Profiling {tag} over {len(workloads)} sizes...")
+    results = []
+    for workload in workloads:
+        call, size_bytes = _build_call(entry, workload, comm, tp_rank, dtype, device)
+        latency = _time_collective(call, warmup_iters, measure_iters, comm_timing)
+        results.append({
+            'operation': op,
+            'topology': topology,
+            'backend': backend,
+            'tp_size': tp_size,
+            'size_bytes': size_bytes,
+            'dtype': dtype_str,
+            'dim_param': entry['dim_param'],
+            'num_dims': entry['num_dims'],
+            'latency_ms': latency,
+        })
+    print(f"✓ Completed {tag}")
+    return results
+
+
 # ============================================================================
 # STANDALONE WORKER FUNCTION (called via collective_rpc)
 # ============================================================================
@@ -87,15 +253,19 @@ def _run_profiling_on_worker_standalone(
     """
     Standalone worker function for profiling (not a class method).
     This runs inside each worker process via collective_rpc.
+
+    Every recorded collective variant in ``plan_info`` (CommProfiler.plan) is
+    replayed through the same engine method it was recorded from, on this
+    real TP group, with its recorded arguments and every swept dimension set
+    to the per-rank workload of each sweep size.
     """
-    # Get TP group (should be initialized in worker process)
     from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
     tp_group = get_tp_group()
     tp_world_size = get_tensor_model_parallel_world_size()
     tp_rank = get_tensor_model_parallel_rank()
     device = torch.device("cuda")
+    comm = tp_group.device_communicator
 
-    # Reconstruct config from dict
     dtype = config_dict['dtype']
     warmup_iters = config_dict['warmup_iters']
     measure_iters = config_dict['measure_iters']
@@ -103,8 +273,6 @@ def _run_profiling_on_worker_standalone(
     # Timing mode: "isolated" (default, per-call) or "amortized" (back-to-back).
     comm_timing = config_dict.get('comm_timing', 'isolated')
     print(f"[DEBUG Worker] comm_timing mode = {comm_timing}")
-
-    # DEBUG: Check TP setup
     print(f"[DEBUG Worker] TP rank={tp_rank}/{tp_world_size}, dtype={dtype}")
 
     # Generate sweep sizes
@@ -119,136 +287,10 @@ def _run_profiling_on_worker_standalone(
     results = []
     dtype_str = str(dtype).split('.')[-1]
 
-    # Profile all_reduce
-    if profile_flags.get('all_reduce', False):
-        print("Profiling all reduce...")
-
-        for size in sizes:
-            try:
-                # Create test tensor
-                tensor = torch.randn(size, dtype=dtype, device=device)
-                size_bytes = tensor.numel() * DTYPE_TO_BYTES[dtype]
-
-                latency = _time_collective(
-                    lambda: tp_group.all_reduce(tensor),
-                    warmup_iters, measure_iters, comm_timing,
-                )
-
-                results.append({
-                    'operation': 'all_reduce',
-                    'topology': topology,
-                    'backend': backend,
-                    'tp_size': tp_size,
-                    'size_bytes': size_bytes,
-                    'dtype': dtype_str,
-                    'dim_param': plan_info['all_reduce']['dim_param'],
-                    # 'num_dims': len([size]),
-                    'num_dims': plan_info['all_reduce']['dim_count'],
-                    'latency_ms': latency
-                })
-            except Exception as e:
-                raise ValueError(f"Error profiling all_reduce (size={size}): {e}")
-
-        print(f"✓ Completed all_reduce profiling")
-
-    # Profile all_gather
-    if profile_flags.get('all_gather', False):
-        print("Profiling all gather...")
-        dim_param = plan_info['all_gather']['dim_param']
-        original_shape = plan_info['all_gather']['tensor_shape']
-        tensor_taints = plan_info['all_gather']['tensor_taints']
-        model_config_dims = plan_info['all_gather']['model_config_dims']
-
-        skipped_count = 0
-        for size in sizes:
-            workload = size // model_config_dims
-            if workload == 0:
-                skipped_count += 1
-                continue
-
-            # Reconstruct tensor shape
-            tensor_dim = []
-            for dim_size, taint in zip(original_shape, tensor_taints):
-                taint_str = str(taint)
-                is_variable_dim = 'NUM_TOK' in taint_str or 'NUM_REQUEST' in taint_str
-                tensor_dim.append(workload if is_variable_dim else dim_size)
-            tensor_dim = tuple(tensor_dim)
-
-            try:
-                # Create test tensor
-                tensor = torch.randn(tensor_dim, dtype=dtype, device=device)
-                size_bytes = tensor.numel() * DTYPE_TO_BYTES[dtype]
-
-                latency = _time_collective(
-                    lambda: tp_group.all_gather(tensor, dim=dim_param),
-                    warmup_iters, measure_iters, comm_timing,
-                )
-
-                results.append({
-                    'operation': 'all_gather',
-                    'topology': topology,
-                    'backend': backend,
-                    'tp_size': tp_size,
-                    'size_bytes': size_bytes,
-                    'dtype': dtype_str,
-                    'dim_param': dim_param,
-                    'num_dims': len(tensor_dim),
-                    'latency_ms': latency
-                })
-            except Exception as e:
-                raise ValueError(f"Error profiling all_gather (size={size}): {e}")
-
-        print(f"✓ Completed all_gather profiling (skipped {skipped_count} sizes)")
-
-    # Profile reduce_scatter
-    if profile_flags.get('reduce_scatter', False):
-        print("Profiling reduce_scatter...")
-        dim_param = plan_info['reduce_scatter']['dim_param']
-        original_shape = plan_info['reduce_scatter']['tensor_shape']
-        tensor_taints = plan_info['reduce_scatter']['tensor_taints']
-        model_config_dims = plan_info['reduce_scatter']['model_config_dims']
-
-        for size in sizes:
-            workload = size // model_config_dims
-            if workload == 0:
-                continue
-
-            # Reconstruct tensor shape
-            tensor_dim = []
-            for dim_size, taint in zip(original_shape, tensor_taints):
-                taint_str = str(taint)
-                is_variable_dim = 'NUM_TOK' in taint_str or 'NUM_REQUEST' in taint_str
-                tensor_dim.append(workload if is_variable_dim else dim_size)
-            tensor_dim = tuple(tensor_dim)
-
-            try:
-                # Create test tensor
-                tensor = torch.randn(tensor_dim, dtype=dtype, device=device)
-                size_bytes = tensor.numel() * DTYPE_TO_BYTES[dtype]
-
-                latency = _time_collective(
-                    lambda: tp_group.reduce_scatter(tensor, dim=dim_param),
-                    warmup_iters, measure_iters, comm_timing,
-                )
-
-                dim0 = tensor_dim[0] if len(tensor_dim) > 0 else None
-                dim1 = tensor_dim[1] if len(tensor_dim) > 1 else None
-
-                results.append({
-                    'operation': 'reduce_scatter',
-                    'topology': topology,
-                    'backend': backend,
-                    'tp_size': tp_size,
-                    'size_bytes': size_bytes,
-                    'dtype': dtype_str,
-                    'dim_param': dim_param,
-                    'num_dims': len(tensor_dim),
-                    'latency_ms': latency
-                })
-            except Exception as e:
-                raise ValueError(f"Error profiling reduce_scatter (size={size}): {e}")
-
-        print(f"✓ Completed reduce_scatter profiling")
+    for key in sorted(plan_info):
+        results.extend(_profile_recorded(
+            plan_info[key], sizes, comm, tp_rank, tp_world_size, dtype, device,
+            warmup_iters, measure_iters, comm_timing, tp_size, backend, topology, dtype_str))
 
     # Profile send/recv (pipeline-parallel stage boundary), through vLLM's group
     # coordinator -- same path as all_reduce above, identical to what PP pays.
@@ -288,49 +330,6 @@ def _run_profiling_on_worker_standalone(
                     raise ValueError(f"Error profiling send_recv (size={size}): {e}")
 
             print(f"✓ Completed send_recv profiling")
-
-    # Profile all-to-all (expert-parallel dispatch/combine). The group coordinator has
-    # no all_to_all method, so use torch.distributed.all_to_all_single on the group's
-    # NCCL process group. Keyed by per-rank message size, like the other collectives.
-    if profile_flags.get('all_to_all', False):
-        if tp_world_size < 2:
-            print(f"[WARN] Skipping all_to_all: requires >= 2 ranks, got {tp_world_size}")
-        else:
-            import torch.distributed as dist
-            print("Profiling all_to_all...")
-            group = tp_group.device_group
-            for size in sizes:
-                try:
-                    # all_to_all_single requires the buffer be divisible by world_size
-                    n = (size // tp_world_size) * tp_world_size
-                    if n == 0:
-                        continue
-                    inp = torch.randn(n, dtype=dtype, device=device)
-                    out = torch.empty_like(inp)
-                    size_bytes = inp.numel() * DTYPE_TO_BYTES[dtype]
-
-                    def _a2a():
-                        dist.all_to_all_single(out, inp, group=group)
-
-                    latency = _time_collective(
-                        _a2a, warmup_iters, measure_iters, comm_timing,
-                    )
-
-                    results.append({
-                        'operation': 'all_to_all',
-                        'topology': topology,
-                        'backend': backend,
-                        'tp_size': tp_size,
-                        'size_bytes': size_bytes,
-                        'dtype': dtype_str,
-                        'dim_param': None,
-                        'num_dims': 1,
-                        'latency_ms': latency
-                    })
-                except Exception as e:
-                    raise ValueError(f"Error profiling all_to_all (size={size}): {e}")
-
-            print(f"✓ Completed all_to_all profiling")
 
     return results
 
@@ -422,7 +421,7 @@ class CommProfiler:
         
         print(f"✓ Database initialized at {self.db_path}")
 
-    def should_profile(self, tp_size, overwrite=False):
+    def should_profile(self, tp_size, overwrite=False, topology="mew1"):
         """Check if we should profile based on existing data and overwrite flag."""
         if overwrite:
             print("[COMM] Overwrite mode enabled - will re-profile all operations")
@@ -431,68 +430,62 @@ class CommProfiler:
         if not hasattr(self, 'plan_info') or not self.plan_info:
             return False
 
-        # Check if any planned operations need profiling
+        # Check every planned (operation, dim_param, num_dims) variant
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
         needs_profiling = False
-        for op_name in self.plan_info.keys():
-            # Check if this operation already has data
+        for entry in self.plan_info.values():
             existing_count = cursor.execute("""
                 SELECT COUNT(*) FROM coll_op_results
                 WHERE operation = ? AND topology = ? AND tp_size = ?
-            """, (op_name, "mew1", tp_size)).fetchone()[0]
-
+                AND dim_param IS ? AND num_dims = ?
+            """, (entry["operation"], topology, tp_size, entry["dim_param"], entry["num_dims"])).fetchone()[0]
+            tag = f"{entry['operation']} (dim={entry['dim_param']}, ndims={entry['num_dims']})"
             if existing_count == 0:
                 needs_profiling = True
-                print(f"[COMM] {op_name} needs profiling (no existing data)")
+                print(f"[COMM] {tag} needs profiling (no existing data)")
             else:
-                print(f"[COMM] {op_name} already profiled ({existing_count} measurements), skipping")
+                print(f"[COMM] {tag} already profiled ({existing_count} measurements), skipping")
 
         conn.close()
         return needs_profiling
 
     def plan(self, collectives: List[Any]):
-        from doolyprof.profiler.finput import ProfileInput
+        """One entry per recorded collective variant, keyed like coll_ops
+        (operation, dim_param, num_dims): the traced input shapes, which of
+        their dimensions are swept (NUM_TOKS / NUM_REQS taints), the product
+        of their MODEL_CONFIG dims, and the recorded call (comm_args)."""
+        from doolyprof.profiler.comm_args import parse_comm_args, identity_int
+        from doolyprof.profiler.taint import DimensionType
 
-        # extract input shape, dim0, dim1
-        self.plan_info: Dict[str, Dict[str, Any]]= {}
-        
+        swept = {DimensionType.NUM_TOKENS, DimensionType.NUM_REQUESTS}
+        self.plan_info: Dict[str, Dict[str, Any]] = {}
         for collective in collectives:
-            tensors: List[ProfileInput] = collective.inputs
-            tensor_shape: List[Any] = [tensor.actual_shape for tensor in tensors]
-            tensor_taints: List[Any] = [tensor.dimensions for tensor in tensors]
-            args_str = collective.hierarchy.anchor.args.get('comm_args', None)
-
-            # Parse comm_args (stored as string like "-1" or "0")
-            dim_param = None
-            if args_str is not None:
-                try:
-                    dim_param = int(args_str)
-                except ValueError:
-                    print(f"Warning: Could not parse comm_args '{args_str}' as integer")
-
-            # collective operations only have single tensor input
-            model_config_idxs = tensors[0].get_model_config_dims()
+            tensors = collective.inputs
+            if not tensors:
+                continue
+            meta = parse_comm_args(collective.hierarchy.anchor.args.get('comm_args'))
+            shapes = [list(t.actual_shape) for t in tensors]
+            dim_param = identity_int(meta)
+            num_dims = len(shapes[0])
+            key = f"{collective.operation_name}|{dim_param}|{num_dims}"
+            if key in self.plan_info:
+                continue
             model_dims = 1
-            for model_config_idx in model_config_idxs:
-                model_dims *= tensor_shape[0][model_config_idx]
-
-            print(model_dims)
-
-            self.plan_info[collective.operation_name] = {
-                'tensor_shape': tensor_shape[0],
-                'tensor_taints': tensor_taints[0],
-                'taint_to_shape': dict(zip(tensor_taints[0], tensor_shape[0])),
+            for idx in tensors[0].get_model_config_dims():
+                model_dims *= shapes[0][idx]
+            self.plan_info[key] = {
+                'operation': collective.operation_name,
+                'dim_param': dim_param,
+                'num_dims': num_dims,
                 'model_config_dims': model_dims,
-                'dim_count': len(tensor_shape[0]),
-                'dim_param': dim_param  # Store as integer, not string
+                'inputs': [{'shape': shape, 'variable': [d in swept for d in t.dimensions]}
+                           for shape, t in zip(shapes, tensors)],
+                'variable_labels': sorted(d.value for d in swept),
+                'meta': meta,
             }
-            print([tensor.get_model_config_dims() for tensor in tensors])
-            
-        self.profile_all_reduce_bool: bool = True if self.plan_info.get('all_reduce', None) else False
-        self.profile_all_gather_bool: bool = True if self.plan_info.get('all_gather', None) else False
-        self.profile_reduce_scatter_bool: bool = True if self.plan_info.get('reduce_scatter', None) else False
+            print(f"[COMM] planned {key}: inputs={shapes}, model_config_dims={model_dims}")
         self.profile_send_recv_bool: bool = False  # enabled by the worker for PP profiling
 
     def profile(
@@ -539,9 +532,6 @@ class CommProfiler:
 
         # Prepare profile flags
         profile_flags = {
-            'all_reduce': self.profile_all_reduce_bool,
-            'all_gather': self.profile_all_gather_bool,
-            'reduce_scatter': self.profile_reduce_scatter_bool,
             'send_recv': getattr(self, 'profile_send_recv_bool', False),
         }
 
