@@ -103,10 +103,12 @@ def parse_args() -> argparse.Namespace:
                         help="Force re-profiling of communication operations")
     parser.add_argument("--no-cuda-graph-comm", action="store_true",
                         help="No effect: the comm workers always run eager (enforce_eager=True)")
-    parser.add_argument("--comm-timing", choices=["isolated", "amortized"], default="isolated",
+    parser.add_argument("--comm-timing", choices=["isolated", "amortized", "graph"], default="isolated",
                         help="Collective timing mode for the comm profiler: 'isolated' "
-                             "(default, per-call synced median) or 'amortized' (measure_iters "
-                             "back-to-back between two CUDA events, single sync, divided by iters).")
+                             "(default, per-call synced median), 'amortized' (measure_iters "
+                             "back-to-back between two CUDA events, single sync, divided by iters) or "
+                             "'graph' (GPU time only, from CUDA-graph replays captured in the engine's "
+                             "graph_capture context; excludes CPU launch time).")
     return parser.parse_args()
 
 
