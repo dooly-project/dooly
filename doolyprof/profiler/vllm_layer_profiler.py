@@ -66,7 +66,7 @@ class VLLMLayerProfiler:
         model_name: str,
         dtype: str = "bfloat16",
         enforce_eager: bool = True,
-        gpu_memory_utilization: float = 0.9,
+        gpu_memory_utilization: Optional[float] = None,
         max_model_len: int = 4096,
         attn_backend: str = "FLASHINFER",
         flash_attn_version: int = 2,
@@ -81,7 +81,8 @@ class VLLMLayerProfiler:
             model_name: HuggingFace model name
             dtype: Data type ("float16" or "bfloat16")
             enforce_eager: Disable CUDA graphs for easier profiling
-            gpu_memory_utilization: Fraction of GPU memory to use
+            gpu_memory_utilization: Fraction of GPU memory to use; None = what is
+                free on the GPU now, at most 0.9 (utils/gpu_memory.py)
             max_model_len: Maximum sequence length
             quantization: Optional quantization scheme (e.g. "fp8", "awq", "gptq").
                 When set with load_format="dummy", vLLM initializes random
@@ -100,6 +101,9 @@ class VLLMLayerProfiler:
         # index 0 within this process, so we always use cuda:0 locally.
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu
         self.device = torch.device("cuda:0")
+        if gpu_memory_utilization is None:
+            from doolyprof.profiler.utils.gpu_memory import engine_memory_fraction
+            gpu_memory_utilization = engine_memory_fraction(devices=1, who="layer profiler")
 
         print(f"[VLLMLayerProfiler] Initializing vLLM with model: {model_name}")
 
@@ -513,7 +517,7 @@ def _run_profiler_in_subprocess(model_name: str, dtype: str, attn_backend: str):
     vlp = VLLMLayerProfiler(
         model_name=model_name,
         dtype=dtype,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=None,
         attn_backend=attn_backend,
     )
 

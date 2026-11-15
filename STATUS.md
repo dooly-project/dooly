@@ -20,6 +20,40 @@ Conventions
 
 ---
 
+## 2026-11-14 — GPU memory request and child-process failures
+Crash seen on mew0: run-profiler's resolver died at vLLM startup with "Free
+memory on device cuda:0 (27.77/79.25 GiB) on startup is less than desired GPU
+memory utilization (0.9, 71.32 GiB)" (another user's job had taken ~51 GiB in
+the seconds after the GPU was checked free), and run-profiler then waited 90
+minutes on a result that never came. Three DoolyProf issues behind it:
+- Fixed 0.9 memory request. vLLM refuses to start unless free memory >=
+  total x gpu_memory_utilization, so the tracer, resolver and profiler (0.9)
+  and the comm profiler (0.5) failed whenever another process held more than
+  10% (50%) of a GPU, even an idle one, although they need only the weights
+  and a small KV cache. Reproduced on mew1 GPU 1 with an idle 9.2 GiB
+  co-tenant. Now `profiler/utils/gpu_memory.engine_memory_fraction`: the
+  engine gets min(cap, free/total - (1 - cap)) over the GPUs it uses. On an
+  empty GPU that is the old cap; memory held elsewhere comes out of vLLM's KV
+  share and DoolyProf keeps the (1 - cap) headroom it always had for its own
+  tensors (a first version that kept only 1 GiB made the LM-head dummy run
+  OOM). Read through NVML, no CUDA context in the caller. A warning says when
+  other processes hold memory (latencies are unreliable if they also compute).
+- OOM treated as "op does not run standalone". `ModuleResolver._try_dummy_run`
+  caught CUDA OOM like any other error, walked up, found no parent and
+  skipped the op: the profile silently lost the LM head. OOM now raises.
+- Parent waited forever on a dead child. run-profiler (resolver) and
+  Profiler._profile_models (vLLM-module subprocess) called result_queue.get()
+  before checking the child; now `profiler/utils/procs.get_child_result`
+  raises with the child's exit code.
+Validation (mew1 GPU 1, idle co-tenant 9.2 GiB, Llama-3.1-8B fake TP 2):
+old setting -> the same ValueError; new -> full profile, 14 signatures / 258
+rows, identical to an empty-GPU run. GPU 1 filled to 70 GiB -> run-profiler
+exits code 1 after 25 s naming the resolver (was: hang).
+`python doolyprof/tests/subprocess_result_test.py` and all other unit tests
+pass on 0.17.1 / 0.32 / 0.33.
+
+---
+
 ## 2026-11-14 — Comm profiler: CUDA-graph timing (`--comm-timing graph`)
 - The default (isolated) timing puts a CUDA event pair around one call, so the
   CPU time to launch it counts as GPU time. Against real TP=2 inference this is

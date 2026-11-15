@@ -183,6 +183,7 @@ except Exception as e:
 
 # Apply fake TP patches using shared utility, then import vLLM
 from doolyprof.profiler.utils.fake_tp import apply_fake_tp_patches
+from doolyprof.profiler.utils.gpu_memory import engine_memory_fraction
 if FAKE_TP > 1:
     apply_fake_tp_patches(FAKE_TP)
 
@@ -230,7 +231,9 @@ if __name__ == "__main__":
             tensor_parallel_size=1,  # Tell vLLM executor we're single process
             load_format="dummy",
             enforce_eager=True,
-            gpu_memory_utilization=0.9,
+            # what is free on the GPU now, at most 0.9 (a fixed 0.9 fails whenever
+            # another process holds more than a tenth of the GPU)
+            gpu_memory_utilization=engine_memory_fraction(devices=1, who="tracer"),
             attention_backend=args.attention_backend,
             max_model_len=max_model_len,
             trust_remote_code=True,
