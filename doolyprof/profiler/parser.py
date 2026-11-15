@@ -236,6 +236,7 @@ class HierarchicalTraceParser:
         self.kernels: List[Event] = []      # GPU kernel events
         self.taints: List[Event] = []       # user_annotation events
         self.comm_ops: List[Event] = []     # Communication operations (separate from hierarchy)
+        self._comm_noop_marks: List[Tuple[Any, Any, float]] = []  # COMM ranges that never reached the transport
         self.external_id_to_events: Dict[int, List[Event]] = {}
 
     def parse(self):
@@ -473,6 +474,12 @@ class HierarchicalTraceParser:
                 # CPU operation
                 event_cat = 'cpu_op'
                 event_name = name
+            elif cat == 'user_annotation' and name == 'COMM_NOOP':
+                # Emitted inside a COMM range whose call never reached the
+                # transport (profiler/utils/comm_emulation.py): that range is
+                # not a communication and is dropped below.
+                self._comm_noop_marks.append((event_data.get('pid'), event_data.get('tid'), event_data['ts']))
+                continue
             elif cat == 'user_annotation' and name.startswith('COMM:'):
                 # Communication operation annotation - handle separately
                 # Name format: "COMM: vllm::all_reduce IN:[...] ARGS:[...]"
@@ -557,6 +564,16 @@ class HierarchicalTraceParser:
                 self.external_id_to_events[event.external_id].append(event)
         
         # After parsing all, build the tree by filling in children and parent dict
+        if self._comm_noop_marks:
+            kept = []
+            for comm in self.comm_ops:
+                if any(pid == comm.pid and tid == comm.tid and comm.ts <= ts <= comm.end_ts
+                       for pid, tid, ts in self._comm_noop_marks):
+                    comm.cat = 'ignored'  # build the CPU tree as if the range were absent
+                else:
+                    kept.append(comm)
+            self.comm_ops = kept
+
         self.build_tree()
 
         print("Finding taint association...")
