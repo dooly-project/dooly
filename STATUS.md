@@ -20,6 +20,25 @@ Conventions
 
 ---
 
+## 2026-11-14 — Tracer: tainted configs returned stale values after a write
+- `TaintedConfigSubclass.__getattribute__` caches each tainted value in
+  `_taint_cache`; nothing dropped it when the attribute was assigned. vLLM 0.32+
+  writes config attributes after reading them: with transformers 5.x,
+  Qwen1.5-MoE's config has `sliding_window = 0`, vLLM reads it and sets it to
+  `None`, but kept reading the cached 0, derived max_model_len 0 and run-tracer
+  stopped with "User-specified max_model_len (8192) is greater than the derived
+  max_model_len (sliding_window=0.0 ...)". 0.17.1 was unaffected (transformers
+  4.57 gives `None`, so vLLM never writes it).
+- Fix: `TaintedConfigSubclass.__setattr__` / `__delattr__` clear the cache;
+  `_TaintedDict` drops cached entries on `__setitem__`, `__delitem__`, `update`,
+  `pop`, `setdefault`, `clear`.
+- Validation: `python doolyprof/tests/taint_config_cache_test.py` passes on
+  0.17.1 / 0.32 / 0.33. Building vLLM's ModelConfig for Qwen1.5-MoE with
+  run-tracer's setup (no GPU) failed on 0.32 and 0.33 before, passes after.
+  The other unit tests still pass. MoE trace + profile rerun on GPU pending.
+
+---
+
 ## 2026-11-13 — Communication: the fake TP group is the engine's own, every call recorded
 Before: fake TP swapped the TP group for a hand-written `FakeTPGroup` with a
 fixed op set (all_reduce / all_gather / reduce_scatter via vLLM's fake impls;

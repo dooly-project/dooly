@@ -104,6 +104,32 @@ class _TaintedDict(dict):
             return tainted
         return value
 
+    # Values are tainted and cached on read; a write must drop the cached copy or
+    # later reads return the old value.
+    def __setitem__(self, key, value):
+        self._taint_cache.pop(key, None)
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self._taint_cache.pop(key, None)
+        super().__delitem__(key)
+
+    def update(self, *args, **kwargs):
+        self._taint_cache.clear()
+        super().update(*args, **kwargs)
+
+    def pop(self, key, *default):
+        self._taint_cache.pop(key, None)
+        return super().pop(key, *default)
+
+    def setdefault(self, key, default=None):
+        self._taint_cache.pop(key, None)
+        return super().setdefault(key, default)
+
+    def clear(self):
+        self._taint_cache.clear()
+        super().clear()
+
     def get(self, key, default=None):
         try:
             return self.__getitem__(key)
@@ -165,6 +191,27 @@ def _create_tainted_config_class(config_cls):
                 return tainted
 
             return value
+
+        # Attributes are tainted and cached on read. The engine also writes config
+        # attributes after reading them (vLLM 0.32+ sets sliding_window = None when
+        # a checkpoint stores 0); without dropping the cache, later reads keep
+        # returning the old value. The whole cache is cleared because a write can
+        # go through an alias (attribute_map) or change values derived from it.
+        def __setattr__(self, name, value):
+            if not name.startswith('_'):
+                try:
+                    super().__getattribute__('_taint_cache').clear()
+                except AttributeError:
+                    pass
+            super().__setattr__(name, value)
+
+        def __delattr__(self, name):
+            if not name.startswith('_'):
+                try:
+                    super().__getattribute__('_taint_cache').clear()
+                except AttributeError:
+                    pass
+            super().__delattr__(name)
 
         def __reduce__(self):
             """Pickle as the original config class so spawn-based subprocesses work."""
