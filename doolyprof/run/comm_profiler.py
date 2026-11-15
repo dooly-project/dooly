@@ -26,11 +26,63 @@ DTYPE_TO_BYTES = {
 }
 
 
+GRAPH_OPS = 8  # collectives per captured graph in "graph" timing (a second graph holds 2x)
+
+
+def _graph_replay_ms(graph, warmup_iters, measure_iters):
+    for _ in range(max(1, warmup_iters // 2)):
+        graph.replay()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(measure_iters):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        start_event.record()
+        graph.replay()
+        end_event.record()
+        torch.cuda.synchronize()
+        times.append(start_event.elapsed_time(end_event))
+    return float(np.median(times))
+
+
+def _time_graph(op_fn, warmup_iters, measure_iters, capture_ctx=None, ops=GRAPH_OPS):
+    """GPU time of one collective, from CUDA-graph replays (no CPU launch time).
+
+    Two graphs are captured, with ``ops`` and ``2 * ops`` back-to-back calls, and
+    the result is (T(2*ops) - T(ops)) / ops: the graph launch and the wait for the
+    slower rank at the first collective are the same in both and cancel.
+    ``capture_ctx`` is the engine's own capture context (GroupCoordinator.graph_capture),
+    so communicators that keep graph-specific state (custom all-reduce registers
+    the captured buffers) behave as in the engine's CUDA-graph mode."""
+    import contextlib
+    for _ in range(warmup_iters):
+        op_fn()
+    torch.cuda.synchronize()
+    medians = []
+    for n in (ops, 2 * ops):
+        graph = torch.cuda.CUDAGraph()
+        ctx = capture_ctx() if capture_ctx is not None else contextlib.nullcontext()
+        with ctx as cap:
+            stream = getattr(cap, "stream", None) or torch.cuda.Stream()
+            with torch.cuda.graph(graph, stream=stream):
+                for _ in range(n):
+                    op_fn()
+        torch.cuda.synchronize()
+        medians.append(_graph_replay_ms(graph, warmup_iters, measure_iters))
+        del graph
+    return max(0.0, (medians[1] - medians[0]) / ops)
+
+
 def _time_collective(op_fn, warmup_iters: int, measure_iters: int,
-                     comm_timing: str = "isolated") -> float:
+                     comm_timing: str = "isolated", capture_ctx=None) -> float:
     """Time a collective ``op_fn()`` (no-arg callable) and return latency in ms.
 
-    Two modes (default preserves the original per-call ISOLATED behavior):
+    Modes (default preserves the original per-call ISOLATED behavior):
+
+    - ``"graph"``: GPU time only, from CUDA-graph replays (``_time_graph``).
+      Excludes the CPU time to launch each call, which ISOLATED counts as GPU
+      idle time between its events and which dominates small messages.
 
     - ``"isolated"``: each iteration does sync -> record start -> ONE collective
       -> record end -> sync; returns the MEDIAN per-call GPU time. Every call
@@ -42,6 +94,9 @@ def _time_collective(op_fn, warmup_iters: int, measure_iters: int,
       Kernels queue back-to-back (no per-call idle gap), closer to how the model
       forward issues them. Additive experiment-only option.
     """
+    if comm_timing == "graph":
+        return _time_graph(op_fn, warmup_iters, measure_iters, capture_ctx)
+
     # Warmup (identical for both modes)
     for _ in range(warmup_iters):
         op_fn()
@@ -203,7 +258,8 @@ def _build_call(entry, workload, comm, tp_rank, dtype, device):
 
 
 def _profile_recorded(entry, sizes, comm, tp_rank, tp_world_size, dtype, device,
-                      warmup_iters, measure_iters, comm_timing, tp_size, backend, topology, dtype_str):
+                      warmup_iters, measure_iters, comm_timing, tp_size, backend, topology, dtype_str,
+                      group=None):
     op = entry["operation"]
     tag = f"{op} (dim={entry['dim_param']}, ndims={entry['num_dims']})"
     if op in _P2P_PEER and tp_world_size < 2:
@@ -218,11 +274,29 @@ def _profile_recorded(entry, sizes, comm, tp_rank, tp_world_size, dtype, device,
         return []
     # Calls that moved no data on the emulated group were already dropped at
     # trace time (COMM_NOOP), so every planned entry is a real transfer.
-    print(f"Profiling {tag} over {len(workloads)} sizes...")
+    timing = comm_timing
+    capture_ctx = group.graph_capture if group is not None else None
+    if timing == "graph":
+        # Every rank tries the same capture; if any rank cannot capture this call,
+        # all of them time it with the isolated method instead (one method per entry).
+        probe, _ = _build_call(entry, workloads[0], comm, tp_rank, dtype, device)
+        ok = 1
+        try:
+            _time_collective(probe, 1, 1, "graph", capture_ctx)
+        except Exception as e:  # noqa: BLE001
+            ok = 0
+            print(f"[WARN] {tag}: CUDA-graph capture failed ({type(e).__name__}: {str(e)[:120]})")
+        flag = torch.tensor([ok], dtype=torch.int32)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN,
+                                     group=group.cpu_group if group is not None else None)
+        if not flag.item():
+            timing = "isolated"
+            print(f"[WARN] {tag}: timed with the isolated method instead of graph")
+    print(f"Profiling {tag} over {len(workloads)} sizes ({timing} timing)...")
     results = []
     for workload in workloads:
         call, size_bytes = _build_call(entry, workload, comm, tp_rank, dtype, device)
-        latency = _time_collective(call, warmup_iters, measure_iters, comm_timing)
+        latency = _time_collective(call, warmup_iters, measure_iters, timing, capture_ctx)
         results.append({
             'operation': op,
             'topology': topology,
@@ -290,7 +364,8 @@ def _run_profiling_on_worker_standalone(
     for key in sorted(plan_info):
         results.extend(_profile_recorded(
             plan_info[key], sizes, comm, tp_rank, tp_world_size, dtype, device,
-            warmup_iters, measure_iters, comm_timing, tp_size, backend, topology, dtype_str))
+            warmup_iters, measure_iters, comm_timing, tp_size, backend, topology, dtype_str,
+            group=tp_group))
 
     # Profile send/recv (pipeline-parallel stage boundary), through vLLM's group
     # coordinator -- same path as all_reduce above, identical to what PP pays.
@@ -312,7 +387,7 @@ def _run_profiling_on_worker_standalone(
                             tp_group.recv(tensor.size(), dtype, src=0)
 
                     latency = _time_collective(
-                        _p2p, warmup_iters, measure_iters, comm_timing,
+                        _p2p, warmup_iters, measure_iters, comm_timing, tp_group.graph_capture,
                     )
 
                     results.append({

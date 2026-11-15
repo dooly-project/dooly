@@ -20,6 +20,27 @@ Conventions
 
 ---
 
+## 2026-11-14 — Comm profiler: CUDA-graph timing (`--comm-timing graph`)
+- The default (isolated) timing puts a CUDA event pair around one call, so the
+  CPU time to launch it counts as GPU time. Against real TP=2 inference this is
+  accurate for large messages (all_reduce within ~2% at 32-64 MB) but small
+  ones come out 4-8x too slow (all_reduce ~37 us vs ~9 us of kernel time,
+  all_gather ~100 us vs 7-27 us).
+- `graph` captures n and 2n back-to-back calls into CUDA graphs inside the
+  engine's own `GroupCoordinator.graph_capture()` (custom all-reduce registers
+  the captured buffers as in CUDA-graph serving) and reports
+  (T(2n) - T(n)) / n, which cancels the graph launch and the wait for the
+  slower rank. If any rank cannot capture an entry, every rank times that
+  entry with the isolated method and a warning is printed.
+- Exposed as `--comm-timing graph` in run-profiler.py / comm_worker.py and
+  `comm_replay_test.py --comm-timing graph`. Default unchanged.
+- Validation so far: `comm_replay_test.py --gpus 0,1 --comm-timing graph` on
+  mew1, 0.17.1: all 9 recorded ops captured (no fallback), smallest-payload
+  latency all_reduce 4 us, all_gather 14 us, send/recv 9 us. Comparison
+  against real TP=2 runs (eager and CUDA graph, three vLLM versions) pending.
+
+---
+
 ## 2026-11-14 — Tracer: tainted configs returned stale values after a write
 - `TaintedConfigSubclass.__getattribute__` caches each tainted value in
   `_taint_cache`; nothing dropped it when the attribute was assigned. vLLM 0.32+

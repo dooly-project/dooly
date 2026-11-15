@@ -70,7 +70,7 @@ if __name__ == '__main__':
     parser.add_argument('--db-path', required=True)
     parser.add_argument('--overwrite', action='store_true', help="Whether to overwrite existing profiling data in the database")
     parser.add_argument('--profile-send-recv', action='store_true', help="Profile 2-rank point-to-point send/recv (PP stage boundary)")
-    parser.add_argument('--comm-timing', choices=['isolated', 'amortized'], default='isolated',
+    parser.add_argument('--comm-timing', choices=['isolated', 'amortized', 'graph'], default='isolated',
                         help="Collective timing mode: 'isolated' (default, per-call synced) or "
                              "'amortized' (back-to-back between two events, single sync).")
     args = parser.parse_args()

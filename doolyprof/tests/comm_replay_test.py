@@ -8,14 +8,15 @@
    them with CommProfiler.profile on a real TP=2 vLLM engine (2 GPUs, no fake
    TP), then saves to a scratch DB.
 3. Checks that every recorded operation got a latency sweep: positive
-   latencies over increasing payloads, larger payloads not faster than the
-   smallest one.
+   latencies over increasing payloads, the largest payloads (median of 5) not
+   faster than the smallest (median of 5).
 
-Usage (two free GPUs): ``python doolyprof/tests/comm_replay_test.py --gpus 0,1 [--model M]``
+Usage (two free GPUs): ``python doolyprof/tests/comm_replay_test.py --gpus 0,1 [--model M] [--comm-timing graph]``
 """
 import argparse
 import os
 import sqlite3
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -30,8 +31,10 @@ def main():
     ap.add_argument("--gpus", default="0,1")
     ap.add_argument("--model", default="meta-llama/Llama-3.1-8B")
     ap.add_argument("--max-size", type=int, default=8 * 1024 * 1024, help="largest payload, elements")
+    ap.add_argument("--comm-timing", default="isolated", choices=["isolated", "amortized", "graph"])
     args = ap.parse_args()
-    work = tempfile.mkdtemp(prefix="dooly_comm_replay_")
+    work = os.environ.get("DOOLY_REPLAY_DIR") or tempfile.mkdtemp(prefix="dooly_comm_replay_")
+    os.makedirs(work, exist_ok=True)
     trace = os.path.join(work, "emulated.json")
 
     env = dict(os.environ, DOOLY_COMM_TRACE_OUT=trace, VLLM_FAKE_TP="2",
@@ -60,7 +63,8 @@ def main():
     print(f"recorded: {recorded}")
 
     db = os.path.join(work, "replay.db")
-    config = CommProfilingConfig(dtype=torch.bfloat16, warmup_iters=3, measure_iters=5, max_size=args.max_size)
+    config = CommProfilingConfig(dtype=torch.bfloat16, warmup_iters=3, measure_iters=5, max_size=args.max_size,
+                                 comm_timing=args.comm_timing)
     prof = CommProfiler(config=config, db_path=db)
     prof.make_db()
     prof.plan(collectives)
@@ -75,14 +79,15 @@ def main():
     measured = set()
     for op, dim, nd, n, smin, smax, lmin, lmax in rows:
         measured.add(op)
-        first, last = sqlite3.connect(db).execute(
-            "SELECT latency_ms FROM coll_op_results WHERE operation=? ORDER BY size_bytes", (op,)).fetchall()[::max(1, n - 1)][:2]
+        lat = [r[0] for r in sqlite3.connect(db).execute(
+            "SELECT latency_ms FROM coll_op_results WHERE operation=? ORDER BY size_bytes", (op,)).fetchall()]
+        small, large = statistics.median(lat[:5]), statistics.median(lat[-5:])  # medians: single points are noisy
         print(f"  {op:16s} dim={dim} ndims={nd} rows={n:4d} bytes {smin}..{smax} latency {lmin:.4f}..{lmax:.4f} ms "
-              f"(smallest {first[0]:.4f}, largest {last[0]:.4f})")
+              f"(5 smallest {small:.4f}, 5 largest {large:.4f})")
         if n < 5 or lmin <= 0:
             failures.append(f"{op}: {n} rows, min latency {lmin}")
-        if last[0] < first[0]:
-            failures.append(f"{op}: largest payload faster than smallest ({last[0]} < {first[0]})")
+        if large < small:
+            failures.append(f"{op}: largest payloads faster than smallest ({large} < {small})")
     for op in recorded:
         if op not in measured:
             failures.append(f"{op}: recorded but not measured")
