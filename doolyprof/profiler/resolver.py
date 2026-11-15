@@ -672,6 +672,14 @@ class ModuleResolver:
             return True
 
         except Exception as e:
+            if isinstance(e, torch.cuda.OutOfMemoryError) or "CUDA out of memory" in str(e):
+                # Running out of GPU memory says nothing about whether the op runs
+                # standalone; treating it as "failed, walk up / skip" silently drops
+                # the op from the profile. Stop instead.
+                torch.cuda.empty_cache()
+                raise RuntimeError(
+                    f"[RESOLVER] out of GPU memory in the dummy run of {module.operation_name}; "
+                    f"not resolving on a GPU without room for it (is another process using this GPU?)") from e
             print(f"[RESOLVER]   Dummy run failed: {e}")
             # Clean up CUDA state
             torch.cuda.synchronize()

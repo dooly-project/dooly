@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 from vllm import LLM
+from doolyprof.profiler.utils.gpu_memory import engine_memory_fraction
 from vllm.distributed.parallel_state import get_tp_group
 
 # Dtype to bytes mapping
@@ -578,7 +579,8 @@ class CommProfiler:
             dtype=dtype,  # Model dtype for initialization
             enforce_eager=True,
             load_format="dummy",  # Fast initialization without loading real weights
-            gpu_memory_utilization=0.5,  # Conservative for profiling
+            # what is free on the TP GPUs now, at most 0.5 (utils/gpu_memory.py)
+            gpu_memory_utilization=engine_memory_fraction(cap=0.5, devices=tp_size, who="comm profiler"),
             max_model_len=2048,  # Small model_len sufficient for comm profiling
             tensor_parallel_size=tp_size,  # REAL tensor parallelism
         )

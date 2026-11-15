@@ -698,8 +698,9 @@ class Profiler:
                 )
                 p.start()
 
-                # Get results BEFORE join to avoid deadlock
-                vllm_results = result_queue.get()
+                # Get results BEFORE join to avoid deadlock; raise if the subprocess dies first
+                from doolyprof.profiler.utils.procs import get_child_result
+                vllm_results = get_child_result(p, result_queue, f"vLLM-module profiler for {model.name}")
                 all_results.extend(vllm_results)
 
                 p.join()
@@ -789,7 +790,7 @@ class Profiler:
             model_name=model.name,
             dtype=str(self.dtype).split(".")[-1],
             enforce_eager=True,
-            gpu_memory_utilization=0.9,
+            gpu_memory_utilization=None,  # what is free now, at most 0.9 (utils/gpu_memory.py)
             max_model_len=self.max_model_len,
             attn_backend=self.attention_backend,
             flash_attn_version=self.flash_attn_version,

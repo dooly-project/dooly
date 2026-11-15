@@ -132,7 +132,7 @@ def resolve_model(model, dtype, attention_backend, flash_attn_version, quantizat
         model_name=model.name,
         dtype=str(model.dtype).split(".")[-1],
         enforce_eager=True,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=None,  # what is free now, at most 0.9 (utils/gpu_memory.py)
         max_model_len=max_model_len,
         attn_backend=attention_backend,
         flash_attn_version=flash_attn_version,
@@ -247,7 +247,8 @@ def main() -> None:
         print(f"[RUNNER] Starting RESOLVER for {model.name}...")
         p = mp.Process(target=resolve_model, args=(model, dtype, args.attention_backend, args.flash_attn_version, args.quantization, args.max_seq_len, result_queue, args.gpu, args.kv_cache_dtype))
         p.start()
-        model.to_profile_resolved = result_queue.get()
+        from doolyprof.profiler.utils.procs import get_child_result
+        model.to_profile_resolved = get_child_result(p, result_queue, f"resolver for {model.name}")
         p.join()
 
         if p.exitcode != 0:
