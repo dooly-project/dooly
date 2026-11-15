@@ -20,6 +20,29 @@ Conventions
 
 ---
 
+## 2026-11-14 — Tracer exit on vLLM >= 0.32; MoE on all three versions
+Every 0.32 / 0.33 trace log ended with `ValueError: Invalid process group
+specified` (after the trace was written, rc 0). run-tracer's `finally` called
+`torch.distributed.destroy_process_group()`, destroying every group while vLLM
+still held them; from 0.32 the engine's exit-time shutdown runs
+`cleanup_dist_env_and_memory` -> `destroy_model_parallel` -> `_TP.destroy()`
+on those same groups (0.17.1's shutdown does not, so it never showed). The
+tracer now tears down with vLLM's own `destroy_model_parallel()` +
+`destroy_distributed_environment()`, as `VLLMLayerProfiler.close` already did:
+the same functions in 0.17.1 / 0.32 / 0.33, and they clear vLLM's references,
+so the later shutdown finds nothing left to destroy.
+Validation (mew1, Qwen2.5-7B fake TP 2): 0.33 and 0.17.1 exit rc 0 with no
+traceback; traces identical to the pre-fix ones (same kernels, ops, counts).
+Qwen1.5-MoE-A2.7B (fake TP 2) after the tainted-config fix: trace + profile on
+all three versions, 0 dropped hierarchies, results for every signature:
+0.17.1 99.85% GPU-time coverage / 14 signatures, 0.32 98.55% / 11, 0.33
+98.66% / 11. 0.32+ have fewer signatures because vLLM moved the shared-expert
+add into `MoERunner`, profiled whole once `moe_forward_shared` walks up to it;
+the uncovered ~1.4% is the engine's input-preparation kernels, outside the
+model forward.
+
+---
+
 ## 2026-11-14 — GPU memory request and child-process failures
 Crash seen on mew0: run-profiler's resolver died at vLLM startup with "Free
 memory on device cuda:0 (27.77/79.25 GiB) on startup is less than desired GPU

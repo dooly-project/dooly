@@ -397,5 +397,9 @@ if __name__ == "__main__":
         print("="*80 + "\n")
             
     finally:
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
+        # vLLM's own teardown, not torch.distributed's: it also drops vLLM's references to
+        # the groups, so an engine whose shutdown runs the same teardown at exit finds
+        # nothing left to destroy (instead of destroying groups torch no longer has)
+        from vllm.distributed.parallel_state import destroy_model_parallel, destroy_distributed_environment
+        destroy_model_parallel()
+        destroy_distributed_environment()
