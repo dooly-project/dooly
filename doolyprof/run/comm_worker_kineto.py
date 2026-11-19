@@ -41,7 +41,7 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
 
     # Import the KINETO-enabled profiler
     from doolyprof.run.comm_profiler_kineto import CommProfiler, CommProfilingConfig, ProfileMethod
-    from doolyprof.profiler.utils.topology import machine_topology
+    from doolyprof.profiler.utils.topology import group_topology, group_link_warning
 
     DTYPE_MAP = {
         "float32": torch.float32,
@@ -74,7 +74,12 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
     comm_profiler.plan(collective_ops)
 
     # Check if we should profile based on existing data
-    topology = machine_topology()
+    # The label for the group the calls are replayed on: the first tp_size visible GPUs
+    topology = group_topology(tp_size)
+    print(f"[WORKER] Topology for {tp_size}-GPU groups: {topology}")
+    warning = group_link_warning(tp_size)
+    if warning:
+        print(f"[WARN] {warning}")
     if comm_profiler.should_profile(tp_size, overwrite=overwrite, topology=topology):
         comm_profiler.profile(model_name, dtype_str, comm_config, tp_size, collective_backend, topology, llm)
         comm_profiler.save_to_db(tp_size=tp_size, topology=topology, overwrite=overwrite)
