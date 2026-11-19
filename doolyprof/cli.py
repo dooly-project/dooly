@@ -1,0 +1,139 @@
+"""DoolyProf command line, the container's entry point.
+
+    python -m doolyprof.cli run --model M --out DIR [--tp N] [--dp N] [--enable-expert-parallel]
+                                [--attention-backend B] [--gpu-memory-cap F] [--max-batch-size N]
+                                [--max-seq-len N] [--tracer-args "..."] [--profiler-args "..."]
+    python -m doolyprof.cli trace   <run-tracer.py arguments>
+    python -m doolyprof.cli profile <run-profiler.py arguments>
+    python -m doolyprof.cli test    [suite ...]
+
+``run`` traces the model (DIR/trace/, log DIR/trace.log), then profiles that
+trace into DIR/profile.db (log DIR/profile.log), on the GPUs this process can
+see, and exits non-zero if either stage fails. ``trace`` and ``profile`` pass
+their arguments to the scripts unchanged. ``test`` runs the unit and emulation
+suites in doolyprof/tests.
+"""
+import argparse
+import glob
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+TRACER = os.path.join(ROOT, "run", "run-tracer.py")
+PROFILER = os.path.join(ROOT, "run", "run-profiler.py")
+SUITES = ["tracer_ops", "taint_parse", "signature_fields", "op_args", "triton_scope", "taint_config_cache",
+          "moe_routing", "compile_wrapper", "subprocess_result", "dp_ep_emulation", "sp_moe_emulation",
+          "comm_emulation"]
+
+
+def _script(path, args, log=None):
+    cmd = [sys.executable, path] + list(args)
+    print(f"[dooly] {' '.join(shlex.quote(c) for c in cmd)}" + (f"  > {log}" if log else ""), flush=True)
+    if log is None:
+        return subprocess.call(cmd)
+    with open(log, "w") as f:
+        return subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+
+
+def _visible_gpus():
+    """The GPUs this process sees, as the scripts' --gpu value: '0', '0,1', ..."""
+    try:
+        import torch
+        n = torch.cuda.device_count()
+    except Exception:  # noqa: BLE001
+        n = 0
+    return ",".join(str(i) for i in range(max(n, 1)))
+
+
+def cmd_run(argv):
+    p = argparse.ArgumentParser(prog="dooly run", description="Trace a model, then profile the trace.")
+    p.add_argument("--model", required=True)
+    p.add_argument("--out", required=True, help="output folder (trace/, trace.log, profile.db, profile.log)")
+    p.add_argument("--tp", type=int, default=1)
+    p.add_argument("--dp", type=int, default=1)
+    p.add_argument("--enable-expert-parallel", action="store_true")
+    p.add_argument("--attention-backend", default="FLASH_ATTN")
+    p.add_argument("--gpu-memory-cap", type=float, default=None,
+                   help="for both stages; raise it when the KV cache cannot hold the trace batch "
+                        "(Kimi-K3 on one A100: 0.975)")
+    p.add_argument("--max-batch-size", type=int, default=2)
+    p.add_argument("--max-seq-len", type=int, default=128)
+    p.add_argument("--dtype", default="bfloat16")
+    p.add_argument("--tracer-args", default="", help="extra run-tracer.py arguments, one string")
+    p.add_argument("--profiler-args", default="", help="extra run-profiler.py arguments, one string")
+    a = p.parse_args(argv)
+
+    out = os.path.abspath(a.out)
+    os.makedirs(os.path.join(out, "trace"), exist_ok=True)
+    gpu = _visible_gpus()
+    par = ["--tp", str(a.tp), "--dp", str(a.dp)] + (["--enable-expert-parallel"] if a.enable_expert_parallel else [])
+    cap = ["--gpu-memory-cap", str(a.gpu_memory_cap)] if a.gpu_memory_cap is not None else []
+
+    t0 = time.time()
+    rc = _script(TRACER, ["--model", a.model] + par + ["--attention-backend", a.attention_backend,
+                 "--trace_dir", os.path.join(out, "trace"), "--gpu", gpu] + cap + shlex.split(a.tracer_args),
+                 log=os.path.join(out, "trace.log"))
+    traces = sorted(glob.glob(os.path.join(out, "trace", "*.json")))
+    if rc != 0 or not traces:
+        print(f"[dooly] trace failed (exit {rc}); see {out}/trace.log", flush=True)
+        return rc or 1
+    print(f"[dooly] traced in {time.time() - t0:.0f}s: {traces[0]}", flush=True)
+
+    t0 = time.time()
+    log = os.path.join(out, "profile.log")
+    rc = _script(PROFILER, ["--models", a.model, "--traces", traces[0]] + par + [
+                 "--profile-output", os.path.join(out, "profile"), "--dtype", a.dtype,
+                 "--attention-backend", a.attention_backend, "--max-batch-size", str(a.max_batch_size),
+                 "--max-seq-len", str(a.max_seq_len), "--gpu", gpu,
+                 "--db-path", os.path.join(out, "profile.db")] + cap + shlex.split(a.profiler_args), log=log)
+    text = open(log, errors="replace").read()
+    rows = re.findall(r"Wrote (\d+) results", text)
+    unresolved = text.count("no working parent")
+    print(f"[dooly] profile exit {rc} in {time.time() - t0:.0f}s: "
+          f"{rows[-1] if rows else 0} result rows, {unresolved} ops without a working parent", flush=True)
+    return rc or (1 if unresolved else 0)
+
+
+def cmd_test(argv):
+    suites = argv or SUITES
+    tests = os.path.join(ROOT, "tests")
+    failed = []
+    for name in suites:
+        path = os.path.join(tests, f"{name}_test.py")
+        out = subprocess.run([sys.executable, path], capture_output=True, text=True)
+        text = out.stdout + out.stderr
+        passed = len(re.findall(r"^PASS", text, re.M))
+        bad = re.findall(r"^(?:FAIL|ERROR) .*", text, re.M)
+        print(f"{name:20s} exit {out.returncode}  pass {passed}  fail {len(bad)}", flush=True)
+        for line in bad[:3]:
+            print(f"    {line[:200]}")
+        if out.returncode or bad:
+            failed.append(name)
+    print(f"[dooly] {len(suites) - len(failed)}/{len(suites)} suites passed" + (f"; failed: {failed}" if failed else ""))
+    return 1 if failed else 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    command, rest = argv[0], argv[1:]
+    if command == "run":
+        return cmd_run(rest)
+    if command == "trace":
+        return _script(TRACER, rest)
+    if command == "profile":
+        return _script(PROFILER, rest)
+    if command == "test":
+        return cmd_test(rest)
+    print(f"unknown command {command!r}\n{__doc__}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
