@@ -29,6 +29,7 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
 
     # Import comm_profiler (which doesn't set VLLM_FAKE_TP)
     from doolyprof.run.comm_profiler import CommProfiler, CommProfilingConfig
+    from doolyprof.profiler.utils.topology import machine_topology
 
     DTYPE_MAP = {
         "float32": torch.float32,
@@ -52,8 +53,9 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
         comm_profiler.profile_send_recv_bool = True
 
     # Check if we should profile based on existing data
-    if comm_profiler.should_profile(tp_size, overwrite=overwrite) or profile_send_recv:
-        comm_profiler.profile(model_name, dtype_str, comm_config, tp_size, collective_backend, "mew1")
+    topology = machine_topology()
+    if comm_profiler.should_profile(tp_size, overwrite=overwrite, topology=topology) or profile_send_recv:
+        comm_profiler.profile(model_name, dtype_str, comm_config, tp_size, collective_backend, topology)
         comm_profiler.save_to_db(overwrite=overwrite)
     else:
         print("[COMM] Skipping profiling - all operations already have data and overwrite=False")

@@ -125,6 +125,57 @@ def test_generator_keeps_max_bound_mix_fixed():
         assert tuple(tensors[0].shape) == (538624,), tensors[0].shape  # MAX_* bound: never swept
 
 
+def test_choose_trace_batch_respects_kv_capacity():
+    # vLLM 0.33 Kimi-K3 (fake TP8 x DP8 on one A100): 3.2 GiB of KV cache in
+    # 39 large hybrid blocks; the 94-request batch ran 39 requests in its first
+    # step and NUM_REQS=39 hit a MODEL_CONFIG value mid-generate.
+    from doolyprof.tracer.registry import kv_cache_capacity
+    reg = {v: "MODEL_CONFIG" for v in range(2, 94)}
+    cap = kv_cache_capacity(39, 1856, 1)
+    assert cap(5) == 39
+    try:
+        choose_trace_batch(5, 12, 263, 521, reg, kv_capacity=cap)
+    except ValueError as e:
+        assert "hold at most 39 requests" in str(e), e
+        # Kimi-K3's layer-index lists cover 1..93: 94 requests is the first clear count
+        assert "smallest request count clear of the registry is 94" in str(e), e
+    else:
+        raise AssertionError("expected no admissible batch")
+    assert choose_trace_batch(5, 12, 263, 521, {}, kv_capacity=cap) == (5, 12)
+    assert kv_cache_capacity(None, 16) is None
+
+
+def _reshape_module(taint, concrete):
+    inputs = extract_inputs_from_taint(taint, trace_input_dims=[[60, 12, 256], []],
+                                       trace_input_dtypes=["c10::BFloat16", "ScalarList"],
+                                       concrete_inputs=["", concrete])
+    return ModuleInfo(module_name="synthetic", operation_name="aten::reshape", inputs=inputs, dtype="bfloat16")
+
+
+def test_shape_list_follows_token_sweep():
+    # vLLM 0.17.1 Qwen3.5 attention: q.reshape(*q.shape[:-1], -1) reaches the op
+    # as [60, -1] (the traced token count as a plain int). Kept fixed, every
+    # token count that does not divide 60 * 3072 failed with "only one
+    # dimension can be inferred".
+    from doolyprof.profiler.input_generator import InputGenerator
+    taint = "aten::reshape IN:[[NUM_TOKS(60), MODEL_CONFIG(12), MODEL_CONFIG(256)]]"
+    gen = InputGenerator(_reshape_module(taint, "[60, -1]"))
+    assert gen._sweep_int_list([60, -1], 4, 1) == [4, -1]
+    assert gen._sweep_int_list((60, 12, 256), 7, 1) == (7, 12, 256)
+    assert gen._sweep_int_list([-1, 256], 4, 1) == [-1, 256]   # fixed dims stay
+
+
+def test_shape_list_ambiguous_value_stays():
+    # 12 is the traced token count and also a fixed dim of the same input: leave it
+    from doolyprof.profiler.input_generator import InputGenerator
+    taint = "aten::reshape IN:[[NUM_TOKS(12), MODEL_CONFIG(12), MODEL_CONFIG(256)]]"
+    inputs = extract_inputs_from_taint(taint, trace_input_dims=[[12, 12, 256], []],
+                                       trace_input_dtypes=["c10::BFloat16", "ScalarList"],
+                                       concrete_inputs=["", "[12, -1]"])
+    gen = InputGenerator(ModuleInfo(module_name="synthetic", operation_name="aten::reshape", inputs=inputs, dtype="bfloat16"))
+    assert gen._sweep_int_list([12, -1], 4, 1) == [12, -1]
+
+
 def test_event_dims_from_taint_string_keeps_singleton():
     ev = Event(cat="cpu_op", name="x", ts=0, dur=1, ev_idx=None, external_id=None, python_id=None, python_parent_id=None)
     dims = ev.get_dims_from_taint_string("[[NUM_TOKS(504), MODEL_CONFIG(2304)] | [NUM_TOKS(504), SINGLETON(1)]]")
@@ -267,6 +318,162 @@ def test_generator_builds_tensor_list_on_request_sweep():
         assert [tuple(t.shape) for t in tensors[0]] == [(1,), (params["num_requests"],)], tensors
         out = torch.cat(tensors[0], tensors[1])
         assert tuple(out.shape) == (1 + params["num_requests"],)
+
+
+def test_offset_label_parsed_and_swept():
+    import torch
+    from doolyprof.profiler.input_generator import InputGenerator
+    t = parse_taint_string("op IN:[[NUM_REQS+1(6)] | [NUM_TOKS-1(59), MODEL_CONFIG(8)] | [MAX_NUM_REQS+1(264)]]")
+    assert [(d.dim_type, d.value, d.offset) for d in t[0].dimensions] == [(NR, 6, 1)]
+    assert [(d.dim_type, d.value, d.offset) for d in t[1].dimensions] == [(NT, 59, -1), (MC, 8, 0)]
+    assert [(d.dim_type, d.offset) for d in t[2].dimensions] == [(NR, 1)]
+    taint = "op IN:[[NUM_REQS+1(6)] | [NUM_TOKS(60), MODEL_CONFIG(8)]]"
+    inputs = extract_inputs_from_taint(taint, trace_input_dims=[[6], [60, 8]],
+                                       trace_input_dtypes=["c10::BFloat16", "c10::BFloat16"],
+                                       concrete_inputs=["", ""])
+    module = ModuleInfo(module_name="M", operation_name="aten::foo", inputs=inputs, dtype="bfloat16")
+    # the offset is part of what the op computes on, so it is in the signature
+    assert module._semantic_params_list()[0].get("input0_dim0_offset") == 1
+    gen = InputGenerator(module, max_num_request=4, max_num_token=256, test_counts=3)
+    tensors, _ = gen._create_tensor_inputs_from_params({"num_tokens": 32, "num_requests": 3})
+    assert [tuple(x.shape) for x in tensors] == [(4,), (32, 8)], [tuple(x.shape) for x in tensors]
+    assert gen._sweep_int_list([6, 60, 8], 32, 3) == [4, 32, 8]
+
+
+def test_gathered_comm_dim_is_tokens_times_world_size():
+    # Qwen1.5-MoE on DP2: the combine's input holds both ranks' 72 tokens
+    from doolyprof.profiler.utils.comm_emulation import label_gathered_dims
+    shapes = ["[?(144), MODEL_CONFIG(2048)]", "[NUM_TOKS(72), MODEL_CONFIG(2048)]"]
+    out = label_gathered_dims(shapes, 2)
+    assert out == ["[MIX(144)[hist:NUM_TOKS:72,WORLD_SIZE:2], MODEL_CONFIG(2048)]", shapes[1]], out
+    t = parse_taint_string(f"COMM: combine IN:[{' | '.join(out)}]")
+    d = t[0].dimensions[0]
+    assert d.dim_type == DimensionType.MIX and d.components == {"NUM_TOKS": 72, "WORLD_SIZE": 2}, d
+    assert label_gathered_dims(shapes, 1) == shapes                     # no group, nothing gathered
+    assert label_gathered_dims(shapes + ["[NUM_REQS(72)]"], 2) == shapes + ["[NUM_REQS(72)]"]  # ambiguous
+    assert label_gathered_dims(["[?(100)]", "[NUM_TOKS(72)]"], 2) == ["[?(100)]", "[NUM_TOKS(72)]"]
+    # the profiler sizes such a dim as tokens x world size
+    from doolyprof.profiler.input_generator import InputGenerator
+    inputs = extract_inputs_from_taint(taint_string=f"COMM: combine IN:[{out[0]}]",
+                                       trace_input_dims=[[144, 2048]], trace_input_dtypes=["c10::BFloat16"])
+    module = ModuleInfo(module_name="combine", operation_name="combine", inputs=inputs)
+    gen = InputGenerator(module, max_num_request=4, max_num_token=256, test_counts=3)
+    tensors, _ = gen._create_tensor_inputs_from_params({"num_tokens": 32, "num_requests": 3})
+    assert tuple(tensors[0].shape) == (64, 2048), tuple(tensors[0].shape)
+
+
+def _paged_batch(block_size=16, num_blocks=50, reqs=3, kv=37, new=5, seed=0):
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    per_seq = -(-(kv + new) // block_size)
+    rows = [rng.integers(0, num_blocks, size=per_seq).tolist() for _ in range(reqs)]
+    req_indices = np.repeat(np.arange(reqs, dtype=np.int32), new)
+    positions = np.tile(np.arange(kv, kv + new, dtype=np.int32), reqs)
+    return rows, req_indices, positions
+
+
+def test_paged_block_table_slots_follow_the_cache_layout():
+    import torch
+    from doolyprof.profiler.utils.vllm_compat import make_block_table, fill_slot_mapping
+    rows, req_indices, positions = _paged_batch()
+    bt = make_block_table(block_size=16, max_num_reqs=8, max_num_blocks_per_req=10,
+                          max_num_batched_tokens=64, device="cpu", pin_memory=False)
+    bt.clear()
+    for r, ids in enumerate(rows):
+        bt.add_row(ids, row_idx=r)
+    fill_slot_mapping(bt, len(rows), req_indices, positions)
+    expect = [rows[r][p // 16] * 16 + p % 16 for r, p in zip(req_indices, positions)]
+    assert bt.slot_mapping.gpu[:len(expect)].tolist() == expect
+    assert bt.block_table.gpu[:3, :len(rows[0])].tolist() == rows
+    assert bt.block_table.gpu.dtype == torch.int32 and bt.slot_mapping.gpu.dtype == torch.int64
+
+
+def test_paged_block_table_matches_vllm_block_table():
+    """Where the installed vLLM still has its runner's BlockTable (0.17-0.33)
+    and a GPU is available, the slots agree with the ones it computes."""
+    import inspect
+    import torch
+    try:
+        from vllm.v1.worker.block_table import BlockTable
+    except ImportError:
+        print("SKIP (this vLLM has no vllm.v1.worker.block_table)"); return
+    if not torch.cuda.is_available():
+        print("SKIP (no GPU)"); return
+    from doolyprof.profiler.utils.vllm_compat import call_with_supported_kwargs, make_block_table, fill_slot_mapping
+    rows, req_indices, positions = _paged_batch()
+    kw = dict(block_size=16, max_num_reqs=8, max_num_blocks_per_req=10, max_num_batched_tokens=64,
+              pin_memory=True, device=torch.device("cuda"), kernel_block_size=16, cp_kv_cache_interleave_size=1)
+    theirs = call_with_supported_kwargs(BlockTable, optional=("kernel_block_size", "cp_kv_cache_interleave_size"), **kw)
+    ours = make_block_table(**kw)
+    for bt in (theirs, ours):
+        bt.clear()
+        for r, ids in enumerate(rows):
+            bt.add_row(ids, row_idx=r)
+    n = len(positions)
+    if "query_start_loc" in inspect.signature(theirs.compute_slot_mapping).parameters:
+        qsl = torch.arange(0, n + 1, n // len(rows), dtype=torch.int32, device="cuda")
+        theirs.commit_block_table(len(rows))
+        theirs.compute_slot_mapping(len(rows), qsl, torch.as_tensor(positions, dtype=torch.int64, device="cuda"))
+    else:
+        theirs.compute_slot_mapping(req_indices, positions)
+        theirs.commit_block_table(len(rows))
+        theirs.commit_slot_mapping(n)
+    fill_slot_mapping(ours, len(rows), req_indices, positions)
+    assert ours.slot_mapping.gpu[:n].tolist() == theirs.slot_mapping.gpu[:n].tolist()
+    assert ours.block_table.gpu[:len(rows)].tolist() == theirs.block_table.gpu[:len(rows)].tolist()
+
+
+def test_module_called_with_none_for_unrecorded_required_arguments():
+    """A decoder layer's first call passes residual=None, which the trace does
+    not record; vLLM 0.34 makes residual a required parameter."""
+    import torch
+    from doolyprof.profiler.utils.vllm_compat import call_module_with_recorded_arguments
+
+    class Layer(torch.nn.Module):
+        def forward(self, positions, hidden_states, residual, *, scale=1.0):
+            return positions, hidden_states, residual, scale
+
+    class OldLayer(torch.nn.Module):
+        def forward(self, positions, hidden_states, residual=0):
+            return residual
+
+    x, pos = torch.zeros(3, 4), torch.arange(3)
+    out = call_module_with_recorded_arguments(Layer(), [], {"positions": pos, "hidden_states": x})
+    assert out[2] is None and out[3] == 1.0 and out[1] is x
+    out = call_module_with_recorded_arguments(Layer(), [pos], {"hidden_states": x})
+    assert out[0] is pos and out[2] is None
+    res = torch.ones(3, 4)
+    assert call_module_with_recorded_arguments(Layer(), [pos, x, res], {})[2] is res
+    assert call_module_with_recorded_arguments(OldLayer(), [], {"positions": pos, "hidden_states": x}) == 0
+
+
+def test_topology_label_from_gpu_model_and_links():
+    # collective measurements were stored and looked up under a hard-coded
+    # host name ("mew1") on every machine
+    from doolyprof.profiler.utils.topology import topology_label, NO_GPU
+    assert topology_label("NVIDIA A100-SXM4-80GB", True) == "nvidia-a100-sxm4-80gb-nvlink"
+    assert topology_label("NVIDIA A100 80GB PCIe", False) == "nvidia-a100-80gb-pcie"     # no "-pcie-pcie"
+    assert topology_label("NVIDIA A100 80GB PCIe", True) == "nvidia-a100-80gb-pcie-nvlink"
+    assert (topology_label("NVIDIA RTX PRO 6000 Blackwell Server Edition", False)
+            == "nvidia-rtx-pro-6000-blackwell-server-edition-pcie")
+    assert topology_label("NVIDIA H100 80GB HBM3", None) == "nvidia-h100-80gb-hbm3-unknown-link"
+    assert topology_label(None, None) == NO_GPU and topology_label("", True) == NO_GPU
+
+
+def test_machine_topology_prefers_the_environment():
+    from doolyprof.profiler.utils import topology
+    saved = os.environ.get("DOOLY_TOPOLOGY")
+    try:
+        os.environ["DOOLY_TOPOLOGY"] = "mew1"          # measurements stored under an older label
+        assert topology.machine_topology() == "mew1"
+        os.environ.pop("DOOLY_TOPOLOGY")
+        derived = topology.machine_topology()
+        assert derived and derived == topology._derived_topology() and "mew" not in derived, derived
+    finally:
+        if saved is None:
+            os.environ.pop("DOOLY_TOPOLOGY", None)
+        else:
+            os.environ["DOOLY_TOPOLOGY"] = saved
 
 
 if __name__ == "__main__":

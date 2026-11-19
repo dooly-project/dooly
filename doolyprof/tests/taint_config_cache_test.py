@@ -42,6 +42,25 @@ def test_dict_write_after_read():
     assert "factor" not in d
 
 
+def test_plain_reads_scope():
+    # vLLM 0.33 merges values that differ across layers only when
+    # `type(v) in (int, float)`; inside plain_config_reads() a tainted config must
+    # pass that check, keep wrapping nested configs, and taint again afterwards.
+    from transformers import LlavaConfig
+    from doolyprof.tracer.config import plain_config_reads
+    text = MistralConfig(hidden_size=64, intermediate_size=128, num_attention_heads=4,
+                         num_key_value_heads=4, num_hidden_layers=2)
+    cfg = create_tainted_config(LlavaConfig(text_config=text.to_dict()))
+    with plain_config_reads():
+        inner = cfg.text_config
+        assert hasattr(inner, "_taint_cache"), type(inner)   # still a tainted config
+        assert type(inner.hidden_size) is int, type(inner.hidden_size)
+        assert type(cfg.text_config.num_hidden_layers) is int
+        assert all(type(v) is not TaintedInt for v in cfg.to_dict()["text_config"].values())
+    assert isinstance(inner.hidden_size, TaintedInt), type(inner.hidden_size)
+    assert isinstance(cfg.text_config.hidden_size, TaintedInt)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

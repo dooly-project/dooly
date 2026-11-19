@@ -1,5 +1,5 @@
 from doolyprof.profiler.module import ModuleInfo
-from doolyprof.profiler.taint import DimensionType
+from doolyprof.profiler.taint import DimensionType, split_label_offset
 from typing import List, Dict, Any, Tuple, Optional, Union
 import torch
 
@@ -12,6 +12,7 @@ def _component_axis(taint_name: str) -> Optional[str]:
     MAX_NUM_TOKS / MAX_NUM_REQS buffer bounds (a substring test would have
     swept those), "?" and anything unknown.
     """
+    taint_name, _ = split_label_offset(taint_name)  # NUM_REQS+1 follows NUM_REQS
     if taint_name == DimensionType.NUM_TOKENS.value:
         return "num_tokens"
     if taint_name == DimensionType.NUM_REQUESTS.value:
@@ -172,6 +173,43 @@ class InputGenerator:
         # Keep as string
         return scalar_str
 
+    def _traced_workload_sizes(self) -> Dict[int, Tuple[str, int]]:
+        """Traced size -> (sweep axis, offset) of the op's swept tensor
+        dimensions: ("num_requests", 1) for a NUM_REQS+1 dim.
+
+        A size that two axes (or offsets) share, or that some fixed dimension
+        of the op's inputs also has, is ambiguous and left out.
+        """
+        axes: Dict[int, set] = {}
+        fixed = set()
+        for profile_input in self.module.inputs:
+            for part in profile_input.tensor_parts():
+                toks, reqs, mix = set(part.get_toks_dim()), set(part.get_reqs_dim()), set(part.get_mix_dims())
+                for i, size in enumerate(part.actual_shape):
+                    if i in toks:
+                        axes.setdefault(size, set()).add(("num_tokens", part.dim_offset(i)))
+                    elif i in reqs:
+                        axes.setdefault(size, set()).add(("num_requests", part.dim_offset(i)))
+                    elif i not in mix:
+                        fixed.add(size)
+        return {size: next(iter(a)) for size, a in axes.items() if len(a) == 1 and size not in fixed}
+
+    def _sweep_int_list(self, value, num_tokens: int, num_requests: int):
+        """An int-list argument (a reshape / view / expand shape) built from
+        the traced batch: entries equal to the traced size of one of the op's
+        swept dimensions follow the sweep.
+
+        The tracer only sees these ints as plain values (the engine's
+        ``q.reshape(*q.shape[:-1], -1)`` reaches the op as ``[60, -1]``), so
+        they are matched to the op's own tainted input dimensions.
+        """
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in value):
+            return value
+        traced = self._traced_workload_sizes()
+        swept = {"num_tokens": num_tokens, "num_requests": num_requests}
+        out = [swept[traced[v][0]] + traced[v][1] if v > 1 and v in traced else v for v in value]
+        return type(value)(out)
+
     def _create_tensor_inputs_from_params(
         self, workload_config: Union[AttentionBatchConfig, Dict[str, int], List[int]]
     ) -> Tuple[List[Any], Dict[str, Any]]:
@@ -232,10 +270,12 @@ class InputGenerator:
             for dim_idx, actual_dim_value in enumerate(profile_input.actual_shape):
                 if dim_idx in num_tokens_dim_indices:
                     # NUM_TOKENS dimension - use num_tokens from workload config
-                    shape.append(num_tokens)
+                    # (plus its constant, for a NUM_TOKS+k dim)
+                    shape.append(num_tokens + profile_input.dim_offset(dim_idx))
                 elif dim_idx in num_requests_dim_indices:
                     # NUM_REQUESTS dimension - use num_requests from workload config
-                    shape.append(num_requests)
+                    # (num_requests + 1 for query_start_loc's NUM_REQS+1)
+                    shape.append(num_requests + profile_input.dim_offset(dim_idx))
                 elif dim_idx in mix_dim_indices:
                     # MIX dimension - calculate size from components
                     components = profile_input.dimension_components[dim_idx] if profile_input.dimension_components else None
@@ -243,10 +283,11 @@ class InputGenerator:
                         new_size = 1
                         for taint_name, qty in components.items():
                             axis = _component_axis(taint_name)
+                            offset = split_label_offset(taint_name)[1]
                             if axis == "num_tokens":
-                                new_size *= num_tokens
+                                new_size *= num_tokens + offset
                             elif axis == "num_requests":
-                                new_size *= num_requests
+                                new_size *= num_requests + offset
                             else:
                                 # MODEL_CONFIG / MAX_* bound / unknown: fixed factor
                                 new_size *= qty
@@ -286,11 +327,18 @@ class InputGenerator:
             shape_tuple = tuple(shape)
 
             # Create tensor
-            if input_dtype in (torch.long, torch.int32, torch.int64):
+            if input_dtype == torch.bool:
+                # a mask (masked_fill_, embedding's out-of-range tokens):
+                # normal_ has no bool kernel
+                tensor = torch.randint(0, 2, shape_tuple, device='cuda').bool()
+            elif not input_dtype.is_floating_point and not input_dtype.is_complex:
                 if len(shape) == 1:
                     max_val = shape[0] if shape[0] < 10000 else 1000
                 else:
                     max_val = 1000
+                # every integer width (int8 / int16 / uint8 as well as int32 /
+                # int64): indices stay small and non-negative
+                max_val = min(max_val, torch.iinfo(input_dtype).max) or 1
                 tensor = torch.randint(0, max_val, shape_tuple, dtype=input_dtype, device='cuda')
             else:
                 tensor = torch.randn(shape_tuple, dtype=input_dtype, device='cuda')
@@ -312,6 +360,8 @@ class InputGenerator:
                 # Use scalar_value directly
                 if profile_input.scalar_value:
                     value = self._parse_scalar_value(profile_input.scalar_value)
+                    if isinstance(value, (list, tuple)):
+                        value = self._sweep_int_list(value, num_tokens, num_requests)
                     inputs.append(value)
                 else:
                     # Provide default based on dtype

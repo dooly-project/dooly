@@ -24,6 +24,14 @@ class ProfileInput:
     # For TensorList inputs (e.g. aten::cat's tensors): one Tensor ProfileInput
     # per list element; the list itself has no dimensions of its own.
     elements: Optional[List['ProfileInput']] = None
+    # Per dim: a constant the dim adds to its sweep axis (1 for a NUM_REQS+1
+    # dim such as query_start_loc); None when no dim has one.
+    dimension_offsets: Optional[List[int]] = None
+
+    def dim_offset(self, i: int) -> int:
+        """The constant dim ``i`` adds to its sweep value (0 for most dims)."""
+        offs = self.dimension_offsets
+        return offs[i] if offs is not None and i < len(offs) else 0
 
     def tensor_parts(self) -> List['ProfileInput']:
         """The Tensor inputs this argument contributes: itself for a Tensor,
@@ -67,6 +75,8 @@ class ProfileInput:
             d['arg_name'] = self.arg_name
         if self.elements is not None:
             d['elements'] = [e.to_dict() for e in self.elements]
+        if self.dimension_offsets is not None:
+            d['dimension_offsets'] = self.dimension_offsets
         return d
 
     @classmethod
@@ -82,6 +92,7 @@ class ProfileInput:
             arg_name=data.get('arg_name'),
             elements=([cls.from_dict(e) for e in data['elements']]
                       if data.get('elements') is not None else None),
+            dimension_offsets=data.get('dimension_offsets'),
         )
 
 
@@ -102,6 +113,7 @@ def _tensor_input(i, taint_input, dims, dtype) -> 'ProfileInput':
         )
     dim_types = [dim.dim_type for dim in taint_input.dimensions]
     dim_components = [dim.components for dim in taint_input.dimensions]
+    dim_offsets = [dim.offset for dim in taint_input.dimensions]
     # Handle dimension mismatch (broadcasting case)
     # If taint has fewer dims than trace, the tensor was broadcast
     # Pad leading dimensions with MODEL_CONFIG (conservative)
@@ -111,6 +123,7 @@ def _tensor_input(i, taint_input, dims, dtype) -> 'ProfileInput':
         num_missing = len(dims) - len(dim_types)
         dim_types = [DimensionType.MODEL_CONFIG] * num_missing + dim_types
         dim_components = [None] * num_missing + dim_components
+        dim_offsets = [0] * num_missing + dim_offsets
     elif len(dim_types) > len(dims):
         # Taint has more dims than trace - unusual, raise error
         raise ValueError(
@@ -123,6 +136,7 @@ def _tensor_input(i, taint_input, dims, dtype) -> 'ProfileInput':
         dimensions=dim_types,
         actual_shape=dims,
         dimension_components=dim_components,
+        dimension_offsets=dim_offsets if any(dim_offsets) else None,
     )
 
 
@@ -211,6 +225,7 @@ def extract_inputs_from_taint(
                 dim_types = [dim.dim_type for dim in taint_input.dimensions]
                 actual_shape = [dim.value for dim in taint_input.dimensions]
                 dim_components = [dim.components for dim in taint_input.dimensions]
+                dim_offsets = [dim.offset for dim in taint_input.dimensions]
                 # Default to long for index tensors when dtype is empty
                 effective_dtype = dtype if dtype else "long int"
                 profile_input = ProfileInput(
@@ -218,7 +233,8 @@ def extract_inputs_from_taint(
                     dtype=effective_dtype,
                     dimensions=dim_types,
                     actual_shape=actual_shape,
-                    dimension_components=dim_components
+                    dimension_components=dim_components,
+                    dimension_offsets=dim_offsets if any(dim_offsets) else None,
                 )
             elif not is_trace_scalar and is_tensor_dtype:
                 # Case 2: 0-d tensor (scalar buffer). Preserve as Tensor with

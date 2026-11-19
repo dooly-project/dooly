@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from doolyprof.profiler.utils.vllm_compat import call_module_with_recorded_arguments
 from doolyprof.profiler.module import ModuleInfo
 from doolyprof.profiler.finput import extract_inputs_from_taint
 from doolyprof.profiler.input_generator import InputGenerator, AttentionBatchConfig
@@ -30,6 +31,12 @@ def _dim_is_tokens(dim) -> bool:
 def _dim_is_requests(dim) -> bool:
     name = getattr(dim, 'value', None) or str(dim)
     return 'NUM_REQ' in name.upper()
+
+
+def _dim_offset(inp, i) -> int:
+    """The constant a NUM_REQS+k / NUM_TOKS+k dim adds to the batch size."""
+    offset = getattr(inp, 'dim_offset', None)
+    return offset(i) if offset is not None else 0
 
 
 def _tensor_parts(inputs):
@@ -57,7 +64,7 @@ def _extract_num_tokens_from_inputs(inputs) -> Optional[int]:
             continue
         for i, d in enumerate(dims):
             if _dim_is_tokens(d) and i < len(shape) and shape[i] > 0:
-                return int(shape[i])
+                return int(shape[i]) - _dim_offset(inp, i)
         if fallback is None and shape[0] > 0:
             fallback = int(shape[0])
     return fallback
@@ -70,9 +77,26 @@ def _extract_num_requests_from_inputs(inputs) -> Optional[int]:
         shape = getattr(inp, 'actual_shape', None) or []
         for i, d in enumerate(dims):
             if _dim_is_requests(d) and i < len(shape) and shape[i] > 0:
-                return int(shape[i])
+                return int(shape[i]) - _dim_offset(inp, i)
     return None
 
+
+
+def _event_class(event) -> str:
+    """The module class of a MODULE event (``MODULE: <class> IN:...``), else its name."""
+    name = getattr(event, "name", "") or ""
+    parts = name.split()
+    return parts[1] if len(parts) > 1 and parts[0] == "MODULE:" else name.split(" IN:")[0]
+
+
+def _under_any(anchor, parent_ids) -> bool:
+    """Whether the event runs inside one of the events with these ids."""
+    e = anchor
+    while e is not None:
+        if id(e) in parent_ids:
+            return True
+        e = e.parent
+    return False
 
 class ModuleResolver:
     """Validates and merges ModuleInfo objects before profiling.
@@ -159,6 +183,8 @@ class ModuleResolver:
                     resolved.append((module, callable_obj))
                     resolved_indices.add(idx)
                     continue
+                elif getattr(module, "_not_standalone", False):
+                    print(f"[RESOLVER] → {module.operation_name} — trying the module that calls it")
                 else:
                     print(f"[RESOLVER] ✗ {module.operation_name} — dummy run failed, walking up")
             else:
@@ -170,6 +196,7 @@ class ModuleResolver:
                 continue
 
             found_parent = False
+            op_anchor = module.hierarchy.anchor  # the walk below re-anchors the shared hierarchy
             curr_event = module.hierarchy.anchor.parent
 
             while curr_event:
@@ -189,7 +216,8 @@ class ModuleResolver:
                     continue
 
                 # absorb siblings that share this parent
-                absorbed_names, absorbed_from_resolved = self._absorb_siblings(curr_event, idx, modules, absorbed_indices, resolved_indices)
+                absorbed_names, absorbed_from_resolved = self._absorb_siblings(
+                    curr_event, idx, modules, absorbed_indices, resolved_indices, op_anchor=op_anchor)
                 parent_module.absorbed_ops = absorbed_names
 
                 # Remove already-resolved modules that got absorbed by this parent
@@ -204,6 +232,24 @@ class ModuleResolver:
                 resolved.append((parent_module, parent_callable))
                 found_parent = True
                 break
+
+            if not found_parent and callable_obj is not None:
+                module.hierarchy.anchor = op_anchor
+            last_resort = (not found_parent and callable_obj is not None
+                           and self._try_dummy_run(callable_obj, module, bind_layer=True))
+            if not last_resort and getattr(module, "bound_layer", None) is not None and not found_parent:
+                del module.bound_layer  # a tentative binding the run did not confirm
+            if last_resort:
+                # Last resort: a custom op that acts on a registered layer it is
+                # given by name (an argument the trace cannot record), whose
+                # enclosing modules cannot run on their own either (North-Mini's
+                # dual-stream join under a decoder layer that needs its residual).
+                # Ops a parent can run (an Attention layer's KV-cache update) are
+                # resolved to that parent above, with the metadata it builds.
+                print(f"[RESOLVER] ✓ {module.operation_name} — runs on registered layer {module.bound_layer}")
+                resolved.append((module, callable_obj))
+                resolved_indices.add(idx)
+                found_parent = True
 
             if not found_parent:
                 print(f"[RESOLVER] ✗ {module.operation_name} — no working parent found, skipping")
@@ -229,7 +275,7 @@ class ModuleResolver:
     def _import_op(self, module: ModuleInfo) -> Optional[Callable]:
         """Try importing a cpu_op via OpImporter."""
         try:
-            callable_obj, msg = self.importer.import_op(op_full_name=module.operation_name)
+            callable_obj, msg = self.importer.import_for(module)
             if callable_obj is None:
                 print(f"[RESOLVER]   Import failed for {module.operation_name}: {msg}")
             return callable_obj
@@ -419,8 +465,13 @@ class ModuleResolver:
         callable_obj: Callable,
         module: ModuleInfo,
         layer_name_override: Optional[str] = None,
+        bind_layer: bool = False,
     ) -> bool:
         """Run one forward pass to verify the callable works with the given inputs.
+
+        bind_layer: for a raw op whose next argument is a layer name the trace
+        could not record, pass the registered layer that encloses it and run it
+        in a forward context (``resolve`` tries this only as a last resort).
 
         Uses a small workload to minimize overhead. Catches CUDA errors
         that would otherwise corrupt the GPU context.
@@ -466,6 +517,21 @@ class ModuleResolver:
             # kernel-name normalization.
             trace_num_tokens = _extract_num_tokens_from_inputs(module.inputs)
             trace_num_requests = _extract_num_requests_from_inputs(module.inputs)
+
+            # Last resort for a raw op that names the layer it acts on: when that
+            # layer has a metadata builder (attention / Mamba), the op is that
+            # layer's kernels and runs as the layer would, with its metadata and
+            # an attention batch. A forward context with no metadata makes vLLM
+            # take its profile-run path, which runs nothing (an empty KV-cache
+            # write, an attention that returns at once) and would pass.
+            from doolyprof.profiler.profiler import (
+                enclosing_registered_layer as _enclosing, op_takes_layer_name)
+            if (layer_name is None and bind_layer and not module.is_module and self.vlp is not None
+                    and op_takes_layer_name(callable_obj, module.operation_name)):
+                candidate = _enclosing(module, self.vlp.vllm_config.compilation_config.static_forward_context)
+                if candidate is not None and self.vlp.has_metadata_builder(candidate):
+                    layer_name = candidate
+                    module.bound_layer = candidate  # needs_metadata takes it as the op's own layer
 
             if layer_name is not None:
                 # Attention-style module needs AttentionBatchConfig. Every knob
@@ -530,13 +596,46 @@ class ModuleResolver:
             #     else:
             #         print(f"[RESOLVER DEBUG]   [{i}] {type(inp).__name__}: {inp}")
 
-            from doolyprof.profiler.profiler import prepare_op_args
-            args, kwargs = prepare_op_args(callable_obj, module.operation_name, inputs)
+            from doolyprof.profiler.profiler import (
+                prepare_op_args, needs_layer_name, enclosing_registered_layer,
+                unrecordable_required_args)
+            # An op with a required argument the trace keeps no value for (a
+            # layer name, a cache dtype string) cannot run on its own; say so
+            # and let resolve() go to the module that calls it, instead of a
+            # run that can only raise. A layer name is bound on the last-resort
+            # attempt (bind_layer).
+            if not module.is_module:
+                missing = unrecordable_required_args(callable_obj, module.operation_name, inputs,
+                                                     allow_layer_name=bind_layer)
+                if missing:
+                    print(f"[RESOLVER]   Not runnable on its own: needs {', '.join(missing)}, "
+                          f"which the trace cannot record")
+                    module._not_standalone = True
+                    return False
+            # A custom op that names the registered layer it acts on (vLLM's
+            # layer_name argument, a Python object the trace cannot record)
+            # gets the registered layer that encloses it in the trace, and
+            # runs in a forward context, where the engine looks the layer up.
+            bound_layer = None
+            if bind_layer and not module.is_module and self.vlp is not None and needs_layer_name(
+                    callable_obj, module.operation_name, inputs):
+                registered = self.vlp.vllm_config.compilation_config.static_forward_context
+                bound_layer = enclosing_registered_layer(module, registered)
+                print(f"[RESOLVER]   Layer-name argument: {bound_layer or 'no registered layer encloses the op'}")
+            args, kwargs = prepare_op_args(callable_obj, module.operation_name, inputs,
+                                           layer_name=bound_layer)
 
             forward_context = None
             slot_mapping_dict = None
             num_tokens_for_context = None
-            if layer_name and isinstance(workload_batch, AttentionBatchConfig):
+            # Metadata only for a module that runs the layer (the attention /
+            # Mamba layer itself or a module around it). One that borrows the
+            # layer's name for its forward context (a MoE runner beside it)
+            # gets an empty context and the step's token count below: with the
+            # attention batch's count instead, sequence-parallel MoE split the
+            # wrong number of tokens and its dispatch assertion failed.
+            if (layer_name and isinstance(workload_batch, AttentionBatchConfig)
+                    and self.vlp.needs_metadata(module, layer_name)):
                 # print(f"[RESOLVER DEBUG] Setting up forward_context for layer: {layer_name}")
                 batch_config = AttentionBatchConfig(
                     batch_size=workload_batch.batch_size,
@@ -550,15 +649,15 @@ class ModuleResolver:
                         # Skip this config - exceeds available KV cache blocks
                         print(f"[RESOLVER]   Skipping config (exceeds KV cache): {batch_config}")
                         return False
-                    layer_metadata, _ = result
+                    layer_metadata, _, common_meta = result
                     forward_context = {layer_name: layer_metadata}
 
-                    # Mirror profiler.py:920-923 — without slot_mapping +
+                    # Mirror the profiler — without slot_mapping +
                     # num_actual_tokens in the forward context, vLLM's
                     # unified_kv_cache_update silently skips
                     # reshape_and_cache_flash_kernel and the attention kernel
-                    # dispatch can misroute (kernel-match sees nothing).
-                    common_meta = self.vlp._build_common_attention_metadata(batch_config, kv_cache_gid=0)
+                    # dispatch can misroute (kernel-match sees nothing). The
+                    # slots are the layer's own batch (its KV-cache group).
                     if common_meta is not None:
                         slot_mapping_dict = {layer_name: common_meta.slot_mapping}
                         num_tokens_for_context = common_meta.num_actual_tokens
@@ -571,16 +670,37 @@ class ModuleResolver:
                     # the "Forward context is not set" guard. Metadata content
                     # stays empty; ops that actually need attention metadata
                     # would fail further downstream with a clearer KeyError.
+                    from doolyprof.profiler.comm_args import describe_exception
+                    if self.vlp.needs_metadata(module, layer_name):
+                        # an attention / Mamba-style layer run without its
+                        # metadata takes vLLM's no-op path: the run would pass
+                        # and the profile would time nothing
+                        print(f"[RESOLVER]   Metadata build failed for {layer_name}: {describe_exception(e)}")
+                        return False
                     print(f"[RESOLVER]   No metadata for {layer_name} "
-                          f"(ok for non-attention ops): {e}")
+                          f"(ok for non-attention ops): {describe_exception(e)}")
                     forward_context = {layer_name: None}
                     slot_mapping_dict = None
                     num_tokens_for_context = None
+            elif layer_name:
+                # a registered layer's name for the forward context only (the
+                # engine requires one to be set); the token count is the step's
+                forward_context = {layer_name: None}
+            elif bound_layer is not None:
+                forward_context = {bound_layer: None}
             else:
                 # No layer_name / not an AttentionBatchConfig workload: ops
                 # like aten::linear, aten::embedding, etc. don't read forward
                 # context, so leave it None to preserve existing behavior.
                 pass
+            if forward_context and num_tokens_for_context is None:
+                # The batch's token count (any workload kind, also when building
+                # attention metadata failed): under data parallelism the engine
+                # sizes the per-rank token counts (DP metadata) from it.
+                num_tokens_for_context = (workload_params or {}).get('num_tokens')
+                if num_tokens_for_context is not None:
+                    from doolyprof.profiler.profiler import step_token_ratio
+                    num_tokens_for_context = num_tokens_for_context * step_token_ratio(module)
             
             def run_callable():
                 with torch.inference_mode():
@@ -607,7 +727,7 @@ class ModuleResolver:
                         #     if hasattr(v, 'shape'):
                         #         print(f"[RESOLVER DEBUG]     {k}={v.shape}")
                         
-                        callable_obj(*positional_tensors, **kwarg_tensors)
+                        call_module_with_recorded_arguments(callable_obj, positional_tensors, kwarg_tensors)
                     else:
                         callable_obj(*args, **kwargs)
 
@@ -646,7 +766,7 @@ class ModuleResolver:
                                 num_tokens=num_tokens_for_context,
                                 slot_mapping=slot_mapping_dict,
                             ):
-                                callable_obj(*positional_tensors, **kwarg_tensors)
+                                call_module_with_recorded_arguments(callable_obj, positional_tensors, kwarg_tensors)
                     else:
                         with set_current_vllm_config(self.vlp.vllm_config):
                             with set_forward_context(
@@ -669,6 +789,9 @@ class ModuleResolver:
             del inputs, args, kwargs
             torch.cuda.empty_cache()
 
+            if bound_layer is not None:
+                # the profiler times it with the model loaded (profiler._profile_models)
+                module.bound_layer = bound_layer
             return True
 
         except Exception as e:
@@ -680,7 +803,8 @@ class ModuleResolver:
                 raise RuntimeError(
                     f"[RESOLVER] out of GPU memory in the dummy run of {module.operation_name}; "
                     f"not resolving on a GPU without room for it (is another process using this GPU?)") from e
-            print(f"[RESOLVER]   Dummy run failed: {e}")
+            from doolyprof.profiler.comm_args import describe_exception
+            print(f"[RESOLVER]   Dummy run failed: {describe_exception(e)}")
             # Clean up CUDA state
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -776,37 +900,81 @@ class ModuleResolver:
         all_modules: List[ModuleInfo],
         absorbed_indices: set,
         resolved_indices: set,
+        op_anchor=None,
     ) -> Tuple[List[str], List[str]]:
-        """Find and mark all sibling modules whose ancestry passes through parent_event.
+        """Take the calls that run inside the parent the group is profiled as off
+        the other groups, call by call.
 
-        Any module whose anchor.parent chain includes parent_event gets absorbed.
+        The parent stands for one instance per member of the resolving group
+        (``parent_instances``). Every other group loses the calls of its own that
+        run inside one of them: its count drops by that many, and a group left
+        with none is absorbed (no profile of its own), as before. Counting by the
+        representative call alone took a group whole or not at all: SmolLM3's
+        9 NoPE layers profile their whole SmolLM3Attention (its attention group
+        differs from the 27 RoPE layers'), and the q/k/v and o_proj linears of all
+        36 layers, one group each, kept their 36 calls: 9 of them counted twice.
         Returns:
-            - absorbed_names: list of all absorbed operation names
-            - absorbed_from_resolved: list of names that were already in resolved
+            - absorbed_names: operation names of the groups absorbed whole
+            - absorbed_from_resolved: those of them already resolved
         """
         absorbed_names = []
         absorbed_from_resolved = []
+        partly = []
+        parents = self.parent_instances(parent_event, all_modules[current_idx], op_anchor)
 
         for i, module in enumerate(all_modules):
             if i == current_idx or i in absorbed_indices:
                 continue
             if module.hierarchy is None:
                 continue
-
-            # Check if this module's anchor is a descendant of parent_event
-            current = module.hierarchy.anchor
-            while current:
-                if current is parent_event:
-                    absorbed_indices.add(i)
-                    absorbed_names.append(module.operation_name)
-                    # Track if this was already resolved
-                    if i in resolved_indices:
-                        absorbed_from_resolved.append(module.operation_name)
-                        resolved_indices.discard(i)
-                    break
-                current = current.parent
+            uncovered = getattr(module, "_uncovered_anchors", None)
+            if uncovered is None:
+                anchors = list(getattr(module, "instance_anchors", None) or []) or [module.hierarchy.anchor]
+                uncovered = {id(a): a for a in anchors}
+            inside = [k for k, a in uncovered.items() if _under_any(a, parents)]
+            if not inside:
+                continue
+            for k in inside:
+                del uncovered[k]
+            module._uncovered_anchors = uncovered
+            if not uncovered:
+                absorbed_indices.add(i)
+                absorbed_names.append(module.operation_name)
+                # Track if this was already resolved
+                if i in resolved_indices:
+                    absorbed_from_resolved.append(module.operation_name)
+                    resolved_indices.discard(i)
+            else:
+                module.count = len(uncovered)
+                partly.append(f"{module.operation_name} -{len(inside)}")
+        if partly:
+            print(f"[RESOLVER]   Calls inside it, no longer counted on their own: {partly}")
 
         return absorbed_names, absorbed_from_resolved
+
+    @staticmethod
+    def parent_instances(parent_event, group, op_anchor=None) -> set:
+        """ids of the parent events the group's members run in: ``parent_event``
+        for the representative call, and for each other member the ancestor as
+        many levels up, when it is the same module class."""
+        rep = op_anchor if op_anchor is not None else (
+            group.instance_anchors[0] if getattr(group, "instance_anchors", None) else None)
+        out = {id(parent_event)}
+        if rep is None:
+            return out
+        depth, e = 0, rep
+        while e is not None and e is not parent_event:
+            e, depth = e.parent, depth + 1
+        if e is None:
+            return out
+        head = _event_class(parent_event)
+        for a in getattr(group, "instance_anchors", None) or []:
+            e = a
+            for _ in range(depth):
+                e = e.parent if e is not None else None
+            if e is not None and _event_class(e) == head:
+                out.add(id(e))
+        return out
 
 # ---------------------------------------------------------------------------
 # Manual test: python -m doolyprof.profiler.resolver <trace.json> <model>

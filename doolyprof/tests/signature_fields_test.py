@@ -221,6 +221,111 @@ def test_derive_op_dtype():
     assert _derive_op_dtype([], fallback="") == ""
 
 
+# A custom operator registered in this process: it resolves through torch.ops
+# like a loaded vLLM op, but PyTorch does not define it.
+_TEST_LIB = torch.library.Library("doolysigtest", "DEF")
+_TEST_LIB.define("scale(Tensor x, str layer_name) -> Tensor")
+
+
+def _tensor(dtype, *dims):
+    """A traced tensor input: the first dim is the token count, the rest MODEL_CONFIG."""
+    return ProfileInput(type="Tensor", dtype=dtype,
+                        dimensions=[DimensionType.NUM_TOKENS] + [DimensionType.MODEL_CONFIG] * len(dims),
+                        actual_shape=[470, *dims])
+
+
+def _scalar(value, dtype="Scalar"):
+    return ProfileInput(type="Scalar", dtype=dtype, dimensions=[], actual_shape=[], scalar_value=value)
+
+
+def _raw_op(op_name, parent_state, inputs):
+    """A raw-op anchor (not a module) under a module whose state hash is ``parent_state``."""
+    from doolyprof.profiler.module import ModuleInfo
+    from doolyprof.profiler.parser import Event, OperationHierarchy
+    from doolyprof.profiler.trace import _derive_op_dtype
+
+    def ev(name, cat, **args):
+        return Event(cat=cat, name=name, ts=0, dur=1, ev_idx=None, external_id=None, python_id=None,
+                     python_parent_id=None, args=args)
+
+    parent = ev("KimiDecoderLayer", "module", **({"state_hash": parent_state} if parent_state else {}))
+    h = OperationHierarchy(anchor=ev(op_name, "cpu_op"), root_module=parent, nearest_module=parent,
+                           kernels=[], taints=[])
+    return ModuleInfo(module_name=op_name, operation_name=op_name, inputs=inputs,
+                      dtype=_derive_op_dtype(inputs), hierarchy=h)
+
+
+def test_is_builtin_operator():
+    from doolyprof.profiler.module import is_builtin_operator
+    for name in ("aten::pad", "aten::mul.Tensor", "aten::mul", "aten::add.Tensor", "aten::linear"):
+        assert is_builtin_operator(name), name
+    for name in ("doolysigtest::scale",             # registered, but not by PyTorch
+                 "vllm::unified_attention_with_output", "_C::rms_norm",  # custom ops
+                 "aten::no_such_op", "KimiDecoderLayer", "", "::pad"):
+        assert not is_builtin_operator(name), name
+
+
+def test_builtin_op_ignores_parent_state():
+    """A builtin PyTorch op called identically under differently configured modules is one op
+    (Kimi-K3's sequence-parallel pad under 16 decoder-layer states); its own arguments still
+    separate calls that really differ."""
+    from doolyprof.profiler.module import ModuleComparator
+    cmp = ModuleComparator()
+    sig = lambda m: cmp._hash_signature(cmp._module_signature(m))  # noqa: E731
+    pad = lambda state, p="[0, 0, 0, 2]": _raw_op(  # noqa: E731
+        "aten::pad", state, [_tensor("c10::BFloat16", 7168), _scalar(p, "ScalarList")])
+    assert sig(pad("0a1b2c3d4e5f")) == sig(pad("ffffffffffff")) == sig(pad(""))
+    assert sig(pad("0a1b2c3d4e5f")) != sig(pad("0a1b2c3d4e5f", "[0, 0, 0, 6]"))
+
+
+def test_custom_op_keeps_parent_state():
+    """A custom op can read its layer's configuration through the layer name (vLLM attention's
+    sliding window), so the same call under differently configured layers stays apart."""
+    from doolyprof.profiler.module import ModuleComparator
+    cmp = ModuleComparator()
+    sig = lambda m: cmp._hash_signature(cmp._module_signature(m))  # noqa: E731
+    for op in ("doolysigtest::scale", "vllm::unified_attention_with_output"):
+        call = lambda state: _raw_op(op, state, [_tensor("c10::BFloat16", 2048), _scalar("layers.0.attn")])  # noqa: E731
+        assert sig(call("0a1b2c3d4e5f")) != sig(call("ffffffffffff")), op
+        assert sig(call("0a1b2c3d4e5f")) == sig(call("0a1b2c3d4e5f")), op
+
+
+def test_every_input_dtype_in_signature():
+    """The dtype field is the first floating input's; a different dtype in any other input is a
+    different op."""
+    from doolyprof.profiler.module import ModuleComparator
+    cmp = ModuleComparator()
+    sig = lambda m: cmp._hash_signature(cmp._module_signature(m))  # noqa: E731
+    bf16_scale = _raw_op("aten::mul.Tensor", "", [_tensor("c10::BFloat16", 2816), _tensor("c10::BFloat16")])
+    fp32_scale = _raw_op("aten::mul.Tensor", "", [_tensor("c10::BFloat16", 2816), _tensor("float")])
+    assert bf16_scale.dtype == fp32_scale.dtype == "bfloat16"
+    assert bf16_scale.input_dtypes() == ("bfloat16", "bfloat16")
+    assert fp32_scale.input_dtypes() == ("bfloat16", "float32")
+    assert sig(bf16_scale) != sig(fp32_scale)
+    # index dtypes count too
+    i32 = _raw_op("aten::index_select", "", [_tensor("c10::BFloat16", 2048), _scalar("0"), _tensor("int")])
+    i64 = _raw_op("aten::index_select", "", [_tensor("c10::BFloat16", 2048), _scalar("0"), _tensor("long int")])
+    assert i32.input_dtypes() == ("bfloat16", "", "int32") and sig(i32) != sig(i64)
+    # spellings of one dtype agree, and an omitted trailing argument is no difference
+    a = _raw_op("aten::add.Tensor", "", [_tensor("c10::BFloat16", 2048), _tensor("torch.bfloat16", 2048)])
+    b = _raw_op("aten::add.Tensor", "", [_tensor("c10::BFloat16", 2048), _tensor("c10::BFloat16", 2048), _scalar(None)])
+    assert a.input_dtypes() == b.input_dtypes() == ("bfloat16", "bfloat16")
+    assert sig(a) == sig(b)
+
+
+def test_dedup_groups_follow_signature():
+    """The parser's dedup groups apply the same rule as the signature: the builtin op's calls
+    under two layer states become one entry counting both, the custom op's stay two."""
+    from doolyprof.profiler.trace import TraceParser
+    infos = [_raw_op("aten::pad", s, [_tensor("c10::BFloat16", 7168), _scalar("[0, 0, 0, 2]", "ScalarList")])
+             for s in ("0a1b2c3d4e5f", "ffffffffffff")]
+    infos += [_raw_op("doolysigtest::scale", s, [_tensor("c10::BFloat16", 2048), _scalar("layers.0.attn")])
+              for s in ("0a1b2c3d4e5f", "ffffffffffff")]
+    out = TraceParser._deduplicate_module_infos(infos)
+    counts = sorted((d.operation_name, d.count) for d in out)
+    assert counts == [("aten::pad", 2), ("doolysigtest::scale", 1), ("doolysigtest::scale", 1)], counts
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

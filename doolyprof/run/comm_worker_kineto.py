@@ -34,11 +34,14 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
         gpu_memory_utilization=0.5,  # Conservative for profiling
         max_model_len=2048,  # Small model_len sufficient for comm profiling
         tensor_parallel_size=tp_size,  # REAL tensor parallelism
+        language_model_only=True,  # the traced language model, no multimodal encoders
+        skip_tokenizer_init=True,  # collectives only, no text
     )
     print(f"[WORKER] LLM initialized successfully")
 
     # Import the KINETO-enabled profiler
     from doolyprof.run.comm_profiler_kineto import CommProfiler, CommProfilingConfig, ProfileMethod
+    from doolyprof.profiler.utils.topology import machine_topology
 
     DTYPE_MAP = {
         "float32": torch.float32,
@@ -71,9 +74,10 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
     comm_profiler.plan(collective_ops)
 
     # Check if we should profile based on existing data
-    if comm_profiler.should_profile(tp_size, overwrite=overwrite):
-        comm_profiler.profile(model_name, dtype_str, comm_config, tp_size, collective_backend, "mew1", llm)
-        comm_profiler.save_to_db(tp_size=tp_size, overwrite=overwrite)
+    topology = machine_topology()
+    if comm_profiler.should_profile(tp_size, overwrite=overwrite, topology=topology):
+        comm_profiler.profile(model_name, dtype_str, comm_config, tp_size, collective_backend, topology, llm)
+        comm_profiler.save_to_db(tp_size=tp_size, topology=topology, overwrite=overwrite)
     else:
         print(f"[COMM] Skipping profiling - all operations already have data with {selected_method} and overwrite=False")
 

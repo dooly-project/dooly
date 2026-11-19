@@ -42,9 +42,12 @@ class _MoE(torch.nn.Module):
             self.expert_map = None
 
 
-def _routed_ids(layer, num_tokens, activated, local_pairs=None):
+def _routed_ids(layer, num_tokens, activated, local_pairs=None, rows=None):
+    """Route ``rows`` hidden-state rows (default: ``num_tokens``) under forced routing; the
+    router sees the hidden states as vLLM passes them."""
+    hidden_states = torch.zeros(rows or num_tokens, 8)
     with moe_hook.force_moe_routing(layer, num_tokens, activated, local_pairs=local_pairs):
-        _, ids = layer.router._compute_routing(None, None, torch.int64)
+        _, ids = layer.router._compute_routing(hidden_states, None, torch.int64)
     return ids.tolist()
 
 
@@ -53,6 +56,19 @@ def test_non_ep_routing_unchanged():
     ids = _routed_ids(layer, num_tokens=5, activated=16)
     assert ids == moe_hook._cycle_ids(5, 6, 16), ids
     assert moe_hook.moe_expert_placement(layer) == (list(range(64)), [])
+
+
+def test_routing_on_rows_gathered_from_dp_ranks():
+    """An engine that routes after gathering every data-parallel rank's tokens passes a multiple
+    of the per-rank batch; each rank's tokens are routed like this rank's."""
+    layer = _MoE(num_experts=64, top_k=6)
+    one = moe_hook._cycle_ids(5, 6, 16)
+    assert _routed_ids(layer, num_tokens=5, activated=16, rows=10) == one + one
+    try:
+        _routed_ids(layer, num_tokens=5, activated=16, rows=7)
+    except ValueError:
+        return
+    raise AssertionError("accepted 7 rows for 5 tokens")
 
 
 def test_ep_local_pairs_routing():

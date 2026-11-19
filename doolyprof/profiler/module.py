@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Any, Set, Optional, Union, Callable
+import functools
 import json
 import hashlib
 import sqlite3
@@ -45,6 +46,13 @@ class ModuleInfo:
     # the group. The resolver fetches the instance by path and verifies that
     # all members are configured and shaped identically. Never hashed.
     instance_paths: List[str] = field(default_factory=list)
+    # The trace anchor of every member of the dedup group (the template's
+    # first): the resolver takes a group's calls that run inside a parent it
+    # profiles as one unit off the group's count, call by call. Never hashed.
+    instance_anchors: List[Any] = field(default_factory=list, repr=False, compare=False)
+    # For a Triton launch scope (tracer/triton_launch.py): how to launch the
+    # kernel again from the generated tensor inputs (profiler/utils/triton_replay.py).
+    launch_spec: Optional[dict] = None
 
     # Convenience properties for accessing hierarchy info
     @property
@@ -121,6 +129,10 @@ class ModuleInfo:
                         if dim_type == DimensionType.MODEL_CONFIG:
                             # Use a generic name for MODEL_CONFIG dimensions
                             params_dict[f"{prefix}_dim{j}"] = dim_val
+                        elif part.dim_offset(j):
+                            # a swept dim at sweep value + k (NUM_REQS+1) is a
+                            # different input from one at the sweep value
+                            params_dict[f"{prefix}_dim{j}_offset"] = part.dim_offset(j)
             elif inp.type == "Scalar" and inp.scalar_value:
                 # Extract scalar value
                 param_name = f"input{i}_scalar"
@@ -137,6 +149,32 @@ class ModuleInfo:
         #     print(self.hierarchy.anchor.name, "params_list :", params_list)
         return params_list
 
+    def input_dtypes(self) -> Tuple[str, ...]:
+        """The dtype of every input, by position (a signature field).
+
+        ``dtype`` is only the first floating-point tensor's dtype, the one the
+        kernel computes in. An op whose other inputs differ in dtype (an fp8
+        weight with an fp32 or bf16 scale, int32 or int64 indices, a bf16 or
+        fp32 residual) is a different op. A tensor's dtype is named by torch,
+        as ``dtype`` is; a TensorList by its recorded dtype; any other
+        argument is ''. Trailing '' entries are dropped, so an omitted
+        trailing scalar argument does not count as a difference.
+        """
+        from doolyprof.profiler.input_generator import trace_dtype_to_torch, canonical_dtype_name
+
+        out: List[str] = []
+        for inp in self.inputs:
+            if inp.type == "Tensor":
+                td = trace_dtype_to_torch(inp.dtype) if inp.dtype else None
+                out.append(canonical_dtype_name(td) if td is not None else (inp.dtype or ""))
+            elif inp.type == "TensorList":
+                out.append(inp.dtype or "")
+            else:
+                out.append("")
+        while out and not out[-1]:
+            out.pop()
+        return tuple(out)
+
 
 def _tensor_part_prefixes(i, inp):
     """(param-name prefix, Tensor ProfileInput) pairs for input ``i``:
@@ -144,6 +182,54 @@ def _tensor_part_prefixes(i, inp):
     if inp.type == "TensorList":
         return [(f"input{i}_t{k}", el) for k, el in enumerate(inp.tensor_parts())]
     return [(f"input{i}", inp)]
+
+
+@functools.lru_cache(maxsize=None)
+def is_builtin_operator(op_name: str) -> bool:
+    """Whether ``op_name`` (``aten::pad``, ``aten::mul.Tensor``) is an operator
+    PyTorch itself defines, by torch's own test
+    (``torch._library.utils.is_builtin``).
+
+    A name that does not resolve to a registered operator (a custom op whose
+    library is not loaded, a module name, a Triton kernel), or a torch
+    without that test, counts as not builtin, which keeps the parent's state
+    in the signature (``parent_state_hash``).
+    """
+    ns, sep, rest = op_name.partition("::")
+    if not sep or not ns or not rest:
+        return False
+    name, _, overload = rest.partition(".")
+    try:
+        import torch
+        from torch._library.utils import is_builtin
+        packet = getattr(getattr(torch.ops, ns), name)
+        return bool(is_builtin(getattr(packet, overload or packet.overloads()[0])))
+    except Exception:
+        return False
+
+
+def parent_state_hash(info: "ModuleInfo") -> str:
+    """The state hash a raw-op anchor's signature takes from its nearest
+    containing module, or '' when the op cannot see that module's state.
+
+    A builtin PyTorch operator computes from its arguments and process-wide
+    settings only, so the module it runs under can change its work only
+    through the arguments, which the signature records (MODEL_CONFIG dims,
+    scalar arguments, every input's dtype). Carrying the parent's hash would
+    only split identical calls by where they were made (Kimi-K3's
+    sequence-parallel pad under 16 decoder-layer configurations).
+
+    Any other operator can read state its arguments do not show: vLLM's
+    attention ops look up their layer, and with it the sliding window, by the
+    layer name through the forward context. Those keep the parent's hash, so
+    calls under differently configured layers stay apart.
+    """
+    if is_builtin_operator(info.operation_name):
+        return ""
+    nearest = info.hierarchy.nearest_module if info.hierarchy else None
+    if nearest is None:
+        return ""
+    return (getattr(nearest, "args", {}) or {}).get("state_hash", "") or ""
 
 
 class ModuleComparator:
@@ -248,10 +334,13 @@ class ModuleComparator:
         # Signature = operation_name
         #           + the anchor's own MODEL_CONFIG dims / scalar args
         #           + state_hash (own for modules, else nearest parent
-        #             module's — the module's configuration, including the
-        #             attention backend's implementation class and its
-        #             constructor contract, cache dtypes, sliding window ...)
-        #           + dtype (derived from the op's own traced inputs).
+        #             module's unless the op is a builtin PyTorch operator,
+        #             see parent_state_hash — the module's configuration,
+        #             including the attention backend's implementation class
+        #             and its constructor contract, cache dtypes, sliding
+        #             window ...)
+        #           + dtype (derived from the op's own traced inputs)
+        #           + every input's dtype (ModuleInfo.input_dtypes).
         #
         # Deliberately NOT hashed: the ops executed under the anchor
         # (descendants) and GPU kernel names. Both describe how the
@@ -261,26 +350,28 @@ class ModuleComparator:
         # metadata, tracer dispatch records), and the kernel symbols change
         # with the traced token count. Over every database produced so far
         # the descendant list never separated two anchors that agreed on the
-        # four hashed fields, except the attention backend, which the state
-        # hash now carries explicitly. The descendants are still written to
-        # signature_json (5th element) for inspection.
-        if module.is_module:
+        # first four hashed fields, except the attention backend, which the
+        # state hash now carries explicitly. The descendants are still written
+        # to signature_json (6th element) for inspection.
+        if module.is_module or module.launch_spec:
+            # a Triton launch scope hashes its own fixed arguments: one kernel
+            # launched with different constexprs (Kimi-K3's attention residual
+            # mixes a layer-dependent number of blocks) is a different kernel
             state_hash = module.state_hash or ""
         else:
-            # cpu_op (non-module) anchor: inherit the nearest containing
-            # module's state hash (the tracer stashed it on the module event's
-            # args via _extract_module_state_hash). Two identical ops living
-            # under differently-configured parents therefore stay distinct.
-            nearest = module.hierarchy.nearest_module if module.hierarchy else None
-            state_hash = ""
-            if nearest is not None:
-                state_hash = (getattr(nearest, "args", {}) or {}).get("state_hash", "") or ""
+            # cpu_op (non-module) anchor: the nearest containing module's
+            # state hash (the tracer stashed it on the module event's args via
+            # _extract_module_state_hash) when the op can read that module's
+            # configuration; '' for a builtin PyTorch operator, whose work
+            # its own arguments fix (parent_state_hash).
+            state_hash = parent_state_hash(module)
 
         parts = (
             module.operation_name,
             self._get_model_param_signature(module),
             state_hash,
             module.dtype or "",
+            module.input_dtypes(),
         )
         return parts
 

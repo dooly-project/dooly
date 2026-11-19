@@ -37,11 +37,11 @@ from doolyprof.profiler.utils.generate_batch import AttentionBatchConfig
 # Apply fake TP patches BEFORE importing vLLM so all modules see patched
 # parallel_state at import time. Set VLLM_FAKE_TP env var before importing
 # this module (e.g. in run-profiler.py via --tp flag).
-from doolyprof.profiler.utils.fake_tp import apply_fake_tp_patches, get_fake_tp_size, get_fake_ep
+from doolyprof.profiler.utils.fake_tp import apply_fake_tp_patches, get_fake_tp_size, get_fake_ep, get_fake_dp_size
 
 _FAKE_TP_SIZE = get_fake_tp_size()
-if _FAKE_TP_SIZE > 1:
-    apply_fake_tp_patches(_FAKE_TP_SIZE)
+if _FAKE_TP_SIZE > 1 or get_fake_dp_size() > 1:
+    apply_fake_tp_patches(_FAKE_TP_SIZE, get_fake_dp_size())
 
 from vllm import LLM
 from vllm.config import set_current_vllm_config
@@ -73,6 +73,9 @@ class VLLMLayerProfiler:
         quantization: Optional[str] = None,
         gpu: str = "0",
         kv_cache_dtype: str = "auto",
+        max_num_batched_tokens: Optional[int] = None,
+        max_num_seqs: Optional[int] = None,
+        gpu_memory_cap: float = 0.9,
     ):
         """
         Initialize the profiler by creating a vLLM LLM instance.
@@ -90,6 +93,8 @@ class VLLMLayerProfiler:
             kv_cache_dtype: vLLM KV-cache dtype literal ("auto", "fp8", ...).
                 Must match the tracer's setting so module state hashes agree
                 between trace time and resolve/profile time.
+            max_num_batched_tokens, max_num_seqs: scheduler limits (see
+                profiler.engine_batch_limits); None keeps vLLM's defaults.
         """
         self.model_name = model_name
         self.dtype = dtype
@@ -103,7 +108,7 @@ class VLLMLayerProfiler:
         self.device = torch.device("cuda:0")
         if gpu_memory_utilization is None:
             from doolyprof.profiler.utils.gpu_memory import engine_memory_fraction
-            gpu_memory_utilization = engine_memory_fraction(devices=1, who="layer profiler")
+            gpu_memory_utilization = engine_memory_fraction(cap=gpu_memory_cap, devices=1, who="layer profiler")
 
         print(f"[VLLMLayerProfiler] Initializing vLLM with model: {model_name}")
 
@@ -122,14 +127,30 @@ class VLLMLayerProfiler:
             tensor_parallel_size=1,  # Single process, fake TP patches handle sharding
             trust_remote_code=True,
             kv_cache_dtype=kv_cache_dtype,
+            # The language model is what was traced and is profiled; no
+            # multimodal encoders (see run-tracer.py)
+            language_model_only=True,
+            # Profiling feeds tensors, never text: no tokenizer (the installed
+            # transformers may not have the checkpoint's tokenizer class)
+            skip_tokenizer_init=True,
+            # Same cache layout as the traced engine (run-tracer.py): with
+            # prefix caching on, vLLM 0.33 puts Mamba-style layers (Kimi-K3's
+            # KDA) in 'align' mode, whose metadata builder needs state indices
+            # the V2 runner precomputes; built here directly it raised, and the
+            # layer ran with no metadata.
+            enable_prefix_caching=False,
         )
         if attn_backend == "FLASH_ATTN":
             llm_kwargs["attention_config"] = {"flash_attn_version": flash_attn_version}
         if quantization:
             llm_kwargs["quantization"] = quantization
         if get_fake_ep():
-            # Fake EP: the fake TP group doubles as the EP group (see get_fake_ep)
+            # Fake EP over the fake TP x DP ranks (see get_fake_ep)
             llm_kwargs["enable_expert_parallel"] = True
+        if max_num_batched_tokens:
+            llm_kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
+        if max_num_seqs:
+            llm_kwargs["max_num_seqs"] = int(max_num_seqs)
         self.llm = LLM(**llm_kwargs)
 
         # Extract internals
@@ -286,6 +307,49 @@ class VLLMLayerProfiler:
                             return builder, attn_group, kv_cache_gid
         raise ValueError(f"No metadata builder found for layer: {layer_name}")
 
+    def needs_metadata(self, module, layer_name: str) -> bool:
+        """Whether running ``module`` runs ``layer_name``'s attention / Mamba
+        kernels, so it cannot run without that layer's metadata: the layer has
+        a metadata builder and is the module itself or inside it. A module that
+        only borrows the layer's name for its forward context (a MoE runner
+        next to it) runs without."""
+        if getattr(module, "bound_layer", None) == layer_name:
+            # a raw op bound to the layer it names (its layer-name argument)
+            # runs that layer's kernels whatever module the trace has around it
+            return self.has_metadata_builder(layer_name)
+        path = getattr(module, "_resolved_path", None) or next(iter(getattr(module, "instance_paths", None) or []), None)
+        if not path or not self.has_metadata_builder(layer_name):
+            return False
+        return layer_name in self.registered_layers_inside(path)
+
+    def registered_layers_inside(self, path: str) -> List[str]:
+        """The KV-cache / recurrent-state layers the engine registered that are
+        the module at ``path`` or inside it. Matched by object as well as by
+        name: a registered name need not be the attribute path (vLLM 0.17.1's
+        LFM2 ShortConv lives at model.layers.0.short_conv but registers as
+        model.layers.0.conv)."""
+        if not path:
+            return []
+        names = self.get_all_layer_names()
+        context = self.vllm_config.compilation_config.static_forward_context
+        try:
+            inside = {id(m) for m in self.model.get_submodule(path).modules()}
+        except AttributeError:
+            inside = set()
+        return [n for n in names
+                if n == path or n.startswith(path + ".")
+                or (context.get(n) is not None and id(context.get(n)) in inside)]
+
+    def has_metadata_builder(self, layer_name: str) -> bool:
+        """Whether the engine builds per-batch metadata for this layer (an
+        attention, Mamba or linear-attention layer). Such a layer cannot be run
+        without it: with no metadata vLLM takes its profiling no-op path."""
+        try:
+            self._find_metadata_builder_for_layer(layer_name)
+            return True
+        except ValueError:
+            return False
+
     def _get_or_create_block_table(
         self,
         batch_size: int,
@@ -421,6 +485,21 @@ class VLLMLayerProfiler:
         # maps positions to their corresponding KV cache slots
         slot_mapping = bt.slot_mapping.gpu[:num_tokens]
 
+        # Per-batch fields some releases carry and their builders require: vLLM
+        # 0.33's MLA and Kimi-K3 KDA builders assert seq_lens_cpu_upper_bound
+        # (an upper bound of seq_lens on the CPU, here exact), its Mamba-style
+        # ones is_prefilling. Set only where the installed
+        # CommonAttentionMetadata defines the field.
+        import dataclasses
+        fields = {f.name for f in dataclasses.fields(CommonAttentionMetadata)}
+        host_copies = {}
+        if "seq_lens_cpu_upper_bound" in fields:
+            host_copies["seq_lens_cpu_upper_bound"] = seq_lens.cpu()
+        if "is_prefilling" in fields:
+            # per request, still in its prompt (the runner's
+            # num_computed_tokens < num_prompt_tokens, on the CPU); vLLM 0.33's
+            # Mamba-style builders (LFM2.5 ShortConv) assert it is set
+            host_copies["is_prefilling"] = torch.full((batch_size,), bool(is_prefill), dtype=torch.bool)
         return CommonAttentionMetadata(
             query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc.cpu(),
@@ -432,6 +511,7 @@ class VLLMLayerProfiler:
             block_table_tensor=block_tables,
             slot_mapping=slot_mapping,
             causal=True,
+            **host_copies,
         )
 
     def build_layer_metadata(
@@ -446,8 +526,14 @@ class VLLMLayerProfiler:
         vLLM's layer-specific builder for the complex part.
 
         Returns:
-            Tuple of (layer_metadata, metadata_builder), or None if the batch
-            config exceeds available KV cache blocks.
+            Tuple of (layer_metadata, metadata_builder, common_metadata), or
+            None if the batch config exceeds available KV cache blocks.
+            ``common_metadata`` is the batch built on the layer's own KV-cache
+            group (its block size and block table): its ``slot_mapping`` is the
+            one the layer's cache write must use. A hybrid model's groups have
+            different block sizes (vLLM 0.17.1 gives a ShortConv / Mamba group
+            blocks of max_model_len tokens, the attention group 16), so slots
+            built on another group's blocks point past the attention cache.
         """
         builder, attn_group, kv_cache_gid = self._find_metadata_builder_for_layer(layer_name)
 
@@ -468,7 +554,7 @@ class VLLMLayerProfiler:
                     common_attn_metadata=common_meta,
                 )
 
-        return layer_metadata, builder
+        return layer_metadata, builder, common_meta
 
     def close(self):
         import gc

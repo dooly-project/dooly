@@ -1,15 +1,45 @@
 """Config tainting: wraps HuggingFace config integer attributes as TaintedInt."""
 
+import contextlib
 import functools
 
 from .types import TaintedInt, TaintedFloat, Taint
 from .registry import register_taint
 
-__all__ = ['create_tainted_config', 'patch_autoconfig', 'unpatch_autoconfig', 'patch_input_buffers', 'unpatch_input_buffers' ]
+__all__ = ['create_tainted_config', 'patch_autoconfig', 'unpatch_autoconfig', 'patch_input_buffers', 'unpatch_input_buffers',
+           'plain_config_reads']
 
 
 # Cache for dynamically created tainted config subclasses
 _tainted_config_cache: dict[type, type] = {}
+
+# Open plain_config_reads() scopes; while any is open, tainted configs return plain values.
+_plain_reads_depth = 0
+
+
+@contextlib.contextmanager
+def plain_config_reads():
+    """Tainted configs return their plain values inside this scope.
+
+    For code that builds its own config objects from the HF config and validates
+    them with exact type checks a TaintedInt fails (``type(v) in (int, float)``);
+    whatever it builds is tainted afterwards by the caller. Nested configs are
+    still returned wrapped, so reads made after the scope stay tainted.
+    """
+    global _plain_reads_depth
+    _plain_reads_depth += 1
+    try:
+        yield
+    finally:
+        _plain_reads_depth -= 1
+
+
+def _is_hf_config(value):
+    try:
+        from transformers import PretrainedConfig
+    except ImportError:
+        return False
+    return isinstance(value, PretrainedConfig)
 
 
 def _reconstruct_config(cls, state):
@@ -172,6 +202,11 @@ def _create_tainted_config_class(config_cls):
             if callable(value):
                 return value
 
+            # inside plain_config_reads(): plain values, but nested configs stay
+            # wrapped so that what the caller keeps of them taints later reads
+            if _plain_reads_depth and not _is_hf_config(value):
+                return value
+
             # check if we have already tainted this attribute
             try:
                 cache = super().__getattribute__('_taint_cache')
@@ -239,6 +274,8 @@ def _create_tainted_config_class(config_cls):
 
         def to_dict(self):
             """Override to_dict to return tainted values instead of raw dict values."""
+            if _plain_reads_depth:
+                return super().to_dict()
             import copy
             # Get the raw dict
             output = copy.deepcopy(self.__dict__)
@@ -409,6 +446,23 @@ def unpatch_autoconfig():
 _original_scheduler_config_getattribute = None
 _original_input_batch_num_reqs = None
 
+# Requests in each scheduler step while observe_scheduled_requests() is on
+# (scheduler output id -> (output, request count)), also with taint tracking off.
+_SCHEDULED_REQUESTS = None
+
+
+def observe_scheduled_requests():
+    """Start recording how many requests each scheduler step runs."""
+    global _SCHEDULED_REQUESTS
+    _SCHEDULED_REQUESTS = {}
+
+
+def observed_scheduled_requests():
+    """Stop recording; the request counts of the steps seen, in order."""
+    global _SCHEDULED_REQUESTS
+    counts, _SCHEDULED_REQUESTS = [n for _, n in (_SCHEDULED_REQUESTS or {}).values()], None
+    return counts
+
 # Attributes to taint in SchedulerConfig
 SCHEDULER_CONFIG_TAINT_MAP = {
     # Note: Commenting out max_num_batched_tokens to prevent buffer tainting
@@ -443,7 +497,13 @@ def _recursively_taint_config(obj, skip_attrs=None, taint_str='MODEL_CONFIG'):
 
             try:
                 value = getattr(obj, attr_name)
+            except Exception:
+                # Not readable as a whole-object attribute: transformers raises
+                # its own error (not an AttributeError) for an attribute that
+                # varies across layers, which is then read per layer instead.
+                continue
 
+            try:
                 # Taint integers (but not bools which are int subclass)
                 # Skip if already tainted to preserve more specific taints
                 if isinstance(value, int) and not isinstance(value, (bool, TaintedInt)):
@@ -523,6 +583,10 @@ def patch_input_buffers():
 
         def patched_scheduler_output_getattribute(self, name):
             value = _original_scheduler_output_getattribute(self, name)
+            if (_SCHEDULED_REQUESTS is not None and name == 'num_scheduled_tokens'
+                    and isinstance(value, dict)):
+                # holding the output keeps its id from being reused by a later step
+                _SCHEDULED_REQUESTS.setdefault(id(self), (self, dict.__len__(value)))
             # Honor the global taint-tracking flag: stay inert during init /
             # warm-up / vLLM's memory-profiling dummy run (matches the dispatcher
             # hooks). vLLM 0.25.1's init dummy run schedules a full batch, so
@@ -532,6 +596,19 @@ def patch_input_buffers():
             if name == 'num_scheduled_tokens':
                 if isinstance(value, dict) and not isinstance(value, TaintedLenDict):
                     register_taint(len(value), Taint('NUM_REQS'))
+                    # ... and the request count plus one, the length of every
+                    # query_start_loc / cu_seqlens / chunk-offset array. The
+                    # engine builds many of these in numpy (the runner's
+                    # query_start_loc_cpu, the gated-delta-rule layers' chunk
+                    # offsets computed from it), where no torch op carries the
+                    # taint, so they are labelled like the batch size itself:
+                    # by value. The trace batch is chosen so this value is in
+                    # no config (registry.choose_trace_batch_size).
+                    plus_one = dict.__len__(value) + 1
+                    from .registry import lookup_taint
+                    from .types import offset_label
+                    if lookup_taint(plus_one) is None:
+                        register_taint(plus_one, offset_label('NUM_REQS', 1))
                     return TaintedLenDict(value)
             elif name == 'total_num_scheduled_tokens':
                 if isinstance(value, int) and not isinstance(value, TaintedInt):
@@ -635,7 +712,25 @@ def patch_input_buffers():
 
             ModelConfig.__post_init__ = patched_model_config_post_init
             ModelConfig.__setattr__ = patched_model_config_setattr
-            
+
+            # vLLM derives its architecture config from the HF config here (from
+            # __post_init__, and again when a multimodal model builds its language
+            # model from the text config) and validates what it derives with exact
+            # type checks a TaintedInt fails: vLLM 0.33 merges values that differ
+            # across layers only when `type(v) in (int, float)`, so every model
+            # whose layers differ (Gemma 4: head size 256 / 512) was rejected. Let
+            # it derive from the plain values, then taint the result.
+            if hasattr(ModelConfig, 'get_model_arch_config'):
+                _original_get_model_arch_config = ModelConfig.get_model_arch_config
+
+                def patched_get_model_arch_config(self, *args, **kwargs):
+                    with plain_config_reads():
+                        arch = _original_get_model_arch_config(self, *args, **kwargs)
+                    _recursively_taint_config(arch, taint_str='MODEL_CONFIG')
+                    return arch
+
+                ModelConfig.get_model_arch_config = patched_get_model_arch_config
+
             ModelConfig._is_recursive_taint_patched = True
             
     except ImportError as e:

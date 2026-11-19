@@ -191,9 +191,20 @@ def force_moe_routing(fused, num_tokens, activated_experts, local_pairs=None):
         # means the router's default, int32); extra keyword arguments such as
         # vLLM 0.32's input_ids are irrelevant to forced routing.
         dt = torch.int32 if indices_type is None else indices_type
-        if dt not in ids_by_dtype:
-            ids_by_dtype[dt] = torch.tensor(ids_list, device=dev, dtype=dt)
-        return weights, ids_by_dtype[dt]
+        rows = hidden_states.shape[0]
+        key = (dt, rows)
+        if key not in ids_by_dtype:
+            ids = torch.tensor(ids_list, device=dev, dtype=dt)
+            w = weights
+            if rows != num_tokens:
+                # Routing on tokens gathered from every data-parallel rank (some
+                # engines route after the EP dispatch): each rank's batch is
+                # routed like this one, as fake DP assumes every rank runs it.
+                if rows % num_tokens:
+                    raise ValueError(f"forced routing for {num_tokens} tokens got {rows} rows")
+                ids, w = ids.repeat(rows // num_tokens, 1), weights.repeat(rows // num_tokens, 1)
+            ids_by_dtype[key] = (w, ids)
+        return ids_by_dtype[key]
 
     router._compute_routing = forced
     try:
