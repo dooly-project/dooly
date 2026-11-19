@@ -608,6 +608,34 @@ def test_group_topology_from_the_links_of_the_group():
         topology._links.cache_clear(); topology._derived_topology.cache_clear()
 
 
+def test_communication_inside_a_module_anchor_stays_its_own_anchor():
+    # A module whose forward launches a kernel directly (Gemma-style RMSNorm:
+    # weight.float() + 1 carries no taint, so its kernel anchors on the module)
+    # held an all_reduce; deduplication folded the COMM anchor into the module,
+    # which is profiled on the emulated group where the collective is a no-op,
+    # so the call was missing from the model's collectives (Qwen3.6-35B-A3B at
+    # TP 2 kept 71 of its 81 all_reduces).
+    from doolyprof.profiler.parser import HierarchicalTraceParser
+    events = [
+        {"ph": "X", "cat": "user_annotation", "ts": 0, "dur": 100, "pid": 1, "tid": 1, "args": {"External id": 1},
+         "name": "MODULE: GemmaRMSNorm IN:[[NUM_TOKS(59), MODEL_CONFIG(64)]] PATH:model.layers.0.input_layernorm"},
+        {"ph": "X", "cat": "cpu_op", "name": "aten::add", "ts": 5, "dur": 10, "pid": 1, "tid": 1,
+         "args": {"External id": 2}},
+        {"ph": "X", "cat": "user_annotation", "ts": 40, "dur": 20, "pid": 1, "tid": 1, "args": {},
+         "name": "COMM: vllm::all_reduce IN:[[NUM_TOKS(59), MODEL_CONFIG(64)]] ARGS:[world_size=2]"},
+        {"ph": "X", "cat": "kernel", "name": "add_kernel", "ts": 200, "dur": 5, "pid": 0, "tid": 7,
+         "args": {"External id": 2}},
+    ]
+    parser = HierarchicalTraceParser(events=events)
+    parser.parse_from_events()
+    assert [c.name for c in parser.comm_ops] == ["vllm::all_reduce"], parser.comm_ops
+    hierarchies = parser.extract_module_to_operation_mapping()
+    by_name = {h.anchor.name: h for h in hierarchies}
+    assert "vllm::all_reduce" in by_name, sorted(by_name)
+    assert [c.name for c in by_name["vllm::all_reduce"].comm_ops] == ["vllm::all_reduce"]
+    assert "GemmaRMSNorm" in by_name and [k.name for k in by_name["GemmaRMSNorm"].kernels] == ["add_kernel"], sorted(by_name)
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

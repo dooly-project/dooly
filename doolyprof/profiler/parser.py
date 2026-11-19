@@ -1005,6 +1005,14 @@ class HierarchicalTraceParser:
         canonical_anchors: Dict[int, Event] = {}
 
         for anchor_id, anchor in anchor_events.items():
+            # A communication is profiled on its own (comm profiler) wherever it
+            # sits. An enclosing anchor (e.g. a module whose forward launches a
+            # kernel directly) is profiled on the emulated group, where the
+            # collective is a no-op, so folding the communication into it would
+            # drop it from the model's collectives.
+            if anchor.cat == 'comm':
+                canonical_anchors[anchor_id] = anchor
+                continue
             is_redundant = False
             curr = anchor.parent
             while curr:
