@@ -96,6 +96,18 @@ class OpImporter:
 
         return False
 
+    def import_for(self, module) -> tuple[Optional[Callable], str]:
+        """The callable for a non-module ModuleInfo: a Triton launch scope's
+        relaunch (it has no op to import), otherwise the op by name."""
+        from doolyprof.profiler.utils.triton_replay import launch_callable
+        try:
+            call = launch_callable(module)
+        except Exception as e:  # noqa: BLE001
+            return None, f"Error importing Triton kernel: {e}"
+        if call is not None:
+            return call, "Success"
+        return self.import_op(op_full_name=module.operation_name)
+
     def import_op(self, op_full_name: str) -> tuple[Optional[Callable], str]:
         namespace, full_op_name = op_full_name.split("::")
         try:

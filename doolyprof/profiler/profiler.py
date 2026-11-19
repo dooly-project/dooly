@@ -22,6 +22,7 @@ def find_free_port() -> int:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         return s.getsockname()[1]
 
+from doolyprof.profiler.utils.vllm_compat import call_module_with_recorded_arguments
 from doolyprof.profiler.vllm_layer_profiler import VLLMLayerProfiler, make_dict 
 from doolyprof.profiler.model import ModelInfo as ProfileModel
 from vllm.config import set_current_vllm_config
@@ -79,11 +80,233 @@ def wrap_list_args(op_packet, op_name: str, inputs: List) -> List:
     return wrapped
 
 
-def prepare_op_args(op_packet, op_name: str, inputs: List) -> Tuple[List, Dict]:
+def _is_layer_name_arg(arg) -> bool:
+    """A required ``str`` / Python-object argument of a custom op: how the
+    engine's ops name the registered layer they act on (vLLM looks it up in
+    the forward context's ``no_compile_layers``). The trace keeps no value for
+    it (Kineto records a Python object as an empty input)."""
+    return (not arg.has_default_value()
+            and isinstance(arg.type, (torch._C.StringType, torch._C.PyObjectType)))
+
+
+def op_takes_layer_name(op_packet, op_name: str) -> bool:
+    """Whether some overload of the custom op has a layer-name argument
+    (``_is_layer_name_arg``)."""
+    from torch._ops import OpOverloadPacket
+    if not isinstance(op_packet, OpOverloadPacket):
+        return False
+    try:
+        overloads = [getattr(op_packet, name) for name in op_packet.overloads()]
+    except Exception:  # noqa: BLE001
+        return False
+    return any(_is_layer_name_arg(a) for o in overloads for a in o._schema.arguments)
+
+
+def _unrecorded_layer_name(arg, value) -> bool:
+    """A layer-name argument whose traced value is Kineto's empty input for a
+    Python object: None once the input generator has seen the zero-size shape,
+    or an empty string. vLLM's unified_attention_with_output(q, k, v, output,
+    layer_name, ...) has inputs after its layer name, so the name's slot is
+    filled -- with nothing."""
+    return _is_layer_name_arg(arg) and (value is None or (isinstance(value, str) and value == ""))
+
+
+def needs_layer_name(op_packet, op_name: str, inputs: List) -> bool:
+    """True when the op has a layer-name argument the trace could not record
+    (see ``_is_layer_name_arg``): the next argument after ``inputs``, or one
+    ``inputs`` fills with Kineto's empty value (``_unrecorded_layer_name``)."""
+    from torch._ops import OpOverloadPacket
+    if not isinstance(op_packet, OpOverloadPacket):
+        return False
+    op_overload = _select_overload(op_packet, op_name, len(inputs), all_overloads=True)
+    if op_overload is None:
+        return False
+    pairs, n_filled = _align_inputs(op_overload._schema, inputs)
+    if any(_unrecorded_layer_name(a, v) for a, v in pairs):
+        return True
+    rest = op_overload._schema.arguments[n_filled:]
+    return bool(rest) and _is_layer_name_arg(rest[0])
+
+
+def _is_optional_tensor(arg) -> bool:
+    t = arg.type
+    return isinstance(t, torch._C.OptionalType) and isinstance(t.getElementType(), torch._C.TensorType)
+
+
+def _align_inputs(schema, inputs):
+    """Pair the traced inputs with the schema's arguments, in order.
+
+    The trace keeps nothing for a None tensor argument (Kineto records it as an
+    empty input), so the inputs after it would each land one argument early:
+    vLLM's moe_forward_shared got an int for its ``Tensor? input_ids``, and
+    _C::rms_norm its float epsilon for ``Tensor? weight``. An optional tensor
+    argument whose input is not a tensor gets None, and a defaulted string
+    argument whose input is not a string its default; either leaves that input
+    to the next argument. Returns ([(arg, value)], number of schema arguments filled).
+    """
+    pairs, j = [], 0
+    for arg in schema.arguments:
+        if j >= len(inputs):
+            break
+        value = inputs[j]
+        if _is_optional_tensor(arg) and value is not None and not isinstance(value, torch.Tensor):
+            value = None
+        elif (isinstance(arg.type, torch._C.StringType) and arg.has_default_value()
+              and not isinstance(value, str)):
+            # a defaulted string the trace kept no value for (aten::pad's
+            # mode="constant": its float value landed on mode)
+            value = arg.default_value
+        else:
+            j += 1
+        pairs.append((arg, value))
+    return pairs, len(pairs)
+
+
+def unrecordable_required_args(op_packet, op_name: str, inputs: List, allow_layer_name: bool = False) -> List[str]:
+    """Required arguments of the op that no traced input fills and that have no
+    default (a layer name, a cache dtype string): the op cannot run on its own,
+    so the resolver goes to its enclosing module instead of trying. With
+    ``allow_layer_name`` a leading layer-name argument is not counted (the
+    resolver can bind one, see ``enclosing_registered_layer``)."""
+    from torch._ops import OpOverloadPacket
+    if not isinstance(op_packet, OpOverloadPacket):
+        return []
+    op_overload = _select_overload(op_packet, op_name, len(inputs), all_overloads=True)
+    if op_overload is None:
+        return []
+    pairs, n_filled = _align_inputs(op_overload._schema, inputs)
+    # a layer name the trace "recorded" as an empty string (Kineto's value for
+    # a Python object) is as missing as one it did not record at all
+    blank = [a for a, v in pairs if _unrecorded_layer_name(a, v)]
+    rest = blank + list(op_overload._schema.arguments[n_filled:])
+    if allow_layer_name and rest and _is_layer_name_arg(rest[0]):
+        rest = rest[1:]
+    return [a.name for a in rest
+            if not a.has_default_value() and not a.kwarg_only and not isinstance(a.type, torch._C.OptionalType)]
+
+
+def enclosing_registered_layer(module, registered) -> Optional[str]:
+    """Innermost module around the op, by the trace's PATH: fields, that the
+    engine registered by name (``static_forward_context``): the layer an op's
+    layer-name argument refers to.
+
+    When no enclosing module is registered, the registered layer directly under
+    the innermost enclosing module, if there is exactly one: a layer that its
+    parent calls through ``.forward()`` rather than ``__call__`` runs without a
+    module annotation of its own. vLLM's Transformers modeling backend (SmolLM3
+    and other models without a native vLLM implementation) attaches the vLLM
+    ``Attention`` as ``<hf attention>.attn`` and calls ``self_attn.forward(q, k,
+    v)``, so the attention ops sit right inside ``model.layers.N.self_attn``.
+    None if neither finds one."""
+    hierarchy = getattr(module, "hierarchy", None)
+    event = hierarchy.anchor.parent if hierarchy is not None and hierarchy.anchor is not None else None
+    innermost = None
+    while event is not None:
+        path = (event.args or {}).get("module_path")
+        if path and path in registered:
+            return path
+        if path and innermost is None:
+            innermost = path
+        event = event.parent
+    if innermost is not None:
+        below = [name for name in registered if isinstance(name, str) and name.startswith(innermost + ".")]
+        if len(below) == 1:
+            return below[0]
+    return None
+
+
+_STEP_TOKS = None
+
+
+def _num_toks_values(text) -> List[int]:
+    """Values of the NUM_TOKS dims in a trace annotation's IN section
+    (``NUM_TOKS(60)``; MAX_NUM_TOKS buffers excluded)."""
+    import re
+    global _STEP_TOKS
+    if _STEP_TOKS is None:
+        _STEP_TOKS = re.compile(r"(?<![A-Za-z_])NUM_TOKS\((\d+)\)")
+    return [int(v) for v in _STEP_TOKS.findall(text or "")]
+
+
+def step_token_ratio(module) -> int:
+    """Tokens of the traced engine step behind each token the op or module ran
+    on: 1, except where the model splits the batch over ranks inside the step
+    (vLLM's sequence-parallel MoE under TP x DP + EP runs ceil(T / tp) of the
+    step's T tokens). The engine derives every rank's share from the forward
+    context's token count, so profiling at n tokens needs a context of
+    n x ratio tokens. Read off the trace: the outermost module's NUM_TOKS over
+    the anchor's own."""
+    hierarchy = getattr(module, "hierarchy", None)
+    if hierarchy is None or hierarchy.root_module is None or hierarchy.anchor is None:
+        return 1
+    step = _num_toks_values(hierarchy.root_module.params)
+    own = _num_toks_values(hierarchy.anchor.params)
+    if not step or not own or min(own) <= 0:
+        return 1
+    return max(1, int(round(max(step) / min(own))))
+
+
+def engine_batch_limits(taint_registry, max_batch_size, max_model_len):
+    """``(max_num_batched_tokens, max_num_seqs)`` for a profiling engine: the
+    limits the traced engine ran with (the registry's MAX_NUM_TOKS /
+    MAX_NUM_REQS), raised where the sweep needs more (prefills of up to
+    ``max_model_len`` tokens, decodes of up to ``max_batch_size`` requests).
+
+    vLLM sizes its start-up buffers from max_num_batched_tokens -- the MoE
+    workspace among them, which under DP + EP holds every EP rank's tokens --
+    so its serving default (8192) can need more memory than the GPU has left
+    after the weights, while the profiler never runs more than the sweep.
+    Equal limits also give the profiling engine the traced engine's buffers."""
+    traced = {}
+    for value, label in (taint_registry or {}).items():
+        if label in ("MAX_NUM_TOKS", "MAX_NUM_REQS"):
+            try:
+                traced[label] = max(traced.get(label, 0), int(value))
+            except (TypeError, ValueError):
+                pass
+    seqs = max(traced.get("MAX_NUM_REQS", 0), int(max_batch_size or 1))
+    tokens = max(traced.get("MAX_NUM_TOKS", 0), int(max_model_len or 1), seqs)
+    return tokens, seqs
+
+
+def _select_overload(op_packet, op_name: str, n_inputs: int, all_overloads: bool = False):
+    """The overload of ``op_packet`` that ``op_name`` names, or the one whose
+    positional-argument count best matches ``n_inputs``.
+
+    ``dir()`` lists an aten op's overloads but not those of an extension or
+    Python-registered op (``_C::``, ``vllm::``) until they are first accessed;
+    ``all_overloads`` also takes the packet's ``overloads()``."""
+    overload_name = op_name.split('.')[-1] if '.' in op_name else None
+    if overload_name and hasattr(op_packet, overload_name):
+        return getattr(op_packet, overload_name)
+    names = dir(op_packet)
+    if all_overloads:
+        names = sorted(set(names) | set(op_packet.overloads()))
+    best_overload, best_score = None, float('inf')
+    for attr_name in names:
+        try:
+            candidate = getattr(op_packet, attr_name)
+            if not hasattr(candidate, '_schema'):
+                continue
+            score = abs(sum(1 for a in candidate._schema.arguments if not a.kwarg_only) - n_inputs)
+            if score < best_score:
+                best_score, best_overload = score, candidate
+        except Exception:
+            continue
+    if best_overload is None and not all_overloads:
+        # dir() listed none (vLLM 0.17.1's torch had not materialised
+        # aten::pad.default yet): the packet's own overload list
+        return _select_overload(op_packet, op_name, n_inputs, all_overloads=True)
+    return best_overload
+
+
+def prepare_op_args(op_packet, op_name: str, inputs: List, layer_name: Optional[str] = None) -> Tuple[List, Dict]:
     """
     Prepare inputs for PyTorch op call by:
     1. Wrapping inputs that should be lists according to schema
     2. Separating keyword-only arguments from positional arguments
+    3. Passing ``layer_name`` (the registered layer that encloses the op in
+       the trace) for the layer-name arguments the trace could not record
 
     Returns:
         Tuple of (positional_args, keyword_args)
@@ -99,43 +322,21 @@ def prepare_op_args(op_packet, op_name: str, inputs: List) -> Tuple[List, Dict]:
     # available overload and pick the one whose number of positional (non-kwarg-only)
     # arguments best matches the number of inputs we have.  This prevents
     # misrouting inputs through the wrong schema (e.g. feeding [-1] into dtype).
-    overload_name = op_name.split('.')[-1] if '.' in op_name else None
-
-    if overload_name and hasattr(op_packet, overload_name):
-        op_overload = getattr(op_packet, overload_name)
-    else:
-        # No explicit overload; score every overload by how closely its
-        # positional-arg count matches len(inputs).
-        best_overload = None
-        best_score = float('inf')
-        for attr_name in dir(op_packet):
-            try:
-                candidate = getattr(op_packet, attr_name)
-                if not hasattr(candidate, '_schema'):
-                    continue
-                positional_count = sum(
-                    1 for a in candidate._schema.arguments if not a.kwarg_only
-                )
-                score = abs(positional_count - len(inputs))
-                if score < best_score:
-                    best_score = score
-                    best_overload = candidate
-            except Exception:
-                continue
-        if best_overload is None:
-            return inputs, {}
-        op_overload = best_overload
+    op_overload = _select_overload(op_packet, op_name, len(inputs),
+                                   all_overloads=layer_name is not None)
+    if op_overload is None:
+        return inputs, {}
 
     schema = op_overload._schema
     positional_args = []
     keyword_args = {}
 
-    for i, arg in enumerate(schema.arguments):
-        if i >= len(inputs):
-            break
-
-        value = inputs[i]
+    pairs, n_filled = _align_inputs(schema, inputs)
+    positional_names = []
+    for arg, value in pairs:
         arg_type = str(arg.type)
+        if layer_name is not None and _unrecorded_layer_name(arg, value):
+            value = layer_name
 
         # Wrap list arguments (List[...] or type[] patterns) - but not if already a list
         if ('List[' in arg_type or '[]' in arg_type) and not isinstance(value, list):
@@ -146,6 +347,16 @@ def prepare_op_args(op_packet, op_name: str, inputs: List) -> Tuple[List, Dict]:
             keyword_args[arg.name] = value
         else:
             positional_args.append(value)
+            positional_names.append(arg.name)
+
+    if layer_name is not None:
+        for arg in schema.arguments[n_filled:]:
+            if not _is_layer_name_arg(arg):
+                break
+            if arg.kwarg_only:
+                keyword_args[arg.name] = layer_name
+            else:
+                positional_args.append(layer_name)
 
     # Fix shape-list arguments (e.g. reshape/view second arg) whose concrete
     # values captured from the trace don't match the dummy-run tensor size.
@@ -160,6 +371,11 @@ def prepare_op_args(op_packet, op_name: str, inputs: List) -> Tuple[List, Dict]:
         total_elements = primary_tensor.numel()
         for idx, val in enumerate(positional_args):
             if not isinstance(val, list):
+                continue
+            # only a target shape (view / reshape size, shape): an int list
+            # that is not one (aten::pad's amounts, permute's dims) was
+            # rewritten too, turning pad [0, 2] into [0, -1]
+            if idx >= len(positional_names) or positional_names[idx] not in ("size", "shape"):
                 continue
             if not all(isinstance(v, int) for v in val):
                 continue
@@ -193,8 +409,11 @@ class Profiler:
         db_path: Optional[str] = None,
         gpu: str = "0",
         kv_cache_dtype: str = "auto",
+        gpu_memory_cap: float = 0.9,
     ):
         self.importer = OpImporter()
+        # largest GPU fraction the profiling engine may take (run-profiler --gpu-memory-cap)
+        self.gpu_memory_cap = gpu_memory_cap
         # vLLM KV-cache dtype literal; part of the deployment key in
         # profiled_models and forwarded to the vLLM instance used for timing.
         self.kv_cache_dtype = kv_cache_dtype
@@ -675,8 +894,12 @@ class Profiler:
 
             # Partition modules into raw ops vs vLLM modules
             # to_profile_resolved contains 4-tuples: (module, callable, sig_hash, sig_json)
-            raw_ops = [(m, c, h, j) for m, c, h, j in model.to_profile_resolved if not m.is_module]
-            vllm_modules = [(m, c, h, j) for m, c, h, j in model.to_profile_resolved if m.is_module]
+            # An op that acts on a registered layer (the resolver found its
+            # layer-name argument, ``bound_layer``) runs where the model is loaded.
+            def _needs_model(m):
+                return m.is_module or getattr(m, 'bound_layer', None) is not None
+            raw_ops = [(m, c, h, j) for m, c, h, j in model.to_profile_resolved if not _needs_model(m)]
+            vllm_modules = [(m, c, h, j) for m, c, h, j in model.to_profile_resolved if _needs_model(m)]
 
             # Phase 1: Profile raw ops in main process (no vLLM needed - maximum GPU memory)
             if raw_ops:
@@ -734,7 +957,7 @@ class Profiler:
             tqdm.write(f"[{i+1}/{len(raw_ops)}] Profiling raw op: {module.operation_name} for {module.module_name}")
 
             # Import the callable (resolution phase sets it to None)
-            callable_obj, msg = self.importer.import_op(op_full_name=module.operation_name)
+            callable_obj, msg = self.importer.import_for(module)
             if callable_obj is None:
                 tqdm.write(f"  Could not import: {msg}")
                 continue
@@ -786,17 +1009,23 @@ class Profiler:
         print(f"[PROFILER SUBPROCESS] World config TP: {self.world_config.get('tp', 1)}")
 
         # Initialize VLLMLayerProfiler
+        max_tokens, max_seqs = engine_batch_limits(
+            getattr(model, 'taint_registry', {}), self.max_batch_size, self.max_model_len)
+        print(f"[PROFILER SUBPROCESS] Engine limits: max_num_batched_tokens={max_tokens}, max_num_seqs={max_seqs}")
         self.module_caller = VLLMLayerProfiler(
             model_name=model.name,
             dtype=str(self.dtype).split(".")[-1],
             enforce_eager=True,
-            gpu_memory_utilization=None,  # what is free now, at most 0.9 (utils/gpu_memory.py)
+            gpu_memory_utilization=None,  # what is free now, at most gpu_memory_cap (utils/gpu_memory.py)
+            gpu_memory_cap=self.gpu_memory_cap,
             max_model_len=self.max_model_len,
             attn_backend=self.attention_backend,
             flash_attn_version=self.flash_attn_version,
             quantization=self.quantization,
             gpu=self.gpu,
             kv_cache_dtype=self.kv_cache_dtype,
+            max_num_batched_tokens=max_tokens,
+            max_num_seqs=max_seqs,
         )
 
         # Re-resolve callables with loaded model. Pass the taint_registry
@@ -929,7 +1158,7 @@ class Profiler:
                             for pi, tensor in zip(module.inputs, inputs)
                             if getattr(pi, 'arg_name', None) is not None
                         }
-                        callable_obj(*positional_tensors, **kwarg_tensors)
+                        call_module_with_recorded_arguments(callable_obj, positional_tensors, kwarg_tensors)
                     else:
                         callable_obj(*args, **kwargs)
 
@@ -966,7 +1195,7 @@ class Profiler:
                     if "out of memory" in str(e).lower():
                         print(f"[PROFILER] OOM for {module.operation_name}, skipping...")
                     else:
-                        print(f"[PROFILER] Error profiling {module.operation_name}: {e}")
+                        print(f"[PROFILER] Error profiling {module.operation_name}: {__import__('doolyprof.profiler.comm_args', fromlist=['describe_exception']).describe_exception(e)}")
                     torch.cuda.empty_cache()
                     continue
 
@@ -977,7 +1206,7 @@ class Profiler:
             return results if results else None
 
         except Exception as e:
-            print(f"[PROFILER] Error profiling {module.operation_name}: {e}")
+            print(f"[PROFILER] Error profiling {module.operation_name}: {__import__('doolyprof.profiler.comm_args', fromlist=['describe_exception']).describe_exception(e)}")
             return None
 
     def _profile_single_module_for_model(
@@ -991,10 +1220,6 @@ class Profiler:
         sig_json: Optional[str] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         try:
-            # Adjust model params for tensor parallelism
-            num_kv_heads = model.num_kv_heads
-            head_dim = model.head_dim
-
             # Use max_model_len as the limit for token counts
             # (Vidur also limits to model's max_position_embeddings, not batch * seq_len)
             limit = max_model_len if max_model_len is not None else self.max_seq_len
@@ -1014,6 +1239,28 @@ class Profiler:
                     ) or resolved_path
                 else:
                     layer_name = self.module_caller.get_layer_name_by_module(module.operation_name, name_to_module)
+
+            # A module that is, or contains, a layer the engine registered in a
+            # KV-cache / recurrent-state group needs that layer's metadata and the
+            # attention sweep, whatever its class is called. Without metadata such
+            # layers take vLLM's profile-run path and skip their state compute
+            # (ShortConv drops its causal conv; vLLM 0.17.1's Qwen3_5GatedDeltaNet,
+            # which runs the Gated DeltaNet core itself, asserts). Exact paths only:
+            # the fuzzy layer-name match would also claim MoE modules of the layer.
+            owns_cache_layer = False
+            resolved_path = getattr(module, '_resolved_path', None) if module.is_module else None
+            if resolved_path and self.module_caller is not None:
+                owns_cache_layer = bool(self.module_caller.registered_layers_inside(resolved_path))
+            # A raw op bound to an attention / Mamba layer it names (the resolver's
+            # last resort, see enclosing_registered_layer: vLLM's Transformers
+            # backend calls its Attention through .forward(), so the trace has the
+            # op but no module for the layer) gets that layer's metadata and the
+            # attention sweep, as the layer's module would. With an empty forward
+            # context vLLM takes its profile-run path and times nothing.
+            bound = None if module.is_module else getattr(module, 'bound_layer', None)
+            if bound and self.module_caller is not None and self.module_caller.has_metadata_builder(bound):
+                layer_name = layer_name or bound
+                owns_cache_layer = True
 
             # MoE 2-D sweep: if this module is (or contains) a FusedMoE, read top_k /
             # num_experts from the live layer so the InputGenerator builds the
@@ -1043,7 +1290,8 @@ class Profiler:
             # Previously forced use_batch_config=True for any registered layer,
             # which over-swept MoE (FusedMoE / SharedFusedMoE) on kv_cache_size
             # / prefill_chunk_size axes that don't affect MoE latency.
-            workload_configs = generator.prepare_inputs(mode=self.workload_mode)
+            workload_configs = generator.prepare_inputs(mode=self.workload_mode,
+                                                        use_batch_config=True if owns_cache_layer else None)
 
             # Sort workload configs by size descending so large configs fail early if OOM
             def get_config_size(config):
@@ -1101,13 +1349,19 @@ class Profiler:
                     continue
 
                 # Prepare inputs: wrap list args and separate keyword-only args
-                args, kwargs = prepare_op_args(callable_obj, module.operation_name, inputs)
+                bound_layer = None if module.is_module else getattr(module, 'bound_layer', None)
+                args, kwargs = prepare_op_args(callable_obj, module.operation_name, inputs,
+                                               layer_name=bound_layer)
 
                 forward_context = None
                 slot_mapping_dict = None
                 num_tokens_for_context = None
 
-                if layer_name and isinstance(workload_config, AttentionBatchConfig):
+                # metadata only for a module that runs the layer (see
+                # resolver._try_dummy_run); one that borrows its name takes the
+                # empty-context branch and the step's token count
+                if (layer_name and isinstance(workload_config, AttentionBatchConfig)
+                        and self.module_caller.needs_metadata(module, layer_name)):
                     batch_config = AttentionBatchConfig(
                         batch_size=workload_config.batch_size,
                         prefill_chunk_size=workload_config.prefill_chunk_size,
@@ -1119,11 +1373,11 @@ class Profiler:
                         if result is None:
                             # Skip this config - exceeds available KV cache blocks
                             continue
-                        layer_metadata, _ = result
+                        layer_metadata, _, common_meta = result
                         forward_context = {layer_name: layer_metadata}
 
-                        # Get slot_mapping from CommonAttentionMetadata for KV cache updates
-                        common_meta = self.module_caller._build_common_attention_metadata(batch_config, kv_cache_gid=0)
+                        # slot_mapping for the KV-cache update: the layer's own
+                        # batch, on its KV-cache group's blocks
                         if common_meta is not None:
                             slot_mapping_dict = {layer_name: common_meta.slot_mapping}
                             num_tokens_for_context = common_meta.num_actual_tokens
@@ -1131,7 +1385,14 @@ class Profiler:
                         # Metadata build failed — fall back to an empty forward_context
                         # so vLLM's invariant holds (any module forward expects a
                         # context set). Matches resolver.py behaviour.
-                        print(f"[PROFILER] Warning: Could not build metadata (ok for non-attention ops): {e}")
+                        from doolyprof.profiler.comm_args import describe_exception
+                        if self.module_caller.needs_metadata(module, layer_name):
+                            # timing it without its metadata would time vLLM's
+                            # no-op path (see resolver._try_dummy_run)
+                            print(f"[PROFILER] ERROR: metadata build failed for {layer_name}, "
+                                  f"skipping {batch_config}: {describe_exception(e)}")
+                            continue
+                        print(f"[PROFILER] Warning: Could not build metadata (ok for non-attention ops): {describe_exception(e)}")
                         forward_context = {layer_name: None}
                         slot_mapping_dict = None
                         num_tokens_for_context = None
@@ -1142,6 +1403,18 @@ class Profiler:
                     # internally and will raise without one. Provide an empty
                     # context so the kernel can dispatch.
                     forward_context = {layer_name: None}
+                elif bound_layer:
+                    # An op given its layer by name finds the layer through the
+                    # forward context (no metadata needed).
+                    forward_context = {bound_layer: None}
+
+                if forward_context and num_tokens_for_context is None:
+                    # The batch's token count (any workload kind, also when building
+                    # attention metadata failed): under data parallelism the engine
+                    # sizes the per-rank token counts (DP metadata) from it.
+                    num_tokens_for_context = (workload_params or {}).get('num_tokens')
+                    if num_tokens_for_context is not None:
+                        num_tokens_for_context = num_tokens_for_context * step_token_ratio(module)
 
                 @torch.inference_mode()
                 def run_callable():
@@ -1161,7 +1434,7 @@ class Profiler:
                             for pi, tensor in zip(module.inputs, inputs)
                             if getattr(pi, 'arg_name', None) is not None
                         }
-                        callable_obj(*positional_tensors, **kwarg_tensors)
+                        call_module_with_recorded_arguments(callable_obj, positional_tensors, kwarg_tensors)
                     else:
                         callable_obj(*args, **kwargs)
 
@@ -1191,7 +1464,7 @@ class Profiler:
                                 num_tokens=num_tokens_for_context,
                                 slot_mapping=slot_mapping_dict
                             ):
-                                callable_obj(*positional_tensors, **kwarg_tensors)
+                                call_module_with_recorded_arguments(callable_obj, positional_tensors, kwarg_tensors)
                     else:
                         with set_current_vllm_config(self.module_caller.vllm_config):
                             with set_forward_context(
@@ -1207,7 +1480,7 @@ class Profiler:
 
                 try:
                     # For Attention modules, use gpu_busy method for accurate timing
-                    if "Attention" in module.operation_name:
+                    if "Attention" in module.operation_name or owns_cache_layer:
                         run_results = self._profile_gpu_busy(
                             run_fn=run_fn,
                             warmup_runs=5,
@@ -1424,7 +1697,8 @@ class Profiler:
 
                 # Write collective operations
                 import hashlib
-                topology = os.environ.get("DOOLY_TOPOLOGY", "mew1")  # Get from environment or default
+                from doolyprof.profiler.utils.topology import machine_topology
+                topology = machine_topology()  # DOOLY_TOPOLOGY, else derived from the GPUs
 
                 # Aggregate counts for each unique collective operation signature
                 # Key: (operation_name, dim_param, num_dims), Value: total_count
@@ -1435,15 +1709,20 @@ class Profiler:
                     # dim_param: the call's first untainted integer argument
                     # (e.g. the gather/scatter dim), read from the COMM
                     # annotation's ARGS (profiler/comm_args.py)
-                    from doolyprof.profiler.comm_args import parse_comm_args, identity_int
-                    dim_param = identity_int(parse_comm_args(collective_op.hierarchy.anchor.args.get('comm_args')))
+                    from doolyprof.profiler.comm_args import parse_comm_args, identity_int, swept_payload_dims, swept_size_lists
+                    from doolyprof.profiler.taint import DimensionType
+                    comm_meta = parse_comm_args(collective_op.hierarchy.anchor.args.get('comm_args'))
+                    dim_param = identity_int(comm_meta)
+                    # The group the call ran on (a DP+EP dispatch gathers over the
+                    # DP group, not TP); the comm profiler keys its results the same way.
+                    group_size = int(comm_meta.get('world_size') or self.tp_config)
 
                     # Get num_dims from tensor shape
                     tensor_shape = collective_op.inputs[0].actual_shape
                     num_dims = len(tensor_shape)
 
                     # Create key for aggregation
-                    key = (collective_op.operation_name, dim_param, num_dims)
+                    key = (collective_op.operation_name, dim_param, num_dims, group_size)
 
                     # Aggregate count
                     count = getattr(collective_op, 'count', 1)
@@ -1451,17 +1730,26 @@ class Profiler:
 
                     # Store metadata from first occurrence
                     if key not in collective_metadata:
-                        # Extract MODEL_CONFIG dimension
-                        model_config_idxs = collective_op.inputs[0].get_model_config_dims()
+                        # Per-token width: the product of the payload's fixed dims,
+                        # i.e. every dim that does not follow the workload sweep
+                        # (same rule as the comm profiler's plan; a payload the
+                        # tracer saw as plain tensors has no MODEL_CONFIG labels).
+                        swept = {DimensionType.NUM_TOKENS, DimensionType.NUM_REQUESTS}
+                        labels = {d.value for d in swept}
+                        tensor_taints = collective_op.inputs[0].dimensions
+                        variable = swept_payload_dims(comm_meta, tensor_shape, tensor_taints, swept, labels)
                         model_config_dim = 1
-                        for idx in model_config_idxs:
-                            model_config_dim *= tensor_shape[idx]
+                        for size, var in zip(tensor_shape, variable):
+                            if not var:
+                                model_config_dim *= size
 
-                        # Determine batch parameter based on tensor taints
+                        # Batch parameter: the swept taint of the payload, or of
+                        # the per-rank size lists it follows
                         # NUM_TOKS typically appears in first dimension for all_reduce
                         # NUM_REQS typically appears in first dimension for all_gather
-                        tensor_taints = collective_op.inputs[0].dimensions
-                        batch_param = "NUM_TOKS" if "NUM_TOKS" in str(tensor_taints) else "NUM_REQS"
+                        list_taints = [taint for _, taint in swept_size_lists(comm_meta, labels)]
+                        batch_param = ("NUM_TOKS" if "NUM_TOKS" in str(tensor_taints) or "NUM_TOKS" in list_taints
+                                       else "NUM_REQS")
 
                         collective_metadata[key] = {
                             'operation_name': collective_op.operation_name,
@@ -1473,10 +1761,11 @@ class Profiler:
 
                 # Now insert aggregated collectives
                 for key, total_count in collective_counts.items():
-                    op_name, dim_param, num_dims = key
+                    op_name, dim_param, num_dims, group_size = key
 
-                    # Generate signature (MUST match comm_profiler logic)
-                    sig_data = f"{op_name}|{topology}|{self.tp_config}|{dim_param}|{num_dims}"
+                    # Generate signature (MUST match comm_profiler logic: its
+                    # tp_size is the size of the group it replayed the call on)
+                    sig_data = f"{op_name}|{topology}|{group_size}|{dim_param}|{num_dims}"
                     sig_hash = hashlib.sha256(sig_data.encode()).hexdigest()
 
                     # Check if collective exists in coll_ops
@@ -1494,7 +1783,7 @@ class Profiler:
                             INSERT INTO coll_ops
                             (signature_hash, operation_name, topology, tp_degree, dim_param, num_dims)
                             VALUES (?, ?, ?, ?, ?, ?)
-                        """, (sig_hash, op_name, topology, self.tp_config, dim_param, num_dims))
+                        """, (sig_hash, op_name, topology, group_size, dim_param, num_dims))
                         collective_id = cursor.lastrowid
 
                     # Link model to collective with AGGREGATED count
@@ -1540,8 +1829,8 @@ class Profiler:
                 if collective_counts:
                     print(f"[PROFILER] Wrote {len(collective_counts)} unique collective operations for {model.name}:")
                     for key, total_count in collective_counts.items():
-                        op_name, dim_param, num_dims = key
-                        print(f"  - {op_name} (dim={dim_param}, ndims={num_dims}): count={total_count}")
+                        op_name, dim_param, num_dims, group_size = key
+                        print(f"  - {op_name} (dim={dim_param}, ndims={num_dims}, group={group_size}): count={total_count}")
 
             conn.execute("COMMIT")
             print(f"[PROFILER] Wrote {len(models)} models to database at {self.db_path}")
@@ -1722,7 +2011,7 @@ class Profiler:
                 return None
         
         else:
-            callable_obj, _ = self.importer.import_op(op_full_name=module.operation_name)
+            callable_obj, _ = self.importer.import_for(module)
 
             if callable_obj is None:
                 print(f"[PROFILER] Could not import module: {module.module_name} for operation {module.operation_name}")

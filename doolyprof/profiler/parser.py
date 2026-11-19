@@ -133,7 +133,7 @@ class Event:
             # Every label the tracer emits has the shape LABEL(N) (DimTaint.display,
             # plus ?(N) and SINGLETON(1)); match the shape, not a fixed label list,
             # so no dimension is dropped and the result stays aligned with the trace.
-            dims = re.findall(r'[A-Za-z_?]+\((\d+)\)', tensor_str)
+            dims = re.findall(r'[A-Za-z_?]+(?:[+-]\d+)?\((\d+)\)', tensor_str)
             result.append([int(d) for d in dims])
 
         return result
@@ -237,6 +237,7 @@ class HierarchicalTraceParser:
         self.taints: List[Event] = []       # user_annotation events
         self.comm_ops: List[Event] = []     # Communication operations (separate from hierarchy)
         self._comm_noop_marks: List[Tuple[Any, Any, float]] = []  # COMM ranges that never reached the transport
+        self._comm_recv_only_marks: List[Tuple[Any, Any, float, list]] = []  # receive-only tensors of a COMM range
         self.external_id_to_events: Dict[int, List[Event]] = {}
 
     def parse(self):
@@ -274,7 +275,7 @@ class HierarchicalTraceParser:
             # We only stack CPU-side events (modules, compile-scopes, ops, comm)
             # Taints are excluded as per user request
             # Kernels are on GPU/different thread, handled separately
-            if event.cat in ('module', 'compile', 'cpu_op', 'comm'):
+            if event.cat in ('module', 'compile', 'triton', 'cpu_op', 'comm'):
             # if event.cat in ('module', 'cpu_op'):
                 # Use a combined key for pid/tid
                 key = (event.pid, event.tid)
@@ -318,7 +319,7 @@ class HierarchicalTraceParser:
             if cpu_op.external_id is not None:
                 cpu_op_by_external_id[cpu_op.external_id].append(cpu_op)
         for ev in self.events:
-            if ev.cat in ('module', 'compile') and ev.external_id is not None:
+            if ev.cat in ('module', 'compile', 'triton') and ev.external_id is not None:
                 cpu_op_by_external_id.setdefault(ev.external_id, []).append(ev)
 
         # 4. Link GPU Kernels to CPU Ops using index
@@ -379,7 +380,7 @@ class HierarchicalTraceParser:
 
         # Pass 2: Prune children that aren't marked (single pass, in-place)
         for event in self.events:
-            if event.cat in ('module', 'compile', 'cpu_op', 'comm'):
+            if event.cat in ('module', 'compile', 'triton', 'cpu_op', 'comm'):
                 # Filter children in-place (only one dict rebuild per node)
                 event.children = {
                     k: v for k, v in event.children.items()
@@ -447,6 +448,28 @@ class HierarchicalTraceParser:
                     args['Input type'] = list(
                         dtypes_section.replace('[', '').replace(']', '').split(', ')
                     )
+            elif cat == 'user_annotation' and name.startswith('TRITON:'):
+                # A Triton kernel launched from Python with tainted tensors
+                # (tracer/triton_launch.py). Self-tainted like a COMPILE scope,
+                # so its kernel anchors here instead of on the module whose
+                # forward launched it; SPEC holds what the profiler needs to
+                # launch it again (tensor order, fixed scalars, grid).
+                # Name format: "TRITON: <module>:<fn> IN:[...] DTYPES:[...] STATE:<hex> SPEC:<base64 json>"
+                from doolyprof.tracer.triton_launch import decode_spec
+                body = name[len('TRITON:'):].strip()
+                if ' SPEC:' in body:
+                    body, _, spec = body.rpartition(' SPEC:')
+                    args['triton_spec'] = decode_spec(spec)
+                if ' STATE:' in body:
+                    body, _, state = body.rpartition(' STATE:')
+                    args['state_hash'] = state.strip()
+                event_cat = 'triton'
+                event_name = 'triton::' + body.split(' IN:')[0].strip()
+                if ' IN:' in body:
+                    event_param = body.split(' IN:', 1)[1].split(' DTYPES:')[0]
+                if ' DTYPES:' in body:
+                    args['Input type'] = list(
+                        body.split(' DTYPES:')[1].replace('[', '').replace(']', '').split(', '))
             elif cat == 'user_annotation' and name.startswith('COMPILE:'):
                 # torch.compile-decorated function scope. Emitted by
                 # _make_taint_aware_compiled in hooks.py wrapping the call to
@@ -479,6 +502,13 @@ class HierarchicalTraceParser:
                 # transport (profiler/utils/comm_emulation.py): that range is
                 # not a communication and is dropped below.
                 self._comm_noop_marks.append((event_data.get('pid'), event_data.get('tid'), event_data['ts']))
+                continue
+            elif cat == 'user_annotation' and name.startswith('COMM_RECV_ONLY:'):
+                # Inside a COMM range: the recorded tensors the call only received
+                # into (comm_emulation.receive_only), excluded from its payload size.
+                import ast
+                self._comm_recv_only_marks.append((event_data.get('pid'), event_data.get('tid'), event_data['ts'],
+                                                   ast.literal_eval(name[len('COMM_RECV_ONLY:'):])))
                 continue
             elif cat == 'user_annotation' and name.startswith('COMM:'):
                 # Communication operation annotation - handle separately
@@ -541,7 +571,7 @@ class HierarchicalTraceParser:
                 if event_param:
                     event.args['Input Dims'] = event.get_dims_from_taint_string(event_param)
                 self.modules.append(event)
-            elif event_cat == 'compile':
+            elif event_cat in ('compile', 'triton'):
                 # Compile events are self-tainted: populate Input Dims from
                 # their own params now so the trace.py anchor handler can read
                 # shapes the same way it does for cpu_op anchors.
@@ -565,14 +595,26 @@ class HierarchicalTraceParser:
         
         # After parsing all, build the tree by filling in children and parent dict
         if self._comm_noop_marks:
+            # A marker belongs to the innermost COMM range around it: recorded
+            # calls nest (comm_emulation), and an inner call that moved nothing
+            # does not make the call around it a no-op.
+            noop = set()
+            for pid, tid, ts in self._comm_noop_marks:
+                around = [c for c in self.comm_ops if c.pid == pid and c.tid == tid and c.ts <= ts <= c.end_ts]
+                if around:
+                    noop.add(id(max(around, key=lambda c: c.ts)))
             kept = []
             for comm in self.comm_ops:
-                if any(pid == comm.pid and tid == comm.tid and comm.ts <= ts <= comm.end_ts
-                       for pid, tid, ts in self._comm_noop_marks):
+                if id(comm) in noop:
                     comm.cat = 'ignored'  # build the CPU tree as if the range were absent
                 else:
                     kept.append(comm)
             self.comm_ops = kept
+        for pid, tid, ts, indices in self._comm_recv_only_marks:
+            # the innermost COMM range around the marker
+            around = [c for c in self.comm_ops if c.pid == pid and c.tid == tid and c.ts <= ts <= c.end_ts]
+            if around:
+                max(around, key=lambda c: c.ts).args['recv_only'] = list(indices)
 
         self.build_tree()
 
@@ -727,7 +769,8 @@ class HierarchicalTraceParser:
         # by tracer/kineto_links.py), anchors to that module: like a compile
         # scope, the MODULE annotation carries its own input taints. Only the
         # direct parent qualifies, so kernels under untainted cpu ops still
-        # walk up as before and never promote an outer module to an anchor.
+        # walk up as before; a module is reached through them only by the
+        # leaf-module fallback at the end, never an outer module.
         if event is not None and event.cat == 'module' and event.params:
             return event
         current = event
@@ -737,7 +780,7 @@ class HierarchicalTraceParser:
             # hooks.py) are self-tainted: their own params hold the taint
             # signature, no separate taint event is emitted by design (the
             # whole point is to skip per-op dispatch inside the compiled fn).
-            if current.cat == 'compile' and current.params:
+            if current.cat in ('compile', 'triton') and current.params:
                 return current
             # We treat 'cpu_op' and 'module' as valid candidates for having taints.
             if current.cat in ('cpu_op', 'module'):
@@ -749,7 +792,26 @@ class HierarchicalTraceParser:
             # Move up
             current = current.parent
 
+        # Nothing tainted above: the kernel's ops read only weights (e.g.
+        # `1 + weight.float()` in a Gemma-style RMSNorm), so no input taint
+        # reaches them and their time would be dropped. When the kernel runs
+        # inside a leaf module (no submodules) whose MODULE annotation carries
+        # input taints, that module is the anchor and is profiled as one unit.
+        # Leaves only: a module with submodules (a decoder layer, the model)
+        # would fold everything under it into one unit.
+        module = event
+        while module is not None and module.cat != 'module':
+            module = module.parent
+        if module is not None and module.params and not self._has_module_below(module):
+            return module
         return None
+
+    def _has_module_below(self, event: Event) -> bool:
+        cache = self.__dict__.setdefault('_module_below_cache', {})
+        key = id(event)
+        if key not in cache:
+            cache[key] = any(c.cat == 'module' or self._has_module_below(c) for c in event.children.values())
+        return cache[key]
 
     def get_profiling_ops(self) -> List[Dict]:
         """
@@ -912,6 +974,31 @@ class HierarchicalTraceParser:
                 elif ancestor.cat == 'cpu_op':
                     cpu_op_anchors.add(anchor_id)
 
+        # 1b. An op whose kernels all run inside one module call it makes (a
+        # custom op that only wraps a module, e.g. to run it on another stream
+        # out of Dynamo's sight) is represented by that module. The tracer runs
+        # such an op as one unit, so the module's own ops carry no taints and its
+        # kernels land on the op; but the op can need runtime context a
+        # standalone call cannot supply (a layer name, a pending stream join),
+        # and one op signature can wrap different modules (a dense MLP in some
+        # layers, a MoE in others). The module carries its own input taints,
+        # state and instance path, so it is profiled directly.
+        for anchor_id in list(anchor_events):
+            anchor = anchor_events[anchor_id]
+            if anchor.cat != 'cpu_op':
+                continue
+            wrapped = {self._outermost_module_below(k, anchor) for k in anchor_to_kernels[anchor_id]}
+            if len(wrapped) != 1:
+                continue
+            (module_event,) = wrapped
+            if module_event is None or not module_event.params:
+                continue
+            del anchor_events[anchor_id]
+            cpu_op_anchors.discard(anchor_id)
+            anchor_events[id(module_event)] = module_event
+            anchor_to_kernels[id(module_event)].extend(anchor_to_kernels.pop(anchor_id))
+            module_anchors.add(id(module_event))
+
         # 2. Deduplicate: Remove anchors that are descendants of other anchors
         # If A contains B (A is ancestor of B), keep only A and remap B's kernels to A
         anchor_objects = set(anchor_events.values())
@@ -1002,6 +1089,18 @@ class HierarchicalTraceParser:
         results.sort(key=lambda h: h.anchor.ts)
 
         return results
+
+    @staticmethod
+    def _outermost_module_below(kernel: Event, anchor: Event) -> Optional[Event]:
+        """The outermost MODULE event between a kernel and its anchor (None if
+        the kernel runs outside every module call the anchor makes)."""
+        outermost = None
+        current = kernel.parent
+        while current is not None and current is not anchor:
+            if current.cat == 'module':
+                outermost = current
+            current = current.parent
+        return outermost
 
     def _find_nearest_module(self, event: Event) -> Optional[Event]:
         """Find the nearest (innermost) nn.Module parent of an event."""

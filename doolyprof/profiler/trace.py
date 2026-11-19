@@ -6,7 +6,7 @@ import json
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
-from doolyprof.profiler.module import ModuleInfo
+from doolyprof.profiler.module import ModuleInfo, parent_state_hash
 from doolyprof.profiler.parser import HierarchicalTraceParser, OperationHierarchy
 from doolyprof.profiler.finput import ProfileInput, extract_inputs_from_taint
 from doolyprof.profiler.taint import parse_taint_string
@@ -310,6 +310,12 @@ class TraceParser:
             # event's args by parser.py). Only populated for modules — raw
             # ops don't carry it.
             state_hash = ""
+            launch_spec = None
+            if hierarchy.anchor.cat == 'triton':
+                # a Triton launch scope: STATE hashes its fixed scalar
+                # arguments (kernel specialisations), SPEC is how to relaunch it
+                state_hash = (anchor_args or {}).get("state_hash", "") or ""
+                launch_spec = (anchor_args or {}).get("triton_spec")
             if is_module:
                 # anchor_args is the MODULE event's args (for compile anchors
                 # it was switched to the containing module above, together
@@ -330,6 +336,7 @@ class TraceParser:
                 hierarchy=hierarchy,
                 state_hash=state_hash,
                 instance_paths=[module_path] if module_path else [],
+                launch_spec=launch_spec,
             )
 
             # Add module_info to anchor event
@@ -484,8 +491,6 @@ class TraceParser:
             model_params_list = info._semantic_params_list()
             model_params_tuple = tuple(sorted(model_params_list[0].items())) if model_params_list else ()
 
-            nearest_module = info.hierarchy.nearest_module if info.hierarchy else None
-
             # Module-state discriminator: instances of one class that differ in
             # configuration (sliding window vs full attention, KV-cache dtype,
             # attention backend ...) land in separate groups. GPU kernel names
@@ -497,13 +502,10 @@ class TraceParser:
             # For MODULE anchors (is_module=True), use the module's own hash.
             # For raw-op anchors (e.g. vllm::unified_kv_cache_update), inherit
             # from the nearest containing module so two raw ops living under
-            # differently-configured parents land in separate groups.
-            own_state_hash = info.state_hash or ""
-            parent_state_hash = ""
-            if nearest_module is not None:
-                parent_args = getattr(nearest_module, 'args', {}) or {}
-                parent_state_hash = parent_args.get('state_hash', '') or ''
-            state_hash = own_state_hash or parent_state_hash
+            # differently-configured parents land in separate groups, unless
+            # the op is a builtin PyTorch operator, which cannot see its
+            # parent (parent_state_hash).
+            state_hash = (info.state_hash or "") or parent_state_hash(info)
 
             signature = (
                 base_name,
@@ -511,6 +513,7 @@ class TraceParser:
                 model_params_tuple,
                 state_hash,
                 info.dtype,
+                info.input_dtypes(),
             )
 
             # dictionary of lists that group module infos by signature
@@ -523,6 +526,7 @@ class TraceParser:
             _model_params_tuple,
             _state_hash,
             _dtype,
+            _input_dtypes,
         ), infos in groups.items():
             # use the first info as template since all have same signature
             template = infos[0]
@@ -552,6 +556,9 @@ class TraceParser:
                 # every member's instance path; the resolver checks they are
                 # interchangeable before using one
                 instance_paths=list(dict.fromkeys(p for i in infos for p in i.instance_paths)),
+                instance_anchors=[i.hierarchy.anchor for i in infos
+                                  if i.hierarchy is not None and i.hierarchy.anchor is not None],
+                launch_spec=template.launch_spec,
             )
 
             # Add module_info to anchor event

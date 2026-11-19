@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from vllm.distributed import tensor_model_parallel_all_reduce, tensor_model_parallel_all_gather
+from doolyprof.profiler.utils.topology import machine_topology
 from vllm.distributed.parallel_state import get_tp_group
 
 # Profiling configuration
@@ -537,8 +538,11 @@ class CommProfiler:
 
         print(f"[COMM] Planning to profile: {list(self.plan_info.keys())}")
 
-    def should_profile(self, tp_size, overwrite=False):
-        """Check if we should profile based on existing data and overwrite flag."""
+    def should_profile(self, tp_size, overwrite=False, topology=None):
+        """Check if we should profile based on existing data and overwrite flag.
+
+        ``topology`` is the label the measurements are stored under (machine_topology() by default)."""
+        topology = topology or machine_topology()
         if overwrite:
             print(f"[COMM] Overwrite mode enabled - will re-profile all operations with {self.profile_method}")
             return True
@@ -556,7 +560,7 @@ class CommProfiler:
             existing_count = cursor.execute("""
                 SELECT COUNT(*) FROM coll_op_results
                 WHERE operation = ? AND topology = ? AND tp_size = ?
-            """, (op_name, "mew1", tp_size)).fetchone()[0]
+            """, (op_name, topology, tp_size)).fetchone()[0]
 
             if existing_count == 0:
                 needs_profiling = True
@@ -598,8 +602,9 @@ class CommProfiler:
 
         print(f"\n[COMM] Profiling complete. Collected {len(self.results)} measurements with {self.profile_method}")
 
-    def save_to_db(self, tp_size=None, backend="NCCL", topology="mew1", overwrite=False):
-        """Save profiling results to database."""
+    def save_to_db(self, tp_size=None, backend="NCCL", topology=None, overwrite=False):
+        """Save profiling results to database, under ``topology`` (machine_topology() by default)."""
+        topology = topology or machine_topology()
         if not hasattr(self, 'results') or not self.results:
             print("[COMM] No results to save")
             return

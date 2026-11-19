@@ -153,6 +153,77 @@ class TaintedList(list):
         return f"TaintedList({list.__repr__(self)})"
 
 
+# Batch-size labels that an added constant keeps as an offset: a request count
+# + 1 (cu_seqlens / query_start_loc, sized num_reqs + 1) is "NUM_REQS+1", not a
+# request count of its own. Without the offset, 94 requests + 1 was recorded as
+# NUM_REQS(95), and the profiler would size such a tensor to the request count.
+_OFFSET_BASES = ("MAX_NUM_REQS", "MAX_NUM_TOKS", "NUM_REQS", "NUM_TOKS")
+
+
+def split_offset_label(label):
+    """('NUM_REQS', 1) for 'NUM_REQS+1', ('NUM_TOKS', 0) for 'NUM_TOKS';
+    None for a label that is not a batch size (MODEL_CONFIG, MIX, ...)."""
+    import re
+    m = re.fullmatch(r"(MAX_NUM_REQS|MAX_NUM_TOKS|NUM_REQS|NUM_TOKS)([+-]\d+)?", str(label))
+    if not m:
+        return None
+    return m.group(1), int(m.group(2) or 0)
+
+
+def offset_label(base, offset):
+    return Taint(base if offset == 0 else f"{base}{offset:+d}")
+
+
+def is_fixed_label(taint) -> bool:
+    """True for a label whose size never follows the batch: the model's
+    configuration (MODEL_CONFIG), a size-1 dim (SINGLETON) and the engine's
+    limits (MAX_NUM_TOKS, MAX_NUM_REQS, with or without an offset)."""
+    while isinstance(taint, DimTaint):
+        taint = taint.taint
+    if taint is None:
+        return False
+    name = str(taint)
+    if name in ("MODEL_CONFIG", "SINGLETON"):
+        return True
+    split = split_offset_label(name)
+    return split is not None and split[0].startswith("MAX_")
+
+
+def _offset_taint(self_taint, other_taint, self_val, other_val, op_name):
+    """The taint of (batch size) +/- (plain constant), or False when the rule
+    does not apply. Only an added or subtracted untainted integer moves the
+    offset; anything else (two tainted operands, constant - batch size) is left
+    to the general rules."""
+    def base(t):
+        while isinstance(t, DimTaint):
+            t = t.taint
+        return t
+    if op_name not in ("add", "sub") or (self_taint is None) == (other_taint is None):
+        return False
+    tainted, const = (self_taint, other_val) if self_taint is not None else (other_taint, self_val)
+    if isinstance(const, bool) or not isinstance(const, int):
+        return False
+    parts = split_offset_label(base(tainted))
+    if parts is None:
+        return False
+    if op_name == "sub" and self_taint is None:
+        return False  # constant - batch size: not an offset of it
+    label, offset = parts
+    return offset_label(label, offset + (const if op_name == "add" else -const))
+
+
+def _without_offset(taint):
+    """The batch label of an offset label (NUM_REQS for NUM_REQS+1); any
+    other taint unchanged."""
+    t = taint
+    while isinstance(t, DimTaint):
+        t = t.taint
+    parts = split_offset_label(t) if t is not None else None
+    if parts is None or parts[1] == 0:
+        return taint
+    return Taint(parts[0])
+
+
 def resolve_taint_from_operands(self_taint, other_taint, result_val, self_val=None, other_val=None, op_name=None):
     """
     Apply taint propagation rules to determine result taint from two operands.
@@ -176,8 +247,21 @@ def resolve_taint_from_operands(self_taint, other_taint, result_val, self_val=No
 
     Special case: Multiplication creates merge_history from operand taints and values.
     """
+    offset = _offset_taint(self_taint, other_taint, self_val, other_val, op_name)
+    if offset is not False:
+        return offset
+    # Any other arithmetic on an offset batch size, ((n + 15) // 16 for a block
+    # count, (n + 1) * width): the offset no longer means "n plus a constant",
+    # so the operand counts as its batch label again, as before offsets existed.
+    self_taint, other_taint = _without_offset(self_taint), _without_offset(other_taint)
     def get_base_taint(t):
-        return t.taint if isinstance(t, DimTaint) else t
+        # the plain Taint under any nesting of DimTaints: FlashInfer's XQA
+        # decode (vLLM's FlashInfer backend on Blackwell) multiplies
+        # num_pages_per_seq * page_size, one of them a DimTaint in a DimTaint,
+        # and the one-level unwrap made it a dict key ("unhashable type")
+        while isinstance(t, DimTaint):
+            t = t.taint
+        return t
 
     def get_merge_history_with_value(taint, value):
         """Extract or create merge_history for a taint with its value.
@@ -365,6 +449,11 @@ class TaintedInt(int):
         """
         a, b = int.__int__(self), _int_val(other)
         val = op(a, b)
+        if not isinstance(val, (int, float)):
+            # an array operand (numpy, as in vLLM's chunked local attention:
+            # attn_chunk_size - (seq_lens_np - q_seqlens) % attn_chunk_size on
+            # Llama-4) gives an array: no taint, and it is no registry key
+            return val
 
         # Apply taint propagation rules using centralized helper
         self_taint = self._taint
@@ -575,19 +664,19 @@ class TaintedInt(int):
         # return val
 
     def __add__(self, other):
-        return self._binop(other, lambda a, b: a + b)
+        return self._binop(other, lambda a, b: a + b, op_name='add')
     def __radd__(self, other): return self.__add__(other)
     def __sub__(self, other):
         if isinstance(other, torch.Tensor):
             return int.__int__(self) - other
-        return self._binop(other, lambda a, b: a - b)
+        return self._binop(other, lambda a, b: a - b, op_name='sub')
     def __rsub__(self, other):
         if isinstance(other, torch.Tensor):
             return other - int.__int__(self)
         # Use _binop for proper taint propagation: other - self
         if not isinstance(other, TaintedInt):
             other = TaintedInt(other, None)
-        return other._binop(self, lambda a, b: a - b)
+        return other._binop(self, lambda a, b: a - b, op_name='sub')
     def __mul__(self, other):
         # Handle list replication: TaintedInt(n, taint) * [x]
         if isinstance(other, list):
@@ -629,7 +718,7 @@ class TaintedInt(int):
     def __truediv__(self, other):
         val = int.__int__(self) / _int_val(other)
         if isinstance(val, float):
-            taint = self._taint or (other._taint if isinstance(other, (TaintedInt, TaintedFloat)) else None)
+            taint = _without_offset(self._taint or (other._taint if isinstance(other, (TaintedInt, TaintedFloat)) else None))
             return TaintedFloat(val, taint)
         return val
     def __rtruediv__(self, other):
@@ -650,10 +739,10 @@ class TaintedInt(int):
     def __pow__(self, other):
         val = int.__int__(self) ** _int_val(other)
         if isinstance(val, int):
-            taint = self._taint or (other._taint if isinstance(other, (TaintedInt, TaintedFloat)) else None)
+            taint = _without_offset(self._taint or (other._taint if isinstance(other, (TaintedInt, TaintedFloat)) else None))
             return TaintedInt(val, taint)
         if isinstance(val, float):
-            taint = self._taint or (other._taint if isinstance(other, (TaintedInt, TaintedFloat)) else None)
+            taint = _without_offset(self._taint or (other._taint if isinstance(other, (TaintedInt, TaintedFloat)) else None))
             return TaintedFloat(val, taint)
         return val
     def __rpow__(self, other):
@@ -706,6 +795,8 @@ class TaintedFloat(float):
         """
         a, b = float.__float__(self), _float_val(other)
         val = op(a, b)
+        if not isinstance(val, (int, float)):
+            return val  # an array operand: see TaintedInt._binop
 
         # Apply taint propagation rules
         self_taint = self._taint

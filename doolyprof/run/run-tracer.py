@@ -39,7 +39,12 @@ parser.add_argument("--attention-backend", type=str, default="FLASH_ATTN", help=
 parser.add_argument("--flash-attn-version", type=int, default=2, choices=[2, 3, 4], help="Pin flash-attention version when --attention-backend=FLASH_ATTN. Without this, vLLM auto-picks FA3 on Hopper / FA4 on Blackwell.")
 parser.add_argument("--quantization", type=str, default=None, choices=["fp8", "awq", "gptq"], help="Optional quantization scheme. 'fp8' requires Hopper+ (H100). With load_format=dummy, vLLM initializes random quantized weights — no quantized checkpoint needed.")
 parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
-parser.add_argument("--enable-expert-parallel", action="store_true", help="Fake EP: the fake TP group also serves as the expert-parallel group (vLLM TP+EP without DP); needs --tp >= 2")
+parser.add_argument("--dp", "--data_parallel_size", type=int, default=1, dest="data_parallel_size", help="Fake data parallel size: this process is DP rank 0, every DP rank is assumed to run the same batch; with --enable-expert-parallel the MoE dispatches/combines across the DP ranks")
+parser.add_argument("--enable-expert-parallel", action="store_true", help="Fake EP over the fake TP x DP ranks (vLLM TP+EP, DP+EP); needs --tp * --dp >= 2")
+parser.add_argument("--gpu-memory-cap", type=float, default=0.9,
+                    help="Largest fraction of the GPU the traced engine may take (what is free, at most this). "
+                         "Raise it when the KV cache left after the weights cannot hold a trace batch whose "
+                         "request count avoids every config value (the tracer says so).")
 parser.add_argument("--kv-cache-dtype", type=str, default="auto", help="vLLM KV-cache dtype literal (auto, fp8, fp8_e4m3, fp8_e5m2, ...); recorded in each attention module's state hash")
 args = parser.parse_args()
 
@@ -52,6 +57,8 @@ print(f"[Tracer] Set VLLM_ATTENTION_BACKEND={args.attention_backend}")
 
 FAKE_TP = args.tensor_parallel_size
 os.environ["VLLM_FAKE_TP"] = str(FAKE_TP)
+FAKE_DP = args.data_parallel_size
+os.environ["VLLM_FAKE_DP"] = str(FAKE_DP)
 os.environ["VLLM_FAKE_EP"] = "1" if args.enable_expert_parallel else "0"
 
 # Install taint hooks BEFORE any vLLM imports
@@ -91,9 +98,15 @@ patch_input_buffers()
 # Parameter.__new__'s alt-path (data.detach().requires_grad_(rg)).
 _original_parameter_new = torch.nn.Parameter.__new__
 
-def _patched_parameter_new(cls, data=None, requires_grad=True):
+def _patched_parameter_new(cls, data=None, requires_grad=True, **kwargs):
     from doolyprof.tracer.tensor import TaintedTensor
-    dim_taints = None
+    # Rebuilding a Parameter from another one's attributes,
+    # ``type(p)(p.to(device), **p.__dict__)`` (vLLM's Transformers backend, for
+    # SmolLM3 and other models without a native vLLM implementation), passes
+    # the labels this patch attached as a keyword: they are the labels again.
+    dim_taints = kwargs.pop("_dim_taints", None)
+    if kwargs:  # anything else is for the original constructor to accept or reject
+        return _original_parameter_new(cls, data=data, requires_grad=requires_grad, **kwargs)
     if isinstance(data, TaintedTensor):
         # Save the dim taints before unwrapping so the weight Parameter keeps
         # its MODEL_CONFIG dims (re-attached below). The unwrap itself preserves
@@ -105,11 +118,69 @@ def _patched_parameter_new(cls, data=None, requires_grad=True):
         with torch._C._DisableTorchDispatch():
             data = torch.Tensor._make_subclass(torch.Tensor, data, False)
     param = _original_parameter_new(cls, data=data, requires_grad=requires_grad)
+    sizes = tuple(int(s) for s in torch.Tensor.size(param))
+    if sizes:
+        # A weight's shape is set by the model (and its parallel split), never
+        # by the batch: every dim without a label is MODEL_CONFIG. vLLM builds
+        # some weights from plain sizes or rebuilds them after loading (Kimi-K3's
+        # fused q/kv down-projection, 2112 wide), which left them unlabelled and
+        # their outputs ?(2112).
+        from doolyprof.tracer.types import DimTaint as _DimTaint, Taint as _Taint
+        from doolyprof.tracer.registry import register_taint as _register
+        known = list(dim_taints or getattr(data, "_dim_taints", None) or ())
+        known += [None] * (len(sizes) - len(known))
+        filled = []
+        for size, t in zip(sizes, known):
+            if (t is None or (isinstance(t, _DimTaint) and t.taint is None)) and size > 1:
+                t = _DimTaint(_Taint("MODEL_CONFIG"), merge_history=None)
+                if size not in TAINT_REGISTRY:
+                    # so the trace batch avoids it (choose_trace_batch) and a
+                    # plain tensor of that size reads as the weight's dim
+                    _register(size, _Taint("MODEL_CONFIG"))
+            filled.append(t)
+        dim_taints = tuple(filled)
     if dim_taints is not None:
         object.__setattr__(param, "_dim_taints", dim_taints)
     return param
 
 torch.nn.Parameter.__new__ = _patched_parameter_new
+
+
+def _parameter_getitem(self, index):
+    """A slice of a weight (Kimi-K3 runs its q/kv down-projection on
+    ``fused_qkv_a_g_proj.weight[:qkv_a_rows]``) has fixed sizes, like the
+    weight. Indexing a plain Parameter bypasses the tracer, so the slice lost
+    the weight's labels and the GEMM output came out ?(2112)."""
+    out = torch.Tensor.__getitem__(self, index)
+    if (isinstance(out, torch.Tensor) and getattr(self, "_dim_taints", None) is not None
+            and getattr(out, "_dim_taints", None) is None and out.dim() > 0):
+        from doolyprof.tracer.types import (DimTaint as _DimTaint, Taint as _Taint,
+                                            TaintedInt as _TaintedInt, split_offset_label as _split)
+
+        def _batch(x):  # a bound that follows the batch makes the slice follow it too
+            t = x.taint if isinstance(x, _TaintedInt) else None
+            while isinstance(t, _DimTaint):
+                t = t.taint
+            return t is not None and (_split(t) is not None or str(t) == "MIX")
+        bounds = index if isinstance(index, tuple) else (index,)
+        if not any(_batch(b) or (isinstance(b, slice) and any(_batch(x) for x in (b.start, b.stop, b.step)))
+                   for b in bounds):
+            object.__setattr__(out, "_dim_taints", tuple(
+                _DimTaint(_Taint("MODEL_CONFIG"), merge_history=None) if s > 1 else None
+                for s in torch.Tensor.size(out)))
+    return out
+
+
+torch.nn.Parameter.__getitem__ = _parameter_getitem
+
+
+# A labelled weight's .shape / .size() as tainted ints while taints are tracked
+# (hooks.parameter_size): vLLM's CUTLASS FP8 GEMM on Blackwell sizes its output
+# from b.shape[1] of the weight.
+from doolyprof.tracer.hooks import parameter_size as _parameter_size  # noqa: E402
+
+torch.nn.Parameter.size = _parameter_size
+torch.nn.Parameter.shape = property(_parameter_size)
 
 # Patch DummyModelLoader to force CUDA move
 # (dummy models are loaded into CPU for some reason when tainting is enabled)
@@ -184,8 +255,20 @@ except Exception as e:
 # Apply fake TP patches using shared utility, then import vLLM
 from doolyprof.profiler.utils.fake_tp import apply_fake_tp_patches
 from doolyprof.profiler.utils.gpu_memory import engine_memory_fraction
-if FAKE_TP > 1:
-    apply_fake_tp_patches(FAKE_TP)
+if FAKE_TP > 1 or FAKE_DP > 1:
+    apply_fake_tp_patches(FAKE_TP, FAKE_DP)
+
+# The emulated group sizes are configuration like the model's own: vLLM's
+# collectives shape their buffers with the plain-int world size (all_gather:
+# output.reshape((world_size,) + input_size)), which otherwise leaves the
+# gathered dim untracked. Registered before the engine starts, so the trace
+# batch is also chosen clear of them.
+from doolyprof.tracer.registry import lookup_taint as _lookup_taint, register_taint as _register_taint
+from doolyprof.tracer.types import Taint as _Taint
+_ep = FAKE_TP * FAKE_DP if args.enable_expert_parallel else 1
+for _size in sorted({FAKE_TP, FAKE_DP, _ep} - {0, 1}):
+    if _lookup_taint(_size) is None:
+        _register_taint(_size, _Taint('MODEL_CONFIG'))
 
 from vllm import LLM, SamplingParams
 from transformers import AutoConfig
@@ -208,8 +291,41 @@ def get_max_model_len(model_name: str, default: int = 4096) -> int:
         print(f"[Tracer] Could not find max position embeddings, using default={default}")
         return default
     except Exception as e:
+        # The installed transformers may not know the architecture (LFM2.5's
+        # lfm2_moe under transformers 4.57, which vLLM 0.17.1 still serves):
+        # read the same fields from the checkpoint's config.json.
+        try:
+            from transformers import PretrainedConfig
+            raw, _ = PretrainedConfig.get_config_dict(model_name, trust_remote_code=True)
+            for attr in ["max_position_embeddings", "n_positions", "max_seq_len"]:
+                if raw.get(attr) is not None:
+                    print(f"[Tracer] Auto-detected max_model_len={raw[attr]} from {attr} in config.json "
+                          f"(AutoConfig: {type(e).__name__})")
+                    return int(raw[attr])
+        except Exception:  # noqa: BLE001
+            pass
         print(f"[Tracer] Error loading config: {e}, using default={default}")
         return default
+
+def encode_trace_prompt(tokenizer_name: str, prompt: str) -> list:
+    """Token ids of the traced prompt, from the checkpoint's own tokenizer.
+
+    The engine runs without a tokenizer (skip_tokenizer_init): the traced
+    generate() takes token ids, and nothing else in the trace needs text.
+    AutoTokenizer builds the tokenizer class the checkpoint names; when the
+    installed transformers does not have that class (LFM2.5 and North-Mini
+    name transformers 5's TokenizersBackend), the checkpoint's tokenizer.json
+    is read with the fast-tokenizer base class, which encodes it the same way.
+    """
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[Tracer] AutoTokenizer cannot build {tokenizer_name}'s tokenizer ({type(e).__name__}: "
+              f"{str(e)[:120]}); reading its tokenizer.json")
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_name, trust_remote_code=True)
+    return list(tokenizer.encode(prompt))
+
 
 if __name__ == "__main__":
     print(f"[Tracer] Tracing {args.model} with fake TP={FAKE_TP}")
@@ -233,7 +349,7 @@ if __name__ == "__main__":
             enforce_eager=True,
             # what is free on the GPU now, at most 0.9 (a fixed 0.9 fails whenever
             # another process holds more than a tenth of the GPU)
-            gpu_memory_utilization=engine_memory_fraction(devices=1, who="tracer"),
+            gpu_memory_utilization=engine_memory_fraction(cap=args.gpu_memory_cap, devices=1, who="tracer"),
             attention_backend=args.attention_backend,
             max_model_len=max_model_len,
             trust_remote_code=True,
@@ -244,6 +360,21 @@ if __name__ == "__main__":
             # traced; with prefix caching their prefill would be served from
             # cache and vanish from the trace.
             enable_prefix_caching=False,
+            # Only the language model is traced. With multimodal inputs on, vLLM
+            # also sizes the vision/audio encoders against the scheduler limits
+            # and refuses to start when an item exceeds them (Gemma 4: 2496
+            # tokens per image > max_num_batched_tokens=521).
+            language_model_only=True,
+            # The traced prompts are token ids (encode_trace_prompt); the
+            # engine needs no tokenizer of its own.
+            skip_tokenizer_init=True,
+            # Async scheduling (on by default in vLLM 0.33) plans the next step
+            # while the current one runs, so how the traced batch is split
+            # into steps depends on timing: one Kimi-K3 trace in four had a
+            # step with 93 of its 94 requests, 93 is a config value, and the
+            # NUM_REQS registration stopped the trace. Lockstep scheduling
+            # runs the whole batch in the one step choose_trace_batch sized.
+            async_scheduling=False,
         )
         if args.attention_backend == "FLASH_ATTN":
             llm_kwargs["attention_config"] = {"flash_attn_version": args.flash_attn_version}
@@ -275,10 +406,36 @@ if __name__ == "__main__":
         # Pick the trace batch against the registry the engine config filled
         # during init, so the scheduler's NUM_REQS / NUM_TOKS and the derived
         # cu_seqlens length cannot collide with a MODEL_CONFIG value.
-        prompt_ids = llm.get_tokenizer().encode(args.prompts)
+        prompt_ids = encode_trace_prompt(args.tokenizer or args.model, args.prompts)
         sched = llm.llm_engine.vllm_config.scheduler_config
+        # ... and so the KV cache admits the whole batch in one step (a hybrid
+        # model's large blocks can leave room for few requests)
+        from doolyprof.tracer.registry import kv_cache_capacity
+        cache = llm.llm_engine.vllm_config.cache_config
+        kv_capacity = kv_cache_capacity(getattr(cache, "num_gpu_blocks", None),
+                                        getattr(cache, "block_size", None), args.max_tokens)
+        print(f"[Tracer] KV cache: {getattr(cache, 'num_gpu_blocks', None)} blocks of "
+              f"{getattr(cache, 'block_size', None)} tokens"
+              + (f", {kv_capacity(len(prompt_ids))} requests of this prompt at once" if kv_capacity else ""))
+        # The cache tensors' block count and block size are fixed for the run
+        # but in no config the registry read; label them before the trace batch
+        # is chosen so its integers avoid them as well.
+        from doolyprof.tracer.registry import kv_cache_tensors, register_kv_cache_dims
+        _runner = llm.llm_engine.model_executor.driver_worker.model_runner
+        _contexts = [getattr(getattr(c, "compilation_config", None), "static_forward_context", None)
+                     for c in (getattr(_runner, "vllm_config", None), llm.llm_engine.vllm_config)]
+        _cache_tensors = kv_cache_tensors({k: v for c in _contexts if c for k, v in c.items()})
+        _cache_dims = register_kv_cache_dims(_cache_tensors)
+        print(f"[Tracer] KV-cache tensors: {len(_cache_tensors)}, shapes "
+              f"{sorted({tuple(t.shape) for t in _cache_tensors})[:6]}; labelled KV_CACHE: {sorted(_cache_dims)}")
+        # weights and what quantization rebuilt from them after loading
+        # (repacked weights, scales): fixed sizes
+        from doolyprof.tracer.registry import label_module_tensors
+        print(f"[Tracer] Labelled the fixed dims of {label_module_tensors(model, skip=_cache_tensors)} "
+              f"module tensors MODEL_CONFIG")
         batch_size, prompt_len = choose_trace_batch(
-            args.batch_size, len(prompt_ids), sched.max_num_seqs, sched.max_num_batched_tokens)
+            args.batch_size, len(prompt_ids), sched.max_num_seqs, sched.max_num_batched_tokens,
+            kv_capacity=kv_capacity)
         if batch_size != args.batch_size:
             print(f"[Tracer] Requested batch {args.batch_size} collides with the taint registry "
                   f"or exceeds one scheduler step; using {batch_size}")
@@ -294,12 +451,46 @@ if __name__ == "__main__":
         # off, so one-time work keyed on these shapes (Triton autotuning of
         # the linear-attention kernels, lazy allocations) happens outside the
         # profiled generate instead of inside the first layer's trace.
-        llm.generate(prompts, sampling_params=sampling_params)
+        #
+        # It also shows whether the engine runs the batch in one scheduler
+        # step, which the registry check above assumes: a step with only part
+        # of the batch runs a request count of its own, which may be a config
+        # value (Kimi-K3 on vLLM 0.34: 88 of 94 requests fit its KV cache,
+        # then a step of 6, and 6 is MODEL_CONFIG). The capacity estimate
+        # cannot see every engine's block accounting (hybrid models' KV-cache
+        # groups share one block pool), so the batch is chosen again under the
+        # request count the engine actually ran at once.
+        from doolyprof.tracer.config import observe_scheduled_requests, observed_scheduled_requests
+        for _attempt in range(3):
+            observe_scheduled_requests()
+            llm.generate(prompts, sampling_params=sampling_params)
+            _steps = observed_scheduled_requests()
+            _partial = [n for n in _steps if 0 < n < batch_size]  # an empty step runs no request
+            if not _partial:
+                break
+            _at_once = max(_partial)
+            print(f"[Tracer] The engine ran the {batch_size}-request batch in steps of "
+                  f"{sorted(set(_steps), reverse=True)} requests; choosing a batch of at most {_at_once}")
+            _cap = (lambda p, _k=kv_capacity, _n=_at_once: min(_n, _k(p)) if _k else _n)
+            kv_capacity = _cap
+            batch_size, prompt_len = choose_trace_batch(
+                args.batch_size, len(prompt_ids), sched.max_num_seqs, sched.max_num_batched_tokens,
+                kv_capacity=kv_capacity)
+            print(f"[Tracer] Trace batch: {batch_size} prompts x {prompt_len} tokens = "
+                  f"{batch_size * prompt_len} tokens")
+            prompts = [TokensPrompt(prompt_token_ids=list(prompt_ids[:prompt_len]))] * batch_size
+        else:
+            raise RuntimeError(f"the engine did not run a {batch_size}-request trace batch in one step")
         print("[Tracer] Warm-up generate done")
 
         # Enable taint tracking now - warm-up/compilation is done
         enable_taint_tracking()
         print("\n[Tracer] Taint tracking ENABLED for actual generation")
+
+        # on_trace_ready runs when the profile context exits, which it also does
+        # when generate() raises: without this flag a failed run leaves a partial
+        # trace that looks like a valid one (and that the profiler would use).
+        generate_finished = [False]
 
         def dooly_trace_handler(dir_name: str, model_name: str, tp: int):
             """torch.profiler handler that writes to a predictable filename
@@ -314,9 +505,13 @@ if __name__ == "__main__":
             import json as _json
 
             safe_model = model_name.replace("/", "_")
-            file_name = f"{safe_model}_{tp}_dooly_trace.json"
+            dp_tag = f"_dp{FAKE_DP}" if FAKE_DP > 1 else ""
+            file_name = f"{safe_model}_{tp}{dp_tag}_dooly_trace.json"
 
             def handler_fn(prof) -> None:
+                if not generate_finished[0]:
+                    print("[Tracer] generate() did not finish; no trace written", flush=True)
+                    return
                 if not os.path.isdir(dir_name):
                     try:
                         os.makedirs(dir_name, exist_ok=True)
@@ -363,8 +558,11 @@ if __name__ == "__main__":
             on_trace_ready=dooly_trace_handler(args.trace_dir, args.model, args.tensor_parallel_size),
         ) as prof:
             llm.generate(prompts, sampling_params=sampling_params)
+            generate_finished[0] = True
 
         print(f"[Tracer] Done tracing {args.model}, output saved to {args.trace_dir}")
+        from doolyprof.tracer.tensor import qdebug_dump
+        qdebug_dump()  # DOOLY_QDEBUG=1 only
 
         # Print registry contents
         print("\n" + "="*80)

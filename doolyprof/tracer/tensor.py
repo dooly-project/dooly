@@ -33,11 +33,164 @@ def _dim_taint_from_registry(size):
     return DimTaint.from_taint(registry_info)
 
 
+# Input (shape, dim taints) of each op the tracer is running on plain tensors,
+# innermost last (TaintedTensor.__torch_dispatch__). A vLLM custom op's Python
+# body (MoE runner, ShortConv, attention) sees only plain tensors, so the
+# modules and communications it calls would annotate every dim as untracked.
+_BLACKBOX_INPUTS = []
+
+
+def _dim_taint_from_scope(size):
+    """The taint of the enclosing black-box op's input dim of this size, when
+    exactly one taint has it: the rule the tracer applies to that op's outputs
+    (propagate_taints), applied to the tensors seen inside it. Ambiguous or
+    absent sizes give None."""
+    if not _BLACKBOX_INPUTS or int(size) <= 1:
+        return None
+    labels, divided = {}, {}
+    for shape, taints in _BLACKBOX_INPUTS[-1]:
+        for s, t in zip(shape, taints or ()):
+            while isinstance(t, DimTaint):
+                t = t.taint
+            if t is None:
+                continue
+            if int(s) == int(size):
+                labels[str(t)] = t
+            elif int(s) > int(size) and int(s) % int(size) == 0:
+                divided[str(t)] = t
+    if len(labels) == 1:
+        return DimTaint.from_taint(next(iter(labels.values())))
+    if labels:
+        return None
+    # No input dim has this size, but it evenly divides input dims of exactly
+    # one label, the model's configuration: a size cut from config dims (the
+    # FP8 block scales of the hidden states that Kimi-K3's MoE dispatch sends on
+    # Blackwell, hidden 3584 / 128 = 28) is fixed too. When a batch-sized dim is
+    # also a multiple, the size is left untracked.
+    if len(divided) == 1 and str(next(iter(divided))) == "MODEL_CONFIG":
+        return DimTaint.from_taint(next(iter(divided.values())))
+    return None
+
+
+def in_blackbox() -> bool:
+    """True while a custom op the tracer runs on plain tensors is executing
+    (its Python body: vLLM's MoE runner, ShortConv, attention ops)."""
+    return bool(_BLACKBOX_INPUTS)
+
+
+def retaint_in_blackbox(args, kwargs):
+    """Module inputs inside a black-box op, as TaintedTensors.
+
+    A module called from a custom op's Python body gets plain tensors, so its
+    own ops propagated nothing and the dims it creates (a shared expert's
+    gate_up_proj output, 2 x its intermediate size) stayed untracked. Each
+    plain tensor argument is wrapped (same storage) with the taints of the op's
+    input dims of the same size, when exactly one taint has that size
+    (_dim_taint_from_scope); the module's ops then propagate taints from there
+    and from its weights as in model code. The ops inside still write no taint
+    annotation (the dispatcher's reentrant path, in_blackbox()), so what is
+    profiled as one unit is unchanged."""
+    from . import is_taint_tracking_enabled
+    if not _BLACKBOX_INPUTS or not is_taint_tracking_enabled():
+        return args, kwargs
+
+    def wrap(x):
+        if (isinstance(x, torch.Tensor) and not isinstance(x, TaintedTensor)
+                and not isinstance(x, torch.nn.Parameter) and x.dim() > 0):
+            taints = tuple(_dim_taint_from_scope(int(s)) for s in torch.Tensor.size(x))
+            if any(t is not None for t in taints):
+                return TaintedTensor(x, taints)
+        return x
+    return tuple(wrap(a) for a in args), {k: wrap(v) for k, v in kwargs.items()}
+
+
+def strip_taints(args, kwargs):
+    """``(args, kwargs, changed)`` with every TaintedTensor replaced by a plain
+    tensor over the same storage and every TaintedInt by its int, through lists,
+    tuples and dicts; ``changed`` says whether anything was tainted."""
+    from .types import TaintedInt, TaintedFloat
+    changed = [False]
+
+    def strip(x):
+        if isinstance(x, TaintedTensor):
+            changed[0] = True
+            with torch._C._DisableTorchDispatch():
+                return x.detach()
+        if isinstance(x, TaintedInt):
+            changed[0] = True
+            return int(x)
+        if isinstance(x, TaintedFloat):
+            changed[0] = True
+            return float(x)
+        if isinstance(x, TaintedShape):
+            changed[0] = True
+            return torch.Size(int(i) for i in x)
+        if isinstance(x, (list, tuple)):
+            items = [strip(i) for i in x]
+            try:
+                return type(x)(items)
+            except TypeError:  # namedtuple-like
+                return type(x)(*items)
+        if isinstance(x, dict):
+            return {k: strip(v) for k, v in x.items()}
+        return x
+    plain_args = tuple(strip(a) for a in args)
+    plain_kwargs = {k: strip(v) for k, v in kwargs.items()}
+    return plain_args, plain_kwargs, changed[0]
+
+
+def _no_label(t):
+    return t is None or (isinstance(t, DimTaint) and t.taint is None)
+
+
+def _batch_slice_taint(dim_taint, size, sl):
+    """The label of ``x[sl]`` along one dim when the slice's length is a batch
+    size (NUM_REQS / NUM_TOKS / their MAX_ bounds, with or without an offset)
+    plus or minus constants; None for any other slice, which the general slice
+    rules handle.
+
+      x[c : n + k]   (stop a batch size, start a constant) -> n + k - c:
+                     vLLM's query_start_loc[1 : num_reqs + 1] has num_reqs
+                     entries, not num_reqs + 1
+      x[c:], x[:-d]  along a batch dim of size n + k -> n + k - c (- d):
+                     query_start_loc[1:] of a NUM_REQS+1 dim is NUM_REQS
+    """
+    from .types import TaintedInt, offset_label, split_offset_label
+
+    def base(t):
+        while isinstance(t, DimTaint):
+            t = t.taint
+        return t
+
+    def tainted(b):
+        return isinstance(b, TaintedInt) and base(b.taint) is not None
+
+    def const(b):
+        return b is None or (isinstance(b, int) and not isinstance(b, bool) and not tainted(b))
+
+    if sl.step not in (None, 1):
+        return None
+    start, stop = sl.start, sl.stop
+    kept = len(range(*sl.indices(size)))
+    if tainted(stop) and const(start) and (start or 0) >= 0:
+        parts = split_offset_label(base(stop.taint))
+        if parts is None or kept != int(stop) - (start or 0):
+            return None  # not a batch size, or clamped to the dim
+        return DimTaint(offset_label(parts[0], parts[1] - (start or 0)), merge_history=None)
+    t = base(dim_taint)
+    parts = split_offset_label(t) if t is not None else None
+    if parts is None or not (const(start) and const(stop)) or (start is None and stop is None):
+        return None
+    if (start is not None and start < 0) or (stop is not None and stop >= 0):
+        return None  # x[-k:] / x[:k]: k entries, not the batch
+    return DimTaint(offset_label(parts[0], parts[1] - (size - kept)), merge_history=None)
+
+
 def _format_dim(size, dim_taint, include_history=False):
     if dim_taint is None or (
         isinstance(dim_taint, DimTaint) and dim_taint.taint is None
     ):
-        dim_taint = _dim_taint_from_registry(size) or dim_taint
+        dim_taint = _dim_taint_from_scope(size) or _dim_taint_from_registry(size) or dim_taint
     if isinstance(dim_taint, DimTaint):
         actual_taint = dim_taint
         while isinstance(actual_taint.taint, DimTaint):
@@ -50,11 +203,13 @@ def _format_dim(size, dim_taint, include_history=False):
                     or actual_taint.merge_history,
                 )
         if actual_taint.taint is None:
-            registry_taint = _dim_taint_from_registry(size)
+            registry_taint = _dim_taint_from_scope(size) or _dim_taint_from_registry(size)
             if registry_taint is not None:
                 return _format_dim(size, registry_taint, include_history)
             if int(size) == 1:
                 return "SINGLETON(1)"
+            if int(size) == 0:
+                return "EMPTY(0)"
         if include_history and actual_taint.has_history:
             history_str = ",".join(
                 f"{taint}:{qty}" for taint, qty in actual_taint.merge_history.items()
@@ -65,7 +220,71 @@ def _format_dim(size, dim_taint, include_history=False):
         return f"{dim_taint}({size})"
     if int(size) == 1:
         return "SINGLETON(1)"
+    if int(size) == 0:
+        # an empty placeholder (vLLM's kv_cache_dummy_dep, unused optional
+        # buffers): a fixed size, like a broadcast dim
+        return "EMPTY(0)"
     return f"?({size})"
+
+
+_QDEBUG_COUNTS = None
+_QDEBUG_DEPTH = 0
+
+
+def _qdebug_site():
+    """The innermost three frames outside doolyprof / torch: the model or engine
+    code that handed the untainted tensor to the annotated call."""
+    import sys
+    f, frames = sys._getframe(2), []
+    while f is not None and len(frames) < 3:
+        fn = f.f_code.co_filename
+        if not any(s in fn for s in ("/doolyprof/", "/torch/", "contextlib", "functools")):
+            frames.append(f"{fn.split('site-packages/')[-1]}:{f.f_lineno}:{f.f_code.co_name}")
+        f = f.f_back
+    return " <- ".join(frames)
+
+
+def qdebug_dump():
+    """Print the DOOLY_QDEBUG=1 tally of ?(n) labels by size and call site."""
+    global _QDEBUG_COUNTS
+    if not _QDEBUG_COUNTS:
+        return
+    counts, _QDEBUG_COUNTS = _QDEBUG_COUNTS, None
+    print(f"[QDEBUG] {sum(counts.values())} ? labels at {len(counts)} sites", flush=True)
+    for (label, where), c in counts.most_common(80):
+        print(f"[QDEBUG] {c:6d} {label:10s} {where}", flush=True)
+
+
+def _qdebug(fmt):
+    """DOOLY_QDEBUG=1: tally every ?(n) an annotation writes by the code that
+    passed the untainted tensor, to find where each dim lost (or never had) a
+    taint. Off by default."""
+    import os
+    if os.environ.get("DOOLY_QDEBUG") != "1":
+        return fmt
+    import atexit, collections
+    global _QDEBUG_COUNTS
+    _QDEBUG_COUNTS = collections.Counter()
+    atexit.register(qdebug_dump)
+
+    def format_dim(size, dim_taint, include_history=False):
+        global _QDEBUG_DEPTH
+        _QDEBUG_DEPTH += 1
+        try:
+            s = fmt(size, dim_taint, include_history)
+        finally:
+            _QDEBUG_DEPTH -= 1
+        if _QDEBUG_DEPTH == 0 and s.startswith("?(") and _QDEBUG_COUNTS is not None:
+            from . import is_taint_tracking_enabled
+            # only the traced step: warm-up and vLLM's profiling runs annotate
+            # plain tensors with taint tracking off, and never reach the trace
+            if is_taint_tracking_enabled():
+                _QDEBUG_COUNTS[(s.split("[")[0], _qdebug_site())] += 1
+        return s
+    return format_dim
+
+
+_format_dim = _qdebug(_format_dim)
 
 
 def _get_target_device(args, kwargs):
@@ -277,7 +496,16 @@ class TaintedTensor(torch.Tensor):
         output_taints = []
         input_idx = 0
 
-        for idx_item in index:
+        def consumed(item):
+            # input dims an index item stands for: None adds a dim and Ellipsis
+            # is the rest, neither takes one; a bool mask takes as many as it has
+            if item is None or item is Ellipsis:
+                return 0
+            if isinstance(item, torch.Tensor) and item.dtype == torch.bool:
+                return max(item.dim(), 1)
+            return 1
+
+        for position, idx_item in enumerate(index):
             if isinstance(idx_item, int):
                 # Integer index: dimension is removed
                 input_idx += 1
@@ -285,6 +513,15 @@ class TaintedTensor(torch.Tensor):
                 # Slice: dimension is preserved (possibly with different size)
                 from .types import TaintedInt, Taint, DimTaint
                 from .registry import TAINT_REGISTRY
+
+                # A slice whose length is a batch size plus or minus constants
+                # (query_start_loc[1 : num_reqs + 1], query_start_loc[1:])
+                own = self._dim_taints[input_idx] if input_idx < len(self._dim_taints) else None
+                trimmed = _batch_slice_taint(own, int(self.shape[input_idx]), idx_item)
+                if trimmed is not None:
+                    output_taints.append(trimmed)
+                    input_idx += 1
+                    continue
 
                 # Check if this is a full slice (no bounds specified)
                 is_full_slice = (idx_item.start is None and
@@ -333,8 +570,11 @@ class TaintedTensor(torch.Tensor):
 
                 input_idx += 1
             elif idx_item is Ellipsis:
-                # Ellipsis: preserve remaining dimensions
-                remaining = input_dims - input_idx - sum(1 for i in index[index.index(idx_item)+1:] if i is not Ellipsis)
+                # Ellipsis: preserve the dims the items after it do not take
+                # (x[..., None] keeps both dims of a 2-D x; counting the None as
+                # a dim kept one and moved NUM_TOKS onto the new size-1 axis, in
+                # Hugging Face's rotary embedding: position_ids[..., None])
+                remaining = input_dims - input_idx - sum(consumed(i) for i in index[position + 1:])
                 for _ in range(remaining):
                     if input_idx < len(self._dim_taints):
                         output_taints.append(self._dim_taints[input_idx])
@@ -662,7 +902,11 @@ class TaintedTensor(torch.Tensor):
         if torch.cuda.is_available() and target_device is not None and target_device.type == 'cuda':
             torch.cuda.set_device(target_device)
 
-        out = func(*plain_args, **plain_kwargs)
+        _BLACKBOX_INPUTS.append(input_infos)
+        try:
+            out = func(*plain_args, **plain_kwargs)
+        finally:
+            _BLACKBOX_INPUTS.pop()
 
         # Special handling for copy_: source taints should propagate to destination
         func_name = func.name() if hasattr(func, 'name') else str(func)
@@ -706,6 +950,13 @@ class TaintedTensor(torch.Tensor):
                 func_name = func.name() if hasattr(func, 'name') else str(func)
                 is_inplace = func_name.endswith('_')
                 if is_inplace and len(args) > 0 and isinstance(args[0], TaintedTensor):
+                    # the result is args[0] itself: a dim the op gives no
+                    # label keeps the one it had (vLLM copies the numpy-built
+                    # query_start_loc into its MAX_NUM_REQS+1 buffer)
+                    own = tuple(args[0]._dim_taints or ())
+                    if len(own) == len(out_taints):
+                        out_taints = tuple(
+                            own[i] if _no_label(t) else t for i, t in enumerate(out_taints))
                     args[0]._dim_taints = out_taints
                     if propagation_dict:
                          args[0].__dict__.update(propagation_dict)

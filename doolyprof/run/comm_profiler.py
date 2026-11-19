@@ -14,6 +14,7 @@ os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 from vllm import LLM
 from doolyprof.profiler.utils.gpu_memory import engine_memory_fraction
+from doolyprof.profiler.utils.topology import machine_topology
 from vllm.distributed.parallel_state import get_tp_group
 
 # Dtype to bytes mapping
@@ -191,8 +192,9 @@ def _swept_dim(traced, workload, lists):
 
 def _payload_tensors(entry, workload, dtype, device):
     """Inputs at the traced shapes with every swept (NUM_TOKS / NUM_REQS) dim
-    rebuilt for ``workload`` (_swept_dim). Floating payloads use the profiled
-    dtype, others keep the traced dtype."""
+    rebuilt for ``workload`` (_swept_dim), in their traced dtypes, as compute ops
+    are profiled (a DP+EP dispatch moves fp32 router weights next to the bf16
+    hidden states); the profiled dtype only where no dtype was recorded."""
     traced = entry["meta"].get("dtypes", [])
     lists = _swept_lists(entry["meta"], _variable_labels(entry))
     tensors = []
@@ -200,7 +202,7 @@ def _payload_tensors(entry, workload, dtype, device):
         shape = [_swept_dim(size, workload, lists) if var else size
                  for size, var in zip(inp["shape"], inp["variable"])]
         tdt = getattr(torch, traced[i], None) if i < len(traced) else None
-        if tdt is None or tdt.is_floating_point:
+        if tdt is None:
             tdt = dtype
         if tdt.is_floating_point:
             tensors.append(torch.randn(shape, dtype=tdt, device=device))
@@ -209,9 +211,11 @@ def _payload_tensors(entry, workload, dtype, device):
     return tensors
 
 
-def _payload_bytes(tensors, kwargs, dtype):
+def _payload_bytes(tensors, kwargs, dtype, recv_only=()):
+    """Bytes the call sends: its tensor arguments, except those it only
+    receives into (``recv_only``, e.g. reduce_scatterv_into_output's output)."""
     if tensors:
-        return sum(t.numel() * t.element_size() for t in tensors)
+        return sum(t.numel() * t.element_size() for i, t in enumerate(tensors) if i not in recv_only)
     # Receiving side: the payload is the shape it will produce (e.g. recv(size, dtype)).
     shapes = [v for v in kwargs.values() if isinstance(v, torch.Size)]
     dtypes = [v for v in kwargs.values() if isinstance(v, torch.dtype)] or [dtype]
@@ -226,7 +230,7 @@ def _build_call(entry, workload, comm, tp_rank, dtype, device):
     labels = _variable_labels(entry)
     tensors = _payload_tensors(entry, workload, dtype, device)
     kwargs = {k: _rebuild(v, workload, tensors, labels, device) for k, v in meta.get("args", {}).items()}
-    size_bytes = _payload_bytes(tensors, kwargs, dtype)
+    size_bytes = _payload_bytes(tensors, kwargs, dtype, set(entry.get("recv_only") or ()))
 
     if op in _P2P_PEER:
         # Rank 0 sends the recorded payload to rank 1, which receives it, through
@@ -263,6 +267,12 @@ def _profile_recorded(entry, sizes, comm, tp_rank, tp_world_size, dtype, device,
                       group=None):
     op = entry["operation"]
     tag = f"{op} (dim={entry['dim_param']}, ndims={entry['num_dims']})"
+    recorded_world = entry["meta"].get("world_size")
+    if recorded_world and int(recorded_world) != tp_world_size:
+        # Replayed on a group of another size it would be stored under the
+        # wrong group size (the profiler keys the collective by its own group).
+        print(f"[WARN] Skipping {tag}: recorded on a {recorded_world}-rank group, replay group has {tp_world_size}")
+        return []
     if op in _P2P_PEER and tp_world_size < 2:
         print(f"[WARN] Skipping {tag}: point-to-point needs >= 2 ranks")
         return []
@@ -497,8 +507,11 @@ class CommProfiler:
         
         print(f"✓ Database initialized at {self.db_path}")
 
-    def should_profile(self, tp_size, overwrite=False, topology="mew1"):
-        """Check if we should profile based on existing data and overwrite flag."""
+    def should_profile(self, tp_size, overwrite=False, topology=None):
+        """Check if we should profile based on existing data and overwrite flag.
+
+        ``topology`` is the label the measurements are stored under (machine_topology() by default)."""
+        topology = topology or machine_topology()
         if overwrite:
             print("[COMM] Overwrite mode enabled - will re-profile all operations")
             return True
@@ -530,9 +543,16 @@ class CommProfiler:
     def plan(self, collectives: List[Any]):
         """One entry per recorded collective variant, keyed like coll_ops
         (operation, dim_param, num_dims): the traced input shapes, which of
-        their dimensions are swept (NUM_TOKS / NUM_REQS taints), the product
-        of their MODEL_CONFIG dims, and the recorded call (comm_args)."""
-        from doolyprof.profiler.comm_args import parse_comm_args, identity_int
+        their dimensions are swept, the product of the first input's fixed
+        dims, and the recorded call (comm_args).
+
+        A dim is swept when it carries a NUM_TOKS / NUM_REQS taint, or when it
+        equals a per-rank size of a swept list argument or their sum: an EP
+        dispatch runs inside the MoE custom op, where the tracer sees plain
+        tensors, but its per-rank sizes keep the token taint. Every other dim
+        is fixed, labelled MODEL_CONFIG or not, so the element sweep divides by
+        all of them."""
+        from doolyprof.profiler.comm_args import parse_comm_args, identity_int, swept_payload_dims
         from doolyprof.profiler.taint import DimensionType
 
         swept = {DimensionType.NUM_TOKENS, DimensionType.NUM_REQUESTS}
@@ -548,18 +568,24 @@ class CommProfiler:
             key = f"{collective.operation_name}|{dim_param}|{num_dims}"
             if key in self.plan_info:
                 continue
+            labels = {d.value for d in swept}
+            variable = [swept_payload_dims(meta, shape, t.dimensions, swept, labels)
+                        for shape, t in zip(shapes, tensors)]
             model_dims = 1
-            for idx in tensors[0].get_model_config_dims():
-                model_dims *= shapes[0][idx]
+            for size, var in zip(shapes[0], variable[0]):
+                if not var:
+                    model_dims *= size
             self.plan_info[key] = {
                 'operation': collective.operation_name,
                 'dim_param': dim_param,
                 'num_dims': num_dims,
                 'model_config_dims': model_dims,
-                'inputs': [{'shape': shape, 'variable': [d in swept for d in t.dimensions]}
-                           for shape, t in zip(shapes, tensors)],
+                'inputs': [{'shape': shape, 'variable': var} for shape, var in zip(shapes, variable)],
                 'variable_labels': sorted(d.value for d in swept),
                 'meta': meta,
+                # inputs the call only received into (the parser's COMM_RECV_ONLY):
+                # replayed, but not part of the payload size
+                'recv_only': list(collective.hierarchy.anchor.args.get('recv_only', [])),
             }
             print(f"[COMM] planned {key}: inputs={shapes}, model_config_dims={model_dims}")
         self.profile_send_recv_bool: bool = False  # enabled by the worker for PP profiling
@@ -583,6 +609,8 @@ class CommProfiler:
             gpu_memory_utilization=engine_memory_fraction(cap=0.5, devices=tp_size, who="comm profiler"),
             max_model_len=2048,  # Small model_len sufficient for comm profiling
             tensor_parallel_size=tp_size,  # REAL tensor parallelism
+            language_model_only=True,  # the traced language model, no multimodal encoders
+            skip_tokenizer_init=True,  # collectives only, no text
         )
 
         print(f"\n=== Communication Profiling Sweep ===")

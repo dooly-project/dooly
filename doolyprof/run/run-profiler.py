@@ -17,10 +17,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 #   the main process + comm worker silently fall back to GPU 0.
 _pre_parser = argparse.ArgumentParser(add_help=False)
 _pre_parser.add_argument("--tp", type=int, default=1)
+_pre_parser.add_argument("--dp", type=int, default=1)
 _pre_parser.add_argument("--gpu", type=str, default="0,1,2,3")
 _pre_parser.add_argument("--enable-expert-parallel", action="store_true")
 _pre_args, _ = _pre_parser.parse_known_args()
 os.environ["VLLM_FAKE_TP"] = str(_pre_args.tp)
+os.environ["VLLM_FAKE_DP"] = str(_pre_args.dp)
 # VLLM_FAKE_EP: every engine this process or its children build sets
 # enable_expert_parallel (see fake_tp.get_fake_ep).
 os.environ["VLLM_FAKE_EP"] = "1" if _pre_args.enable_expert_parallel else "0"
@@ -81,13 +83,20 @@ def parse_args() -> argparse.Namespace:
                              "becomes part of the profiled_models deployment key and of the attention state hash.")
     parser.add_argument("--workload-mode", default="vidur")
     parser.add_argument("--max-batch-size", type=int, default=5)
+    parser.add_argument("--gpu-memory-cap", type=float, default=0.9,
+                        help="Largest fraction of the GPU the profiling engines may take (what is free, at most this), "
+                             "as run-tracer's flag. Raise it when the KV cache left after the weights cannot hold "
+                             "the traced engine's max_num_seqs requests (vLLM 0.34 warms up that many at start-up).")
     parser.add_argument("--max-seq-len", type=int, default=128)
     parser.add_argument("--test-counts", type=int, default=1)
     parser.add_argument("--force-prefill-kernel", action="store_true", default=True)
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--dp", type=int, default=1,
+                        help="Fake data parallelism (must match the trace): this process is DP rank 0 of --dp; "
+                             "with --enable-expert-parallel the MoE dispatches/combines across the DP ranks")
     parser.add_argument("--enable-expert-parallel", action="store_true",
-                        help="Fake EP: the fake TP group also serves as the expert-parallel group "
-                             "(vLLM TP+EP without DP); stored as ep_degree = tp in profiled_models")
+                        help="Fake EP over the fake TP x DP ranks (vLLM TP+EP, DP+EP); "
+                             "stored as ep_degree = tp * dp in profiled_models")
     parser.add_argument("--db-path", type=str, default=None,
                         help="Path to SQLite database for persistent storage and deduplication")
     parser.add_argument("--gpu", type=str, default="0",
@@ -112,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_model(model, dtype, attention_backend, flash_attn_version, quantization, max_seq_len, result_queue, gpu, kv_cache_dtype="auto"):
+def resolve_model(model, dtype, attention_backend, flash_attn_version, quantization, max_seq_len, result_queue, gpu, kv_cache_dtype="auto", max_batch_size=1, gpu_memory_cap=0.9):
     from doolyprof.profiler.importer import OpImporter
     from doolyprof.profiler.resolver import ModuleResolver
     from doolyprof.profiler.vllm_layer_profiler import VLLMLayerProfiler
@@ -128,17 +137,23 @@ def resolve_model(model, dtype, attention_backend, flash_attn_version, quantizat
         max_model_len = max_seq_len
         print(f"[RESOLVER] Using max_model_len={max_model_len} from user config")
 
+    from doolyprof.profiler.profiler import engine_batch_limits
+    max_tokens, max_seqs = engine_batch_limits(getattr(model, 'taint_registry', {}), max_batch_size, max_model_len)
+    print(f"[RESOLVER] Engine limits: max_num_batched_tokens={max_tokens}, max_num_seqs={max_seqs}")
     vlp = VLLMLayerProfiler(
         model_name=model.name,
         dtype=str(model.dtype).split(".")[-1],
         enforce_eager=True,
-        gpu_memory_utilization=None,  # what is free now, at most 0.9 (utils/gpu_memory.py)
+        gpu_memory_utilization=None,  # what is free now, at most gpu_memory_cap (utils/gpu_memory.py)
+        gpu_memory_cap=gpu_memory_cap,
         max_model_len=max_model_len,
         attn_backend=attention_backend,
         flash_attn_version=flash_attn_version,
         quantization=quantization,
         gpu=gpu,
         kv_cache_dtype=kv_cache_dtype,
+        max_num_batched_tokens=max_tokens,
+        max_num_seqs=max_seqs,
     )
     resolver = ModuleResolver(
         vlp=vlp,
@@ -182,6 +197,7 @@ def run_comm_profiler(models, dtype_str, tp_size, db_path, overwrite, profile_me
     # Create clean environment WITHOUT VLLM_FAKE_TP
     clean_env = os.environ.copy()
     clean_env.pop('VLLM_FAKE_TP', None)
+    clean_env.pop('VLLM_FAKE_DP', None)
 
     try:
         # Choose worker based on profile method
@@ -232,6 +248,11 @@ def main() -> None:
     args = parse_args()
     if len(args.models) != len(args.traces):
         raise SystemExit("--models and --traces must have the same length")
+    # The trace parser reports a missing file and returns no ops, which left a
+    # run that resolved and profiled nothing and still exited 0.
+    missing = [t for t in args.traces if not os.path.isfile(t)]
+    if missing:
+        raise SystemExit(f"trace file not found: {', '.join(missing)}")
 
     dtype = DTYPE_MAP[args.dtype]
     models = [
@@ -245,7 +266,7 @@ def main() -> None:
 
     for i, model in enumerate(models):
         print(f"[RUNNER] Starting RESOLVER for {model.name}...")
-        p = mp.Process(target=resolve_model, args=(model, dtype, args.attention_backend, args.flash_attn_version, args.quantization, args.max_seq_len, result_queue, args.gpu, args.kv_cache_dtype))
+        p = mp.Process(target=resolve_model, args=(model, dtype, args.attention_backend, args.flash_attn_version, args.quantization, args.max_seq_len, result_queue, args.gpu, args.kv_cache_dtype, args.max_batch_size, args.gpu_memory_cap))
         p.start()
         from doolyprof.profiler.utils.procs import get_child_result
         model.to_profile_resolved = get_child_result(p, result_queue, f"resolver for {model.name}")
@@ -278,11 +299,13 @@ def main() -> None:
         attention_backend=args.attention_backend,
         flash_attn_version=args.flash_attn_version,
         quantization=args.quantization,
-        world_config={"tp": args.tp, "pp": 1, "ep": args.tp if args.enable_expert_parallel else 1},
+        world_config={"tp": args.tp, "pp": 1, "dp": args.dp,
+                      "ep": args.tp * args.dp if args.enable_expert_parallel else 1},
         dtype=dtype,
         db_path=args.db_path,
         gpu=args.gpu,
         kv_cache_dtype=args.kv_cache_dtype,
+        gpu_memory_cap=args.gpu_memory_cap,
     )
     
     import time
@@ -291,17 +314,30 @@ def main() -> None:
    
     # limit model to profile by one
     if models[0].collective_ops and len(models) == 1 and args.profile_comm:
-        # Run comm profiling in separate process (no fake TP)
-        run_comm_profiler(
-            models=models,
-            dtype_str=args.dtype,
-            tp_size=args.tp,
-            db_path=args.db_path,
-            overwrite=args.overwrite_comm,
-            profile_method=args.profile_method,
-            use_cuda_graph=not args.no_cuda_graph_comm,  # Default True unless disabled
-            comm_timing=args.comm_timing,
-        )
+        # Run comm profiling in separate processes (no fake TP). Every recorded
+        # call is replayed on a real group of the size it ran on: TP x DP traces
+        # mix groups (TP all-reduces on tp ranks, an EP dispatch over tp * dp),
+        # so there is one real engine per recorded group size, and each run
+        # skips the calls recorded on groups of another size.
+        from doolyprof.profiler.comm_args import parse_comm_args
+        group_sizes = sorted({int(parse_comm_args(op.hierarchy.anchor.args.get('comm_args')).get('world_size')
+                                  or args.tp) for op in models[0].collective_ops} - {1})
+        visible = torch.cuda.device_count()
+        for comm_world in group_sizes:
+            if comm_world > visible:
+                print(f"[WARN] Calls recorded on {comm_world}-rank groups are not profiled: "
+                      f"{visible} GPU(s) visible (--gpu)")
+                continue
+            run_comm_profiler(
+                models=models,
+                dtype_str=args.dtype,
+                tp_size=comm_world,
+                db_path=args.db_path,
+                overwrite=args.overwrite_comm,
+                profile_method=args.profile_method,
+                use_cuda_graph=not args.no_cuda_graph_comm,  # Default True unless disabled
+                comm_timing=args.comm_timing,
+            )
     
     elapsed_s = time.perf_counter() - start_time    
     print(f"Profiling completed in {elapsed_s:.2f}s")

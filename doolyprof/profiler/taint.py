@@ -28,6 +28,10 @@ class TaintDimension:
     dim_type: DimensionType
     value: int  # Actual value from trace
     components: Optional[Dict[str, int]] = None  # For MIX: {taint_name: quantity}
+    # A batch size plus a constant ("NUM_REQS+1(6)": query_start_loc /
+    # cu_seqlens of 5 requests): the dim follows its sweep axis at
+    # sweep value + offset.
+    offset: int = 0
 
 
 @dataclass
@@ -36,11 +40,18 @@ class TaintInput:
     dimensions: List[TaintDimension]
 
 
-_DIM_RE = re.compile(r'([A-Za-z_?]+)\((\d+)\)(?:\[hist:([^\]]*)\])?')
+_DIM_RE = re.compile(r'([A-Za-z_?]+)([+-]\d+)?\((\d+)\)(?:\[hist:([^\]]*)\])?')
+_OFFSET_RE = re.compile(r'(.*?)([+-]\d+)?')
+
+
+def split_label_offset(label: str):
+    """('NUM_REQS', 1) for 'NUM_REQS+1'; (label, 0) for a label without one."""
+    base, off = _OFFSET_RE.fullmatch(label).groups()
+    return base, int(off or 0)
 _LABEL_TO_TYPE = {t.value: t for t in DimensionType}
 
 
-def _make_dimension(label: str, value: int, hist: str) -> TaintDimension:
+def _make_dimension(label: str, value: int, hist: str, offset: str = "") -> TaintDimension:
     """Map one traced label to a TaintDimension.
 
     ``MAX_<label>`` folds onto its base type (MAX_NUM_TOKS -> NUM_TOKENS).
@@ -52,6 +63,9 @@ def _make_dimension(label: str, value: int, hist: str) -> TaintDimension:
     """
     base = label[4:] if label.startswith("MAX_") else label
     dim_type = _LABEL_TO_TYPE.get(base, DimensionType.MODEL_CONFIG)
+    # the offset only means something on a swept axis; elsewhere the traced
+    # size is the fixed size
+    off = int(offset or 0) if dim_type in (DimensionType.NUM_TOKENS, DimensionType.NUM_REQUESTS) else 0
     components = None
     if dim_type == DimensionType.MIX:
         components = {}
@@ -63,7 +77,7 @@ def _make_dimension(label: str, value: int, hist: str) -> TaintDimension:
                 components[parts[0]] = int(parts[1])
             elif parts[0].isdigit():        # qty:taint (legacy)
                 components[parts[1]] = int(parts[0])
-    return TaintDimension(dim_type, value, components)
+    return TaintDimension(dim_type, value, components, off)
 
 
 def parse_taint_string(taint_name: str) -> List[TaintInput]:
@@ -109,8 +123,8 @@ def parse_taint_string(taint_name: str) -> List[TaintInput]:
         # than a fixed list of labels, so no dimension is dropped and the
         # result stays aligned with the traced shape; the label is mapped to a
         # DimensionType afterwards.
-        for label, value, hist in _DIM_RE.findall(input_str):
-            dimensions.append(_make_dimension(label, int(value), hist))
+        for label, offset, value, hist in _DIM_RE.findall(input_str):
+            dimensions.append(_make_dimension(label, int(value), hist, offset))
 
         taint_inputs.append(TaintInput(dimensions=dimensions))
 
