@@ -29,7 +29,7 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
 
     # Import comm_profiler (which doesn't set VLLM_FAKE_TP)
     from doolyprof.run.comm_profiler import CommProfiler, CommProfilingConfig
-    from doolyprof.profiler.utils.topology import machine_topology
+    from doolyprof.profiler.utils.topology import group_topology, group_link_warning
 
     DTYPE_MAP = {
         "float32": torch.float32,
@@ -53,7 +53,12 @@ def comm_profiler_worker(model_name, collective_ops, dtype_str, tp_size, db_path
         comm_profiler.profile_send_recv_bool = True
 
     # Check if we should profile based on existing data
-    topology = machine_topology()
+    # The label for the group the calls are replayed on: the first tp_size visible GPUs
+    topology = group_topology(tp_size)
+    print(f"[WORKER] Topology for {tp_size}-GPU groups: {topology}")
+    warning = group_link_warning(tp_size)
+    if warning:
+        print(f"[WARN] {warning}")
     if comm_profiler.should_profile(tp_size, overwrite=overwrite, topology=topology) or profile_send_recv:
         comm_profiler.profile(model_name, dtype_str, comm_config, tp_size, collective_backend, topology)
         comm_profiler.save_to_db(overwrite=overwrite)

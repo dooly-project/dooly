@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from vllm.distributed import tensor_model_parallel_all_reduce, tensor_model_parallel_all_gather
-from doolyprof.profiler.utils.topology import machine_topology
+from doolyprof.profiler.utils.topology import group_topology
 from vllm.distributed.parallel_state import get_tp_group
 
 # Profiling configuration
@@ -541,8 +541,8 @@ class CommProfiler:
     def should_profile(self, tp_size, overwrite=False, topology=None):
         """Check if we should profile based on existing data and overwrite flag.
 
-        ``topology`` is the label the measurements are stored under (machine_topology() by default)."""
-        topology = topology or machine_topology()
+        ``topology`` is the label the measurements are stored under (group_topology(tp_size) by default)."""
+        topology = topology or group_topology(tp_size)
         if overwrite:
             print(f"[COMM] Overwrite mode enabled - will re-profile all operations with {self.profile_method}")
             return True
@@ -603,11 +603,14 @@ class CommProfiler:
         print(f"\n[COMM] Profiling complete. Collected {len(self.results)} measurements with {self.profile_method}")
 
     def save_to_db(self, tp_size=None, backend="NCCL", topology=None, overwrite=False):
-        """Save profiling results to database, under ``topology`` (machine_topology() by default)."""
-        topology = topology or machine_topology()
+        """Save profiling results to database, under ``topology`` (group_topology() by default) and
+        the size of the group each result was measured on (its own tp_size, else ``tp_size``)."""
         if not hasattr(self, 'results') or not self.results:
             print("[COMM] No results to save")
             return
+        sizes = {result.get('tp_size') or tp_size for result in self.results}
+        if None in sizes:
+            raise ValueError("save_to_db: results without a tp_size and no tp_size given")
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -620,7 +623,7 @@ class CommProfiler:
                     WHERE operation = ? AND topology = ? AND tp_size = ?
                     AND size_bytes = ? AND dim_param IS ? AND num_dims = ?
                 """, (
-                    result['operation'], topology, tp_size or 4,
+                    result['operation'], topology or group_topology(result.get('tp_size') or tp_size), result.get('tp_size') or tp_size,
                     result['size_bytes'], result.get('dim_param'), result.get('num_dims', 2)
                 ))
 
@@ -633,7 +636,7 @@ class CommProfiler:
                      dim_param, num_dims, latency_ms)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    result['operation'], topology, backend, tp_size or 4,
+                    result['operation'], topology or group_topology(result.get('tp_size') or tp_size), backend, result.get('tp_size') or tp_size,
                     result['size_bytes'], result['dtype'],
                     result.get('dim_param'), result.get('num_dims', 2),
                     result['latency_ms']
@@ -647,7 +650,7 @@ class CommProfiler:
                     AND size_bytes = ? AND dim_param IS ? AND num_dims = ?
                 """, (
                     result['latency_ms'],
-                    result['operation'], topology, tp_size or 4,
+                    result['operation'], topology or group_topology(result.get('tp_size') or tp_size), result.get('tp_size') or tp_size,
                     result['size_bytes'], result.get('dim_param'), result.get('num_dims', 2)
                 ))
 

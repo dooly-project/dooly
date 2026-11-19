@@ -2,7 +2,7 @@
 
     python -m doolyprof.cli run --model M --out DIR [--tp N] [--dp N] [--enable-expert-parallel]
                                 [--attention-backend B] [--gpu-memory-cap F] [--max-batch-size N]
-                                [--max-seq-len N] [--tracer-args "..."] [--profiler-args "..."]
+                                [--max-seq-len N] [--profile-comm] [--tracer-args=...] [--profiler-args=...]
     python -m doolyprof.cli trace   <run-tracer.py arguments>
     python -m doolyprof.cli profile <run-profiler.py arguments>
     python -m doolyprof.cli test    [suite ...]
@@ -40,13 +40,30 @@ def _script(path, args, log=None):
 
 
 def _visible_gpus():
-    """The GPUs this process sees, as the scripts' --gpu value: '0', '0,1', ..."""
+    """The GPUs this process sees, as the scripts' --gpu value: CUDA_VISIBLE_DEVICES when it is
+    set (docker/dooly-docker.sh sets it to the order its GPUs were chosen in), else '0', '0,1', ..."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible:
+        return visible
     try:
         import torch
         n = torch.cuda.device_count()
     except Exception:  # noqa: BLE001
         n = 0
     return ",".join(str(i) for i in range(max(n, 1)))
+
+
+def _comm_rows(db):
+    """'<rows> on <topology> x<group size>, ...' from the run's coll_op_results."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(db)
+        got = con.execute("SELECT topology, tp_size, COUNT(*) FROM coll_op_results "
+                          "GROUP BY topology, tp_size ORDER BY tp_size").fetchall()
+        con.close()
+    except sqlite3.Error:
+        return ""
+    return ", ".join(f"{n} on {topo} x{size}" for topo, size, n in got)
 
 
 def cmd_run(argv):
@@ -64,18 +81,24 @@ def cmd_run(argv):
     p.add_argument("--max-seq-len", type=int, default=128)
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--tracer-args", default="", help="extra run-tracer.py arguments, one string")
-    p.add_argument("--profiler-args", default="", help="extra run-profiler.py arguments, one string")
+    p.add_argument("--profiler-args", default="",
+                   help="extra run-profiler.py arguments, one string (--profiler-args='--x 1': with '=' when it "
+                        "starts with '-')")
+    p.add_argument("--profile-comm", action="store_true",
+                   help="also measure the trace's collectives on real groups of the GPUs this run sees "
+                        "(run-profiler.py --profile-comm; groups larger than that are skipped)")
     a = p.parse_args(argv)
 
     out = os.path.abspath(a.out)
     os.makedirs(os.path.join(out, "trace"), exist_ok=True)
-    gpu = _visible_gpus()
+    gpu = _visible_gpus()  # the tracer runs on the first (TP > 1 is emulated), the profiler on all
     par = ["--tp", str(a.tp), "--dp", str(a.dp)] + (["--enable-expert-parallel"] if a.enable_expert_parallel else [])
     cap = ["--gpu-memory-cap", str(a.gpu_memory_cap)] if a.gpu_memory_cap is not None else []
 
     t0 = time.time()
     rc = _script(TRACER, ["--model", a.model] + par + ["--attention-backend", a.attention_backend,
-                 "--trace_dir", os.path.join(out, "trace"), "--gpu", gpu] + cap + shlex.split(a.tracer_args),
+                 "--trace_dir", os.path.join(out, "trace"), "--gpu", gpu.split(",")[0]] + cap
+                 + shlex.split(a.tracer_args),
                  log=os.path.join(out, "trace.log"))
     traces = sorted(glob.glob(os.path.join(out, "trace", "*.json")))
     if rc != 0 or not traces:
@@ -89,12 +112,18 @@ def cmd_run(argv):
                  "--profile-output", os.path.join(out, "profile"), "--dtype", a.dtype,
                  "--attention-backend", a.attention_backend, "--max-batch-size", str(a.max_batch_size),
                  "--max-seq-len", str(a.max_seq_len), "--gpu", gpu,
-                 "--db-path", os.path.join(out, "profile.db")] + cap + shlex.split(a.profiler_args), log=log)
+                 "--db-path", os.path.join(out, "profile.db")] + cap + (["--profile-comm"] if a.profile_comm else [])
+                 + shlex.split(a.profiler_args), log=log)
     text = open(log, errors="replace").read()
     rows = re.findall(r"Wrote (\d+) results", text)
     unresolved = text.count("no working parent")
+    comm = ""
+    if a.profile_comm:
+        skipped = re.findall(r"Calls recorded on (\d+)-rank groups are not profiled", text)
+        comm = ", collective measurements: " + (_comm_rows(os.path.join(out, "profile.db")) or "none")
+        comm += f" (skipped {'/'.join(skipped)}-rank groups)" if skipped else ""
     print(f"[dooly] profile exit {rc} in {time.time() - t0:.0f}s: "
-          f"{rows[-1] if rows else 0} result rows, {unresolved} ops without a working parent", flush=True)
+          f"{rows[-1] if rows else 0} result rows, {unresolved} ops without a working parent{comm}", flush=True)
     return rc or (1 if unresolved else 0)
 
 

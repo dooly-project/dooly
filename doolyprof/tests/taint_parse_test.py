@@ -476,6 +476,138 @@ def test_machine_topology_prefers_the_environment():
             os.environ["DOOLY_TOPOLOGY"] = saved
 
 
+# nvidia-smi topo -m on a machine of NVLink pairs (A100 PCIe with bridges) and on a PCIe-only one
+_TOPO_NV_PAIRS = (
+    "\t\x1b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\x1b[0m\n"
+    "GPU0\t X \tNV12\tSYS\tSYS\tNODE\t0,2,4\t0\t\tN/A\n"
+    "GPU1\tNV12\t X \tSYS\tSYS\tNODE\t0,2,4\t0\t\tN/A\n"
+    "GPU2\tSYS\tSYS\t X \tNV12\tSYS\t1,3,5\t1\t\tN/A\n"
+    "GPU3\tSYS\tSYS\tNV12\t X \tSYS\t1,3,5\t1\t\tN/A\n"
+    "NIC0\tNODE\tNODE\tSYS\tSYS\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n"
+    "  NV#  = Connection traversing a bonded set of # NVLinks\n")
+_TOPO_PCIE = (
+    "\t\x1b[4mGPU0\tGPU1\tGPU2\tGPU3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\x1b[0m\n"
+    "GPU0\t X \tPIX\tNODE\tNODE\t0-95\t0\t\tN/A\n"
+    "GPU1\tPIX\t X \tNODE\tNODE\t0-95\t0\t\tN/A\n"
+    "GPU2\tNODE\tNODE\t X \tPIX\t0-95\t0\t\tN/A\n"
+    "GPU3\tNODE\tNODE\tPIX\t X \t0-95\t0\t\tN/A\n")
+
+
+def test_gpu_pick_takes_the_best_linked_free_gpus():
+    # the docker wrapper took the first free GPUs, so a 2-rank collective could be
+    # measured on GPUs of two different NVLink pairs and stored as NVLink latencies
+    from doolyprof.profiler.utils.topology import parse_topo_matrix, pick_gpus, same_class
+    links = parse_topo_matrix(_TOPO_NV_PAIRS)
+    assert set(links) == {0, 1, 2, 3} and links[0][1] == "NV12" and links[1][2] == "SYS", links
+    assert pick_gpus(2, [0, 1, 2, 3], links) == ([0, 1], "NV12", "NV12")
+    assert pick_gpus(2, [1, 2, 3], links) == ([2, 3], "NV12", "NV12")   # not 1,2: the free pair
+    chosen, link, best = pick_gpus(2, [1, 2], links)
+    assert (chosen, link, best) == ([1, 2], "SYS", "NV12") and not same_class(link, best)
+    assert pick_gpus(4, [0, 1, 2, 3], links) == ([0, 1, 2, 3], "SYS", "SYS")
+    assert pick_gpus(4, [0, 1, 2], links) is None
+    assert pick_gpus(1, [3], links) == ([3], "-", "-")
+    pcie = parse_topo_matrix(_TOPO_PCIE)
+    assert pick_gpus(2, [1, 2, 3], pcie) == ([2, 3], "PIX", "PIX")     # one PCIe switch over NODE
+    chosen, link, best = pick_gpus(3, [0, 1, 2, 3], pcie)
+    assert link == "NODE" and same_class(link, best) and chosen[:2] in ([0, 1], [2, 3]), chosen
+    # the first k GPUs of the container form the k-rank group: pairs placed first
+    crossed = {0: {1: "SYS", 2: "NV4", 3: "SYS"}, 1: {0: "SYS", 2: "SYS", 3: "NV4"},
+               2: {0: "NV4", 1: "SYS", 3: "SYS"}, 3: {0: "SYS", 1: "NV4", 2: "SYS"}}
+    assert pick_gpus(4, [0, 1, 2, 3], crossed)[0] == [0, 2, 1, 3]
+
+
+def test_gpu_pick_command_line_for_the_docker_wrapper():
+    import subprocess
+    from doolyprof.profiler.utils import topology
+    run = lambda *a: subprocess.run([sys.executable, "-I", topology.__file__, "pick", *a],  # noqa: E731
+                                    input=_TOPO_NV_PAIRS, capture_output=True, text=True)
+    out = run("2", "1,2,3")
+    assert out.returncode == 0 and out.stdout.split() == ["2,3", "NV12", "NV12", "1"], out
+    out = run("2", "1,2")
+    assert out.returncode == 0 and out.stdout.split() == ["1,2", "SYS", "NV12", "0"], out
+    assert run("3", "0,1").returncode == 1
+    out = subprocess.run([sys.executable, "-I", topology.__file__, "link", "1,2"],   # --devices 1,2
+                         input=_TOPO_NV_PAIRS, capture_output=True, text=True)
+    assert out.returncode == 0 and out.stdout.split() == ["SYS", "NV12", "0"], out
+
+
+class _FakeNvml:
+    """NVML of a container: ``gpus`` maps each GPU (its PCI bus id) to what its NVLink links reach
+    (bus ids, or "switch"); ``visible`` are the GPUs passed into the container."""
+    NVML_FEATURE_ENABLED, NVML_NVLINK_MAX_LINKS, NVML_NVLINK_DEVICE_TYPE_SWITCH = 1, 4, 2
+    NVML_P2P_CAPS_INDEX_NVLINK, NVML_P2P_STATUS_OK = 3, 0
+
+    class NVMLError(Exception):
+        pass
+
+    def __init__(self, gpus, visible, name="NVIDIA A100 80GB PCIe"):
+        self.gpus, self.visible, self.name = gpus, visible, name
+
+    def nvmlInit(self): pass
+    def nvmlShutdown(self): pass
+    def nvmlDeviceGetCount(self): return len(self.visible)
+    def nvmlDeviceGetHandleByIndex(self, i): return self.visible[i]
+    def nvmlDeviceGetName(self, h): return self.name
+
+    def nvmlDeviceGetNvLinkState(self, h, link):
+        if link >= len(self.gpus[h]):
+            raise self.NVMLError("no such link")
+        return 1
+
+    def nvmlDeviceGetNvLinkRemoteDeviceType(self, h, link):
+        return 2 if self.gpus[h][link] == "switch" else 0
+
+    def nvmlDeviceGetNvLinkRemotePciInfo(self, h, link):
+        import types
+        return types.SimpleNamespace(busId=self.gpus[h][link])
+
+    def nvmlDeviceGetP2PStatus(self, a, b, cap):
+        both_switched = "switch" in self.gpus[a] and "switch" in self.gpus[b]
+        return 0 if b in self.gpus[a] or both_switched else 5
+
+
+def test_group_topology_from_the_links_of_the_group():
+    # the label said "-nvlink" whenever the first GPU had an NVLink link, also for a pair
+    # of GPUs that are not linked to each other and for a 4-GPU group spanning two pairs
+    from doolyprof.profiler.utils import topology
+    pairs = {"17": ["65", "65"], "65": ["17", "17"], "CA": ["E3", "E3"], "E3": ["CA", "CA"]}
+    saved = {k: os.environ.pop(k, None) for k in ("DOOLY_TOPOLOGY", "CUDA_VISIBLE_DEVICES")}
+    saved_nvml = sys.modules.get("pynvml")
+
+    def label(gpus, visible, size, name="NVIDIA A100 80GB PCIe"):
+        sys.modules["pynvml"] = _FakeNvml(gpus, visible, name)
+        topology._links.cache_clear(); topology._derived_topology.cache_clear()
+        return topology.group_topology(size), topology.group_link_warning(size)
+
+    nv, pcie = "nvidia-a100-80gb-pcie-nvlink", "nvidia-a100-80gb-pcie"
+    try:
+        assert label(pairs, ["17", "65"], 2) == (nv, None)
+        got, warning = label(pairs, ["65", "CA"], 2)             # two GPUs of different pairs
+        assert got == pcie and warning and pcie in warning, (got, warning)
+        assert label(pairs, ["65"], 2) == (nv, None)            # one-GPU compute container
+        assert label(pairs, ["65"], 4) == (pcie, None)          # a 4-GPU group spans two pairs
+        assert label(pairs, ["17", "65", "CA", "E3"], 4) == (pcie, None)
+        assert label(pairs, ["17", "65", "CA", "E3"], 2) == (nv, None)   # ranks 0, 1: a pair
+        assert label(pairs, ["65"], None)[0] == nv
+        switched = {b: ["switch"] * 2 for b in "ABCDEFGH"}
+        assert label(switched, ["C"], 8) == (nv, None)          # an NVLink switch: every GPU
+        assert label(switched, list("ABCDEFGH"), 8) == (nv, None)
+        rtx = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+        assert label({"1": [], "2": []}, ["1", "2"], 2, rtx)[0] == "nvidia-rtx-pro-6000-blackwell-server-edition-pcie"
+        os.environ["DOOLY_TOPOLOGY"] = "mew1"
+        assert label(pairs, ["65", "CA"], 2) == ("mew1", None)
+    finally:
+        os.environ.pop("DOOLY_TOPOLOGY", None)
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+        if saved_nvml is None:
+            sys.modules.pop("pynvml", None)
+        else:
+            sys.modules["pynvml"] = saved_nvml
+        topology._links.cache_clear(); topology._derived_topology.cache_clear()
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

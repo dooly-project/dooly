@@ -1697,8 +1697,10 @@ class Profiler:
 
                 # Write collective operations
                 import hashlib
-                from doolyprof.profiler.utils.topology import machine_topology
-                topology = machine_topology()  # DOOLY_TOPOLOGY, else derived from the GPUs
+                # Each collective is stored under the label for the size of the group it
+                # ran on (DOOLY_TOPOLOGY, else derived from the GPUs), the label the comm
+                # profiler measures that group size under.
+                from doolyprof.profiler.utils.topology import group_topology
 
                 # Aggregate counts for each unique collective operation signature
                 # Key: (operation_name, dim_param, num_dims), Value: total_count
@@ -1762,6 +1764,7 @@ class Profiler:
                 # Now insert aggregated collectives
                 for key, total_count in collective_counts.items():
                     op_name, dim_param, num_dims, group_size = key
+                    topology = group_topology(group_size)
 
                     # Generate signature (MUST match comm_profiler logic: its
                     # tp_size is the size of the group it replayed the call on)

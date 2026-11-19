@@ -14,7 +14,7 @@ os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 from vllm import LLM
 from doolyprof.profiler.utils.gpu_memory import engine_memory_fraction
-from doolyprof.profiler.utils.topology import machine_topology
+from doolyprof.profiler.utils.topology import group_topology
 from vllm.distributed.parallel_state import get_tp_group
 
 # Dtype to bytes mapping
@@ -510,8 +510,8 @@ class CommProfiler:
     def should_profile(self, tp_size, overwrite=False, topology=None):
         """Check if we should profile based on existing data and overwrite flag.
 
-        ``topology`` is the label the measurements are stored under (machine_topology() by default)."""
-        topology = topology or machine_topology()
+        ``topology`` is the label the measurements are stored under (group_topology(tp_size) by default)."""
+        topology = topology or group_topology(tp_size)
         if overwrite:
             print("[COMM] Overwrite mode enabled - will re-profile all operations")
             return True
