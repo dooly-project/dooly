@@ -1,6 +1,7 @@
-# DoolyProf on vLLM 0.33.
+# DoolyProf on vLLM 0.33. Published as jhkjames1110/doolyprof:latest (docker/README.md); to build it:
 #
 #   docker build -f docker/Dockerfile -t doolyprof:vllm0.33 .        (from the repository root)
+#   DOOLY_IMAGE=doolyprof:vllm0.33 docker/dooly-docker.sh test       (to use it)
 #
 # - CUDA 13.0 toolkit, not only the runtime: FlashInfer compiles kernels the first time a shape
 #   needs them and needs nvcc and the CUDA headers; Triton builds its launcher with gcc.

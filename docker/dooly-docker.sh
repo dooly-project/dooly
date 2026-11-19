@@ -1,9 +1,10 @@
 #!/bin/bash
 # dooly-docker.sh [--gpus N | --devices LIST] <dooly command> [args...]: run the DoolyProf image on
 # N GPUs (default 1) that no other user is on, or on the GPUs LIST names (host indices as nvidia-smi
-# shows them, e.g. 2,3), e.g.
+# shows them, e.g. 2,3). See docker/README.md. e.g.
 #
-#   docker/dooly-docker.sh run --model meta-llama/Llama-3.1-8B --out /out/llama
+#   docker/dooly-docker.sh download Qwen/Qwen3-0.6B         (config and tokenizer files, no GPU)
+#   docker/dooly-docker.sh run --model Qwen/Qwen3-0.6B --out /out/qwen3-0.6b
 #   docker/dooly-docker.sh --gpus 2 run --model Qwen/Qwen3-8B --tp 2 --out /out/qwen3 --profile-comm
 #   docker/dooly-docker.sh --devices 2,3 run --model Qwen/Qwen3-8B --tp 2 --out /out/qwen3 --profile-comm
 #   docker/dooly-docker.sh test
@@ -23,14 +24,18 @@
 # without it the first free GPUs are taken. --devices takes the GPUs named, in that order: it waits
 # while one of them is in use or locked, and says when they are linked worse than the machine's best.
 #
-#   DOOLY_IMAGE  image (doolyprof:vllm0.33)       DOOLY_OUT    host folder mounted at /out ($PWD/dooly-out)
+#   DOOLY_IMAGE  image (jhkjames1110/doolyprof:latest)  DOOLY_OUT  host folder mounted at /out ($PWD/dooly-out)
 #   HF_CACHE     host Hugging Face cache, at /hf  DOOLY_CACHE  host folder for FlashInfer / Triton / vLLM
 #                ($HOME/.cache/huggingface)                    caches, the container's HOME ($HOME/.cache/dooly-docker)
 #   DOCKER       docker command (docker); "sudo docker" where your account is not in the docker group
+#   HF_TOKEN     passed to download, for gated models (or a token saved by `hf auth login` in HF_CACHE)
 #   DOOLY_*      every other DOOLY_ variable is passed into the container (e.g. DOOLY_TOPOLOGY, the
-#                label collective measurements are stored under; DOOLY_CAP_MAX)
+#                label collective measurements are stored under)
+#
+# The image works offline (HF_HUB_OFFLINE=1): `download` fetches a model's config and tokenizer files
+# into HF_CACHE first. Weights are never needed: the tracer and profiler load dummy weights.
 set -u
-IMAGE=${DOOLY_IMAGE:-doolyprof:vllm0.33}
+IMAGE=${DOOLY_IMAGE:-jhkjames1110/doolyprof:latest}
 DOCKER=${DOCKER:-docker}
 OUT=${DOOLY_OUT:-$PWD/dooly-out}
 HF=${HF_CACHE:-$HOME/.cache/huggingface}
@@ -44,6 +49,38 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
+
+if [ "${1:-}" = "download" ]; then  # model config and tokenizer files into $HF; needs no GPU
+  shift
+  [ $# -gt 0 ] || { echo "usage: dooly-docker.sh download MODEL [MODEL ...]" >&2; exit 2; }
+  mkdir -p "$HF" "$CACHE"
+  token=(); [ -n "${HF_TOKEN:-}" ] && token=(-e HF_TOKEN)
+  rc=0
+  for model in "$@"; do
+    echo "[dooly-docker] downloading $model into $HF (config and tokenizer files; no weights)" >&2
+    $DOCKER run --rm --user "$(id -u):$(id -g)" -e HOME=/cache -e HF_HOME=/hf -e HF_HUB_OFFLINE=0 \
+      ${token[@]+"${token[@]}"} -v "$HF":/hf -v "$CACHE":/cache --entrypoint hf "$IMAGE" download "$model" \
+      --exclude "*.safetensors" --exclude "*.bin" --exclude "*.pt" --exclude "*.pth" --exclude "*.ckpt" \
+      --exclude "*.gguf" --exclude "*.h5" --exclude "*.msgpack" --exclude "*.onnx" >&2 || rc=1
+  done
+  [ $rc = 0 ] && echo "[dooly-docker] done" >&2
+  exit $rc
+fi
+
+if [ "${1:-}" = "run" ]; then  # the image is offline: say so before a GPU is claimed for nothing
+  model="" prev=""
+  for a in "$@"; do
+    case $a in --model=*) model=${a#--model=} ;; esac
+    [ "$prev" = "--model" ] && model=$a
+    prev=$a
+  done
+  if [[ $model =~ ^[^/.][^/]*/[^/]+$ ]] && [ ! -d "$HF/hub/models--${model//\//--}" ]; then
+    echo "[dooly-docker] $model is not in $HF (the image works offline): run" >&2
+    echo "  docker/dooly-docker.sh download $model" >&2
+    exit 2
+  fi
+fi
+
 if [ -n "$DEVICES" ]; then
   count=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
   seen=,

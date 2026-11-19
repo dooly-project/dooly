@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# publish.sh — one-way, channel-aware publish of the doolyprof package from the
-# private dev repo (doolyprof-dev) into the public release repo (doolyprof-public).
+# publish.sh — one-way, channel-aware publish of the doolyprof package and the
+# docker/ folder (image recipe, runner script and docs) from the private dev repo
+# (doolyprof-dev) into the public release repo (doolyprof-public).
 #
 # A "channel" is a (dev-branch -> public-branch) pair. The script publishes the
 # channel matching whatever branch doolyprof-dev is currently on, and REFUSES to
@@ -37,6 +38,7 @@ declare -A CHANNELS=(
 # Paths (relative to repo root, trailing slash) to publish. Synced with --delete.
 PUBLISH_PATHS=(
   "doolyprof/"
+  "docker/"
 )
 
 EXCLUDES=(
