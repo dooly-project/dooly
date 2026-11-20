@@ -97,6 +97,56 @@ The first run on a new GPU is slower: FlashInfer and Triton compile kernels and 
 
 ---
 
+## Example workloads
+
+`docker/example.sh` profiles three real models, one after another, each with a different
+attention backend:
+
+| Name | Model | What it shows | Attention backend |
+|---|---|---|---|
+| `dense` | `meta-llama/Llama-3.1-8B`, tensor parallel 2 | A dense model split in two. With two or more GPUs it also measures the all-reduces between the two ranks. | `FLASH_ATTN` |
+| `moe` | `Qwen/Qwen3-30B-A3B` | A mixture of experts (128 experts, 8 used per token). | `FLASHINFER` |
+| `hetero` | `openai/gpt-oss-20b` | Layers that alternate sliding-window and full attention. | `TRITON_ATTN` |
+
+You need an 80 GB GPU (for Qwen3-30B-A3B), plus a second GPU for Llama's communication.
+Llama is gated: accept its license at https://huggingface.co/meta-llama/Llama-3.1-8B and give
+your token for the download (see [below](#models-that-need-a-hugging-face-login)):
+
+```bash
+HF_TOKEN=hf_xxx docker/example.sh      # all three: ~12 minutes the first time, ~7 after
+docker/example.sh moe hetero           # just these two (no token needed)
+```
+
+It ends with a summary like this one (RTX PRO 6000 Blackwell; parts left out as `...`). The
+first run on a machine takes about 5 minutes longer while FlashInfer and Triton compile kernels.
+
+```
+=== summary (./dooly-out/example)
+dense   meta-llama/Llama-3.1-8B  253s   ok
+moe     Qwen/Qwen3-30B-A3B       77s    ok
+hetero  openai/gpt-oss-20b       66s    ok
+
+dense: 12 operations to profile, 254 result rows; calls per forward pass:
+    aten::linear                                 129   5 kinds: 32 + 32 + 32 + 32 + 1
+    _C::fused_add_rms_norm                        64
+    Attention                                     32
+    ...
+    all_reduce (group of 2)                       65   collective
+    collective latencies measured: 3040 on nvidia-rtx-pro-6000-blackwell-server-edition-pcie, groups of 2
+...
+hetero: 13 operations to profile, 384 result rows; calls per forward pass:
+    ...
+    Attention                                     24   2 kinds: 12 + 12
+    MoERunner                                     24
+```
+
+Operations with the same name but different shapes or settings are profiled separately and
+shown as *kinds*. Llama's four linear layers per block are four kinds (plus the output layer);
+gpt-oss's attention comes in two kinds, sliding-window and full, 12 layers each. Each model's
+results are in `dooly-out/example/<name>/`, laid out as described next.
+
+---
+
 ## What you get
 
 `/out/...` inside the container is `./dooly-out/...` on your machine. A run folder holds:

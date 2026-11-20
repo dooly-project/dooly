@@ -32,7 +32,15 @@ docker/dooly-docker.sh run --model MODEL --out /out/NAME          # 1 GPU
 docker/dooly-docker.sh --gpus N run --model MODEL --tp N --out /out/NAME --profile-comm
 docker/dooly-docker.sh --devices 2,3 run ...                      # exact host GPUs, in this order
 docker/dooly-docker.sh test
+docker/example.sh [dense] [moe] [hetero] [-- RUN-OPTIONS]        # example workloads, see below
 ```
+
+`docker/example.sh` runs `meta-llama/Llama-3.1-8B` at `--tp 2` (`FLASH_ATTN`; on 2 GPUs with
+`--profile-comm` when the machine has two), `Qwen/Qwen3-30B-A3B` (`FLASHINFER`, needs an 80 GB GPU)
+and `openai/gpt-oss-20b` (`TRITON_ATTN`), downloading configs it does not find in `HF_CACHE`.
+Llama is gated (needs `HF_TOKEN` unless already cached); run `moe hetero` if no token is available.
+It exits 0 only if every model's summary row says `ok`; results are in `$DOOLY_OUT/example/NAME/`,
+each run's output in `$DOOLY_OUT/example/NAME.log`.
 
 - `--out` must start with `/out/`; it maps to `$DOOLY_OUT` (default `./dooly-out`) on the host.
 - Pass extra stage arguments with the `=` form: `--profiler-args=--overwrite`. The space form
@@ -54,6 +62,7 @@ Measured on one RTX PRO 6000 Blackwell; an A100 is similar.
 | `run`, small model (Qwen3-0.6B) | ~3 min first time, ~1.5 min after |
 | `run`, 8B model | 3-5 min |
 | `--profile-comm`, 2-4 GPUs | adds 2-8 min |
+| `example.sh`, all three | ~7 min with compiled kernels (dense ~4, moe ~1.5, hetero ~1); ~12 min the first time |
 | First run on a new GPU | add several minutes (kernel compilation, cached in `$DOOLY_CACHE`) |
 
 Run anything longer than ~2 minutes in the background and poll its output.
@@ -109,7 +118,7 @@ EOF
 |---|---|---|
 | `MODEL is not in ... (the image works offline)` (script, exit 2) | Not downloaded | `docker/dooly-docker.sh download MODEL`, then rerun |
 | `LocalEntryNotFoundError` / `outgoing traffic has been disabled` (`trace.log`) | Model missing from `$HF_CACHE`, or `HF_CACHE` points elsewhere than at download time | Download again with the same `HF_CACHE` |
-| `401` / `gated repo` (download) | Gated model | Need `HF_TOKEN` from the user |
+| `401` / `gated repo` (download), or `download failed (gated: ...)` (example.sh) | Gated model | Need `HF_TOKEN` from the user |
 | `waiting for N free GPU(s)` / `waiting for GPU(s) ...` (script, repeats every 60 s) | GPUs in use by others or locked | Wait, or tell the user. **Never** kill other processes or remove lock dirs you did not create. |
 | `waiting for N free GPUs linked by ...` | Only worse-connected GPUs are free | Wait, or `DOOLY_ANY_LINK=1` if the user accepts measurements on those links |
 | `trace failed (exit N)` (script) + vLLM error about the attention backend or head size (`trace.log`) | vLLM does not support that backend on this GPU/model | Retry with another `--attention-backend`; report which ones vLLM rejected |
