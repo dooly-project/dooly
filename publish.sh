@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# publish.sh — one-way, channel-aware publish of the doolyprof package and the
-# docker/ folder (image recipe, runner script and docs) from the private dev repo
-# (doolyprof-dev) into the public release repo (doolyprof-public).
+# publish.sh — one-way, channel-aware publish of the doolyprof and doolysim packages
+# and the docker/ folder (image recipe, runner script and docs) from the private dev
+# repo (dooly-dev) into the public release repo (dooly-public).
 #
 # A "channel" is a (dev-branch -> public-branch) pair. The script publishes the
-# channel matching whatever branch doolyprof-dev is currently on, and REFUSES to
-# run unless doolyprof-public is on the matching branch — so you can't cross
+# channel matching whatever branch dooly-dev is currently on, and REFUSES to
+# run unless dooly-public is on the matching branch — so you can't cross
 # wires (e.g. publish sglang content onto public main).
 #
 #   Channels:   main                   -> main
@@ -15,8 +15,8 @@
 # Publishing is a content copy only. This script NEVER commits or pushes: it
 # syncs the publishable paths into the public working tree and then stops, so
 # you can review `git diff` and commit/push yourself. Public-only files
-# (LICENSE, README.md, requirements.txt, .gitignore, example_traces/) are never
-# touched; only PUBLISH_PATHS are synced.
+# (LICENSE, README.md, requirements.txt, .gitignore, example_traces/,
+# example_workload/) are never touched; only PUBLISH_PATHS are synced.
 #
 # Usage:
 #   ./publish.sh                       # dry-run: show what WOULD change (default)
@@ -26,8 +26,8 @@
 set -euo pipefail
 
 # ---- config --------------------------------------------------------------
-SRC="${SRC:-$HOME/dooly-project/doolyprof-dev}"      # private source of truth
-DST="${DST:-$HOME/dooly-project/doolyprof-public}"   # public release repo
+SRC="${SRC:-$HOME/dooly-project/dooly-dev}"          # private source of truth
+DST="${DST:-$HOME/dooly-project/dooly-public}"       # public release repo
 
 # dev-branch -> public-branch channel map
 declare -A CHANNELS=(
@@ -38,6 +38,7 @@ declare -A CHANNELS=(
 # Paths (relative to repo root, trailing slash) to publish. Synced with --delete.
 PUBLISH_PATHS=(
   "doolyprof/"
+  "doolysim/"
   "docker/"
 )
 
@@ -123,7 +124,7 @@ if [ "$APPLY" -eq 1 ]; then
   git -C "$DST" status -s
   echo
   echo "    git -C $DST diff                                    # review changes"
-  echo "    git -C $DST add -A && git -C $DST commit -m 'Sync from doolyprof-dev ($SRC_BRANCH)'"
+  echo "    git -C $DST add -A && git -C $DST commit -m 'Sync from dooly-dev ($SRC_BRANCH)'"
   echo "    git -C $DST push origin $DST_BRANCH"
 else
   echo "(dry-run only — nothing changed. Lines above starting with '>f' / '*deleting' show what --apply would write.)"

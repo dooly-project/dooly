@@ -1,3 +1,4 @@
+# DoolyProf (doolyprof/, docker/ and the scripts at the repository root)
 /.claude/
 /__pycache__/
 /vllm_traces_tp/
@@ -18,6 +19,46 @@ hierarchy_output.json
 *.csv
 *.png
 *.pdf
-*.bak 
+*.bak
 *.yaml
 /workspaces/
+
+# DoolySim (doolysim/)
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Simulation outputs
+results/
+cache/
+core/cache/
+dataset/
+
+# Databases / large artifacts
+*.db-journal
+*.pkl
+
+# Local working dirs
+local/
+
+# CLAUDE / agent files
+.claude/
+CLAUDE.md
