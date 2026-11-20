@@ -137,12 +137,12 @@ files into `--cache-dir`.
 
 ### 2. Generate a workload
 
-`example_workload/openchat-1rps.jsonl` is a ready workload (100 requests at 1 request/s). To
+`examples/workload/openchat-1rps.jsonl` is a ready workload (100 requests at 1 request/s). To
 generate one from the openchat ShareGPT-4 dataset:
 
 ```bash
 python -m doolysim.tools.generate_openchat_sharegpt4_dataset \
-    --output example_workload/openchat-1rps.jsonl \
+    --output examples/workload/openchat-1rps.jsonl \
     --num-requests 100 \
     --arrival-rate 1.0 \
     --tokenizer meta-llama/Llama-3.1-8B \
@@ -161,7 +161,7 @@ the same from a local ShareGPT JSON file (`--sharegpt-path`).
 python -m doolysim.cli \
     --model meta-llama/Llama-3.1-8B \
     --backend FLASHINFER \
-    --load-dataset example_workload/openchat-1rps.jsonl
+    --load-dataset examples/workload/openchat-1rps.jsonl
 ```
 
 The simulator prints per-request latency, throughput, and aggregate metrics.
@@ -193,8 +193,9 @@ dooly/
 │   ├── cli.py          # `python -m doolysim.cli`
 │   └── estimator.py    # `python -m doolysim.estimator`
 ├── docker/             # Docker image recipe, runner script (dooly-docker.sh), example.sh, docs
-├── example_traces/     # example tainted traces (output of run-tracer)
-└── example_workload/   # example workload: openchat ShareGPT-4 at 1 request/s
+└── examples/
+    ├── traces/         # example tainted traces (output of run-tracer, input of run-profiler)
+    └── workload/       # example workload for DoolySim: openchat ShareGPT-4 at 1 request/s
 ```
 
 ## Citation
