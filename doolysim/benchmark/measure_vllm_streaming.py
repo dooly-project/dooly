@@ -65,6 +65,7 @@ def run_streaming_benchmark(
     requests: List[tuple],  # (request_id, prompt_token_ids, max_tokens, arrival_time)
     warmup: int = 0,
     verbose: bool = False,
+    profile_kernels: bool = False,
 ) -> tuple[List[RequestFuncOutput], float, dict]:
 
     engine = llm.llm_engine
@@ -166,6 +167,9 @@ def run_streaming_benchmark(
     print("Streaming-path warmup done.")
 
     print(f"Warm up done. Running real runs.")
+    if profile_kernels:
+        # Trace only the measured run; GPU kernel time per step is read from it afterwards
+        llm.start_profile()
     # tqdm
     pbar = tqdm(total=len(requests), desc="Processing requests")
     start_time = time.perf_counter()
@@ -325,8 +329,27 @@ def run_streaming_benchmark(
 
         # Record batch composition for this step (detailed)
         # IMPORTANT: Using scheduler.schedule() output for fair comparison with Dooly
+        # The step's batch as DoolySim's predictor reads it (doolysim.request.BatchConfig): each
+        # prefill or prefill chunk as [tokens scheduled, tokens already in the KV cache], and each
+        # decode as its KV cache size.
+        prefill_requests, decode_requests = [], []
+        if captured_sched_output:
+            for new_req in captured_sched_output.scheduled_new_reqs:
+                prefill_requests.append([captured_sched_output.num_scheduled_tokens.get(new_req.req_id, 0),
+                                         new_req.num_computed_tokens])
+            cached = captured_sched_output.scheduled_cached_reqs
+            for idx, req_id in enumerate(cached.req_ids):
+                if idx >= len(cached.num_computed_tokens):
+                    continue
+                if cached.num_output_tokens[idx] == 0:
+                    prefill_requests.append([captured_sched_output.num_scheduled_tokens.get(req_id, 0),
+                                             cached.num_computed_tokens[idx]])
+                else:
+                    decode_requests.append(cached.num_computed_tokens[idx])
         if total_tokens_scheduled > 0:
             step_batches.append({
+                "prefill_requests": prefill_requests,
+                "decode_requests": decode_requests,
                 "step_id": step_count,  # Match Dooly's field name
                 "sim_time_ms": (step_end - start_time) * 1000.0,  # step end time, matches dooly_batch convention
                 "elapsed_time_ms": step_duration * 1000.0,  # **Add actual step duration**
@@ -459,6 +482,8 @@ def run_streaming_benchmark(
 
     end_time = time.perf_counter()
     duration = end_time - start_time
+    if profile_kernels:
+        llm.stop_profile()
 
     return outputs, duration, step_batches
 
@@ -531,6 +556,9 @@ def main():
                        help="Export batch composition to separate JSON file")
     parser.add_argument("--verbose", action="store_true",
                        help="Verbose output")
+    parser.add_argument("--kernel-trace-dir", type=str, default=None,
+                       help="Absolute path: trace the measured run with vLLM's torch profiler into this "
+                            "directory, to read each step's GPU kernel time from it afterwards")
     parser.add_argument("--quantization", type=str, default=None,
                        choices=["fp8", "awq", "gptq"],
                        help="Optional quantization scheme. 'fp8' requires Hopper+. "
@@ -651,6 +679,17 @@ def main():
         )
     if args.quantization:
         llm_kwargs["quantization"] = args.quantization
+    if args.kernel_trace_dir:
+        # Kernels and the per-step execute_context annotations only: no stacks or shapes, which
+        # would make a trace of thousands of steps very large
+        llm_kwargs["profiler_config"] = {
+            "profiler": "torch",
+            "torch_profiler_dir": args.kernel_trace_dir,
+            "torch_profiler_with_stack": False,
+            "torch_profiler_record_shapes": False,
+            "torch_profiler_dump_cuda_time_total": False,
+            "ignore_frontend": True,
+        }
     llm = LLM(**llm_kwargs)
 
     # Load or generate requests
@@ -800,6 +839,7 @@ def main():
         warmup=2,
         requests=requests,
         verbose=args.verbose,
+        profile_kernels=bool(args.kernel_trace_dir),
     )
 
     # Sort outputs by start_time to match input_requests order
@@ -932,6 +972,8 @@ def main():
                 "running_count": step_batch["running_count"],
                 "finished_req_ids": step_batch["finished_req_ids"],
                 "preempted_req_ids": step_batch["preempted_req_ids"],
+                "prefill_requests": step_batch["prefill_requests"],
+                "decode_requests": step_batch["decode_requests"],
             })
 
         with open(args.batch_composition_output, 'w') as f:
