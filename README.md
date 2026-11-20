@@ -22,10 +22,11 @@ docker/dooly-docker.sh download Qwen/Qwen3-0.6B                          # confi
 docker/dooly-docker.sh run --model Qwen/Qwen3-0.6B --out /out/qwen3-0.6b  # results: ./dooly-out/qwen3-0.6b/profile.db
 ```
 
-`docker/example.sh` profiles three larger models: a dense Llama-3.1-8B at TP 2 together with
-its all-reduces, the Qwen3-30B-A3B mixture of experts, and gpt-oss-20b, whose layers alternate
-sliding-window and full attention. [docker/README.md](docker/README.md) explains every command,
-option and output; [docker/AGENTS.md](docker/AGENTS.md) is the version for coding agents.
+`docker/example.sh` profiles three larger models: the dense Qwen3.8-27B at TP 2 together with
+its all-reduces (three of every four of its layers use linear attention), the Qwen3-30B-A3B
+mixture of experts, and gpt-oss-20b, whose layers alternate sliding-window and full attention.
+[docker/README.md](docker/README.md) explains every command, option and output;
+[docker/AGENTS.md](docker/AGENTS.md) is the version for coding agents.
 
 ## Installation
 
