@@ -41,3 +41,9 @@ local/
 # CLAUDE / agent files
 .claude/
 CLAUDE.md
+
+# Simulation outputs (DoolySim)
+results/
+cache/
+core/cache/
+dataset/
