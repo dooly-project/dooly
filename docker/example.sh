@@ -2,17 +2,19 @@
 # example.sh [dense] [moe] [hetero] [-- RUN-OPTIONS]: trace and profile three example models with
 # docker/dooly-docker.sh, one after another (all three when none is named):
 #
-#   dense   meta-llama/Llama-3.1-8B   dense, tensor parallel 2, FLASH_ATTN. With two or more GPUs
-#                                     it also measures the all-reduces between the two ranks on
-#                                     two linked GPUs (--profile-comm); with one GPU, one rank only.
+#   dense   Qwen/Qwen3.8-27B          dense (no experts), tensor parallel 2, FLASH_ATTN; three of
+#                                     every four layers use linear attention (Gated DeltaNet), the
+#                                     fourth full attention. With two or more GPUs it also measures
+#                                     the all-reduces between the two ranks on two linked GPUs
+#                                     (--profile-comm); with one GPU, one rank only.
 #   moe     Qwen/Qwen3-30B-A3B        mixture of experts (128 experts, 8 per token), FLASHINFER
 #   hetero  openai/gpt-oss-20b        layers alternating sliding-window and full attention (also a
 #                                     mixture of experts), TRITON_ATTN: vLLM runs gpt-oss's
 #                                     attention sinks with Triton on A100 and Blackwell alike
 #
 # Each model's config and tokenizer are downloaded first unless already in HF_CACHE (no weights).
-# Llama is gated: accept its license on huggingface.co and set HF_TOKEN for the download. The
-# others need no login. Computation is profiled on one GPU (Qwen3-30B-A3B needs an 80 GB one).
+# None of the three is gated, so no Hugging Face login is needed. Computation is profiled on one
+# GPU (Qwen3-30B-A3B needs an 80 GB one).
 #
 # Results go to $DOOLY_OUT/example/NAME/ (default ./dooly-out/example/), each run's output to
 # $DOOLY_OUT/example/NAME.log. Each example starts from an empty folder and replaces its previous
@@ -33,7 +35,7 @@ HF=${HF_CACHE:-$HOME/.cache/huggingface}
 IMAGE=${DOOLY_IMAGE:-jhkjames1110/doolyprof:latest}
 DOCKER=${DOCKER:-docker}
 
-declare -A MODEL=([dense]="meta-llama/Llama-3.1-8B" [moe]="Qwen/Qwen3-30B-A3B" [hetero]="openai/gpt-oss-20b")
+declare -A MODEL=([dense]="Qwen/Qwen3.8-27B" [moe]="Qwen/Qwen3-30B-A3B" [hetero]="openai/gpt-oss-20b")
 declare -A WHAT=([dense]="dense, tensor parallel 2" [moe]="mixture of experts"
                  [hetero]="alternating sliding-window and full attention")
 declare -A GPUS=([dense]=1 [moe]=1 [hetero]=1)
@@ -63,8 +65,7 @@ for n in "${names[@]}"; do
   m=${MODEL[$n]}
   [ -d "$HF/hub/models--${m//\//--}" ] && continue
   if ! "$RUN" download "$m"; then
-    STATUS[$n]="download failed"
-    [[ $m == meta-llama/* ]] && STATUS[$n]+=" (gated: accept the license on huggingface.co/$m, then set HF_TOKEN)"
+    STATUS[$n]="download failed (a gated model needs its license accepted on huggingface.co/$m and HF_TOKEN)"
   fi
 done
 for n in "${names[@]}"; do

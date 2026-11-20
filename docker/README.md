@@ -104,17 +104,16 @@ attention backend:
 
 | Name | Model | What it shows | Attention backend |
 |---|---|---|---|
-| `dense` | `meta-llama/Llama-3.1-8B`, tensor parallel 2 | A dense model split in two. With two or more GPUs it also measures the all-reduces between the two ranks. | `FLASH_ATTN` |
+| `dense` | `Qwen/Qwen3.8-27B`, tensor parallel 2 | A dense model (no experts) split in two; three of every four layers use linear attention (Gated DeltaNet), the fourth full attention. With two or more GPUs it also measures the all-reduces between the two ranks. | `FLASH_ATTN` |
 | `moe` | `Qwen/Qwen3-30B-A3B` | A mixture of experts (128 experts, 8 used per token). | `FLASHINFER` |
 | `hetero` | `openai/gpt-oss-20b` | Layers that alternate sliding-window and full attention. | `TRITON_ATTN` |
 
-You need an 80 GB GPU (for Qwen3-30B-A3B), plus a second GPU for Llama's communication.
-Llama is gated: accept its license at https://huggingface.co/meta-llama/Llama-3.1-8B and give
-your token for the download (see [below](#models-that-need-a-hugging-face-login)):
+You need an 80 GB GPU (for Qwen3-30B-A3B), plus a second GPU for Qwen3.8-27B's communication.
+None of the three models is gated, so no Hugging Face login is needed:
 
 ```bash
-HF_TOKEN=hf_xxx docker/example.sh      # all three: ~12 minutes the first time, ~7 after
-docker/example.sh moe hetero           # just these two (no token needed)
+docker/example.sh                      # all three: ~15 minutes the first time, ~10 after
+docker/example.sh moe hetero           # just these two
 ```
 
 It ends with a summary like this one (RTX PRO 6000 Blackwell; parts left out as `...`). The
@@ -122,17 +121,19 @@ first run on a machine takes about 5 minutes longer while FlashInfer and Triton 
 
 ```
 === summary (./dooly-out/example)
-dense   meta-llama/Llama-3.1-8B  253s   ok
+dense   Qwen/Qwen3.8-27B         460s   ok
 moe     Qwen/Qwen3-30B-A3B       77s    ok
 hetero  openai/gpt-oss-20b       66s    ok
 
-dense: 12 operations to profile, 254 result rows; calls per forward pass:
-    aten::linear                                 129   5 kinds: 32 + 32 + 32 + 32 + 1
-    _C::fused_add_rms_norm                        64
-    Attention                                     32
+dense: 10 operations to profile, 276 result rows; calls per forward pass:
+    GemmaRMSNorm                                 129   2 kinds: 128 + 1
+    aten::linear                                 129   3 kinds: 64 + 64 + 1
+    _C::silu_and_mul                              64
+    QwenGatedDeltaNetAttention                    48
+    Qwen3NextAttention                            16
     ...
-    all_reduce (group of 2)                       65   collective
-    collective latencies measured: 3040 on nvidia-rtx-pro-6000-blackwell-server-edition-pcie, groups of 2
+    all_reduce (group of 2)                      129   collective
+    collective latencies measured: 2528 on nvidia-rtx-pro-6000-blackwell-server-edition-pcie, groups of 2
 ...
 hetero: 13 operations to profile, 384 result rows; calls per forward pass:
     ...
@@ -141,10 +142,11 @@ hetero: 13 operations to profile, 384 result rows; calls per forward pass:
 ```
 
 Operations with the same name but different shapes or settings are profiled separately and
-shown as *kinds*. Llama's four linear layers per block are four kinds (plus the output layer);
-gpt-oss's attention comes in two kinds, sliding-window and full, 12 layers each. Each model's
-results are in `dooly-out/example/<name>/`, laid out as described next; running an example again
-replaces them.
+shown as *kinds*. Qwen3.8-27B's two MLP linear layers per block are two kinds (plus the output
+layer), and its attention is two operations: 48 linear-attention (Gated DeltaNet) layers and 16
+full-attention layers. gpt-oss's attention comes in two kinds, sliding-window and full, 12 layers
+each. Each model's results are in `dooly-out/example/<name>/`, laid out as described next;
+running an example again replaces them.
 
 ---
 
