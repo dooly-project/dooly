@@ -15,8 +15,8 @@
 # Publishing is a content copy only. This script NEVER commits or pushes: it
 # syncs the publishable paths into the public working tree and then stops, so
 # you can review `git diff` and commit/push yourself. Public-only files
-# (LICENSE, README.md, requirements.txt, .gitignore, example_traces/,
-# example_workload/) are never touched; only PUBLISH_PATHS are synced.
+# (LICENSE, README.md, requirements.txt, .gitignore, examples/) are never
+# touched; only PUBLISH_PATHS are synced.
 #
 # Usage:
 #   ./publish.sh                       # dry-run: show what WOULD change (default)
