@@ -1,7 +1,7 @@
-# What DoolyProf needs, at the versions it is tested with: vLLM 0.33.0 and PyTorch 2.14.0 on
-# Python 3.11 and an NVIDIA driver 580 or newer (CUDA 13.0). vLLM installs the rest of its own
-# dependencies, FlashInfer included. docker/requirements.txt lists every package in the Docker
-# image at its exact version.
+# What DoolyProf and DoolySim need, at the versions they are tested with: vLLM 0.33.0 and
+# PyTorch 2.14.0 on Python 3.11 and an NVIDIA driver 580 or newer (CUDA 13.0). vLLM installs the
+# rest of its own dependencies, FlashInfer included. docker/requirements.txt lists every package
+# in the Docker image at its exact version.
 
 vllm==0.33.0
 torch==2.14.0
@@ -10,6 +10,9 @@ numpy
 tqdm
 einops
 nvidia-ml-py
+pandas        # DoolySim: doolysim.estimator trains its latency models with these
+scikit-learn
+attrs         # DoolySim: doolysim/request.py
 
-# Only for the dev-only scripts at the repository root (not published)
-matplotlib  # analyze_overlap.py
+# Only for the dev-only scripts (not published)
+matplotlib  # analyze_overlap.py, doolysim/tools/plot_*.py
