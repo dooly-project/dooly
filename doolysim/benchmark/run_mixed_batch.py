@@ -300,8 +300,8 @@ def main() -> int:
     original_schedule = scheduler.schedule
     captured = [None]
 
-    def capture_schedule():
-        captured[0] = original_schedule()
+    def capture_schedule(*args, **kwargs):  # newer vLLM passes throttle_prefills
+        captured[0] = original_schedule(*args, **kwargs)
         return captured[0]
 
     scheduler.schedule = capture_schedule

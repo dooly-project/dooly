@@ -166,6 +166,17 @@ class FakeProps:
     def multi_processor_count(self):
         return _get_fake_gpu_sm_count()
 
+    # Further fields of torch.cuda.get_device_properties() that newer vLLM reads
+    is_integrated = False
+    is_multi_gpu_board = False
+    warp_size = 32
+    L2_cache_size = 128 * 1024**2
+    max_threads_per_multi_processor = 1536
+    regs_per_multiprocessor = 65536
+    shared_memory_per_block_optin = 99 * 1024
+    shared_memory_per_multiprocessor = 100 * 1024
+    uuid = "00000000-0000-0000-0000-000000000000"
+
 
 def apply_fake_cuda():
     global _FAKE_CUDA_APPLIED
@@ -283,6 +294,26 @@ def apply_fake_cuda():
     torch.tensor = fake_tensor
     torch.arange = fake_arange
     torch.Tensor.uniform_ = lambda self, *args, **kwargs: self
+    # The other tensor constructors that take a device: CUDA becomes CPU, as above.
+    def cpu_constructor(fn):
+        def constructor(*args, **kwargs):
+            if "device" in kwargs:
+                kwargs["device"] = redirect_device_arg(kwargs["device"])
+            if kwargs.get("pin_memory"):
+                kwargs["pin_memory"] = False
+            return fn(*args, **kwargs)
+        return constructor
+    for name in ("empty_like", "ones_like", "full", "full_like", "rand", "rand_like", "randn_like",
+                 "randint", "randint_like", "empty_strided", "linspace", "logspace", "eye",
+                 "as_tensor", "scalar_tensor", "tril_indices", "triu_indices"):
+        if hasattr(torch, name):
+            setattr(torch, name, cpu_constructor(getattr(torch, name)))
+    for name in ("new_empty", "new_zeros", "new_ones", "new_full", "new_tensor", "new_empty_strided"):
+        if hasattr(torch.Tensor, name):
+            setattr(torch.Tensor, name, cpu_constructor(getattr(torch.Tensor, name)))
+
+    # Pinned host memory needs a CUDA device; on the CPU a tensor is as good as pinned.
+    torch.Tensor.pin_memory = lambda self, *args, **kwargs: self
 
     torch.cuda.memory_stats = lambda *a, **k: {"allocated_bytes.all.peak": 0}
 
@@ -292,6 +323,35 @@ def apply_fake_cuda():
     torch.Event = Dummy
     torch.cuda.current_stream = lambda *a, **k: Dummy()
     torch.cuda.reset_peak_memory_stats = lambda *a, **k: None    
+
+    # Newer PyTorch has a device-generic API, torch.accelerator, that newer vLLM uses in place of
+    # torch.cuda; give it the same fake device. Only the functions this PyTorch has are replaced.
+    import contextlib
+    fake_accelerator = {
+        "is_available": lambda *a, **k: True,
+        "device_count": lambda *a, **k: _get_fake_gpu_device_count(),
+        "current_device_index": lambda *a, **k: _get_fake_gpu_current_device(),
+        "current_accelerator": lambda *a, **k: torch.device("cuda"),
+        "set_device_index": lambda *a, **k: None,
+        "device_index": lambda *a, **k: contextlib.nullcontext(),
+        "synchronize": lambda *a, **k: None,
+        "current_stream": lambda *a, **k: Dummy(),
+        "set_stream": lambda *a, **k: None,
+        "empty_cache": lambda *a, **k: None,
+        "empty_host_cache": lambda *a, **k: None,
+        "get_memory_info": lambda *a, **k: (_get_fake_gpu_free_memory(), _get_fake_gpu_total_memory()),
+        "memory_reserved": lambda *a, **k: _get_fake_gpu_memory_reserved(),
+        "memory_allocated": lambda *a, **k: 0,
+        "max_memory_allocated": lambda *a, **k: 0,
+        "max_memory_reserved": lambda *a, **k: _get_fake_gpu_memory_reserved(),
+        "memory_stats": lambda *a, **k: {"allocated_bytes.all.peak": 0},
+        "reset_peak_memory_stats": lambda *a, **k: None,
+    }
+    accelerator = getattr(torch, "accelerator", None)
+    if accelerator is not None:
+        for name, fake in fake_accelerator.items():
+            if hasattr(accelerator, name):
+                setattr(accelerator, name, fake)
 
     apply_fake_tp_patches(get_fake_tp_size())
     apply_fake_backend_patches()

@@ -226,9 +226,9 @@ def run_streaming_benchmark(
         original_schedule = scheduler.schedule
         captured_sched_output = None
 
-        def capture_schedule():
+        def capture_schedule(*args, **kwargs):  # newer vLLM passes throttle_prefills
             nonlocal captured_sched_output
-            captured_sched_output = original_schedule()
+            captured_sched_output = original_schedule(*args, **kwargs)
             return captured_sched_output
 
         # Temporarily replace schedule method to capture output

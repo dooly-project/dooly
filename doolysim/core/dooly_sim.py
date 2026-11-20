@@ -2,9 +2,11 @@ import os
 import torch
 import time
 
+# The emulator patches CUDA, NVML and vLLM; it must be imported before anything that imports vLLM
+# (..request does), because vLLM picks its platform the first time it is imported.
+from ..emulator import emulate_init
 from ..utils import SimulationResult, SimulationStep, RequestTrace, TokenEvent
 from ..request import RequestConfig, make_request, create_mock_output
-from ..emulator import emulate_init
 from .simulation_predictor import SimulationPredictor
 
 from typing import Dict, Iterator, Optional
