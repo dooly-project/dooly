@@ -120,7 +120,7 @@ EOF
 | `MODEL is not in ... (the image works offline)` (script, exit 2) | Not downloaded | `docker/dooly-docker.sh download MODEL`, then rerun |
 | `LocalEntryNotFoundError` / `outgoing traffic has been disabled` (`trace.log`) | Model missing from `$HF_CACHE`, or `HF_CACHE` points elsewhere than at download time | Download again with the same `HF_CACHE` |
 | `401` / `gated repo` (download), or `download failed (gated: ...)` (example.sh) | Gated model | Need `HF_TOKEN` from the user |
-| `waiting for N free GPU(s)` / `waiting for GPU(s) ...` (script, repeats every 60 s) | GPUs in use by others or locked | Wait, or tell the user. **Never** kill other processes or remove lock dirs you did not create. |
+| `waiting for N free GPU(s)` / `waiting for GPU(s) ...` (script, repeats every 60 s) | GPUs in use by others or locked by another run (`/tmp/dooly_gpu<i>.lock`) | Wait, or tell the user. **Never** kill other processes or remove lock dirs you did not create. |
 | `waiting for N free GPUs linked by ...` | Only worse-connected GPUs are free | Wait, or `DOOLY_ANY_LINK=1` if the user accepts measurements on those links |
 | `trace failed (exit N)` (script) + vLLM error about the attention backend or head size (`trace.log`) | vLLM does not support that backend on this GPU/model | Retry with another `--attention-backend`; report which ones vLLM rejected |
 | KV cache cannot hold the trace batch (`trace.log`/`profile.log`) | Not enough memory for the batch | `--gpu-memory-cap 0.95` |

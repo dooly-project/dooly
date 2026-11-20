@@ -218,7 +218,8 @@ Options of `run`:
 ## Choosing GPUs
 
 By default the script takes **one free GPU**. A GPU counts as free when it has less than 4 GB in
-use, no other user's process, and no other run of this script on it. If none is free, it prints
+use, no other user's process, and no other run of this script on it (a run locks each GPU it takes
+with `/tmp/dooly_gpu<i>.lock` until it ends). If none is free, it prints
 `waiting for 1 free GPU(s)` and checks again every minute.
 
 - `--gpus N` takes N free GPUs. It picks the N with the fastest links between them
@@ -291,7 +292,7 @@ Only `download` uses the internet; tracing and profiling run offline from your c
 | `permission denied ... docker.sock` | `export DOCKER="sudo docker"` |
 | `could not select device driver "" with capabilities: [[gpu]]` | Install the NVIDIA Container Toolkit and restart Docker. |
 | `MODEL is not in ... (the image works offline)` | Run `docker/dooly-docker.sh download MODEL` first. |
-| `waiting for N free GPU(s)` | All GPUs are busy. Wait, or name GPUs with `--devices`. |
+| `waiting for N free GPU(s)` | All GPUs are busy. Wait, or name GPUs with `--devices`. A run killed with `kill -9` leaves its lock behind: when no run is on GPU *i*, its owner removes it with `rmdir /tmp/dooly_gpu<i>.lock`. |
 | `trace failed (exit N); see .../trace.log` | Read the end of `dooly-out/NAME/trace.log`. If vLLM says the attention backend is not supported on your GPU, try another `--attention-backend`. |
 | `profile exit 1` or `ops without a working parent` above 0 | Read `dooly-out/NAME/profile.log`; please report it with the log. |
 | KV cache too small for the trace batch | Add `--gpu-memory-cap 0.95`. |
