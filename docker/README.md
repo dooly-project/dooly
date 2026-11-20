@@ -143,7 +143,8 @@ hetero: 13 operations to profile, 384 result rows; calls per forward pass:
 Operations with the same name but different shapes or settings are profiled separately and
 shown as *kinds*. Llama's four linear layers per block are four kinds (plus the output layer);
 gpt-oss's attention comes in two kinds, sliding-window and full, 12 layers each. Each model's
-results are in `dooly-out/example/<name>/`, laid out as described next.
+results are in `dooly-out/example/<name>/`, laid out as described next; running an example again
+replaces them.
 
 ---
 
@@ -192,6 +193,7 @@ docker/dooly-docker.sh [--gpus N | --devices LIST] COMMAND [options]
 | `download MODEL [MODEL ...]` | Downloads config and tokenizer files from Hugging Face into your cache. Uses no GPU. |
 | `run --model MODEL --out /out/NAME [options]` | Traces, then profiles. The usual command. |
 | `test` | Runs DoolyProf's unit tests. |
+| `check-update` | Says whether Docker Hub has a newer image than your machine. |
 | `trace ...` / `profile ...` | Runs only one stage, with the arguments of `doolyprof/run/run-tracer.py` / `run-profiler.py`. |
 
 Options of `run`:
@@ -278,6 +280,7 @@ Only `download` uses the internet; tracing and profiling run offline from your c
 | `HF_TOKEN` | | Hugging Face token, for `download` of gated models. |
 | `DOOLY_ANY_LINK` | | `1`: take free GPUs even when better-connected ones exist but are busy. |
 | `DOOLY_TOPOLOGY` | derived | Label for communication measurements. |
+| `DOOLY_UPDATE_CHECK` | `1` | `0`: skip comparing your image with Docker Hub's before each command. |
 
 ---
 
@@ -293,13 +296,18 @@ Only `download` uses the internet; tracing and profiling run offline from your c
 | `profile exit 1` or `ops without a working parent` above 0 | Read `dooly-out/NAME/profile.log`; please report it with the log. |
 | KV cache too small for the trace batch | Add `--gpu-memory-cap 0.95`. |
 | `argument --profiler-args: expected one argument` | Use the `=` form: `--profiler-args=--overwrite`. |
-| An old version runs | `docker pull jhkjames1110/doolyprof` to update. |
+| `0 result rows` when running again with the same `--out` | Operations already in that folder's `profile.db` are not measured again (DoolyProf reuses what it has). Use a new `--out`, or add `--profiler-args=--overwrite` to measure again. |
+| `Docker Hub has a newer jhkjames1110/doolyprof:latest than this machine` | Your copy of the image is older than the repository's main branch. Run the `docker pull` command it prints. |
 
 ---
 
 ## Updating, and building the image yourself
 
-`jhkjames1110/doolyprof:latest` is the code on the repository's main branch. To update:
+`jhkjames1110/doolyprof:latest` is the code on the repository's main branch. Docker downloads it
+only when your machine has no copy, so before each command the script compares your copy with
+Docker Hub's and, if Docker Hub's is newer, prints a warning with the command to update (it still
+runs your copy; `DOOLY_UPDATE_CHECK=0` turns the check off). `docker/dooly-docker.sh check-update`
+runs the check by itself. To update:
 
 ```bash
 docker pull jhkjames1110/doolyprof

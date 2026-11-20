@@ -15,7 +15,9 @@
 # others need no login. Computation is profiled on one GPU (Qwen3-30B-A3B needs an 80 GB one).
 #
 # Results go to $DOOLY_OUT/example/NAME/ (default ./dooly-out/example/), each run's output to
-# $DOOLY_OUT/example/NAME.log. At the end a summary shows, per model, whether the run worked, its
+# $DOOLY_OUT/example/NAME.log. Each example starts from an empty folder and replaces its previous
+# results (a run into an existing profile.db skips every operation already in it). The script first
+# says whether Docker Hub has a newer image than this machine. At the end a summary shows, per model, whether the run worked, its
 # operations per forward pass and its collectives. Operations with one name but different shapes
 # or attention settings are profiled separately and listed as kinds: gpt-oss shows two kinds of
 # Attention, 12 calls each.
@@ -54,6 +56,8 @@ done
 [ ${#names[@]} -gt 0 ] || names=(dense moe hetero)
 mkdir -p "$DOOLY_OUT/example"
 
+"$RUN" check-update            # once here, not before each of the runs below
+export DOOLY_UPDATE_CHECK=0
 declare -A STATUS SECS
 for n in "${names[@]}"; do
   m=${MODEL[$n]}
@@ -68,6 +72,7 @@ for n in "${names[@]}"; do
   echo
   echo "=== $n: ${MODEL[$n]} (${WHAT[$n]}) on ${GPUS[$n]} GPU(s): ${ARGS[$n]} ${extra[*]:-}"
   t0=$(date +%s)
+  rm -rf "${DOOLY_OUT:?}/example/$n"   # this example's previous results, so the summary is this run's
   # shellcheck disable=SC2086  # ARGS holds several words on purpose
   "$RUN" --gpus "${GPUS[$n]}" run --model "${MODEL[$n]}" --out "/out/example/$n" ${ARGS[$n]} \
     ${extra[@]+"${extra[@]}"} 2>&1 | tee "$DOOLY_OUT/example/$n.log"

@@ -32,6 +32,7 @@ docker/dooly-docker.sh run --model MODEL --out /out/NAME          # 1 GPU
 docker/dooly-docker.sh --gpus N run --model MODEL --tp N --out /out/NAME --profile-comm
 docker/dooly-docker.sh --devices 2,3 run ...                      # exact host GPUs, in this order
 docker/dooly-docker.sh test
+docker/dooly-docker.sh check-update                               # is Docker Hub's image newer?
 docker/example.sh [dense] [moe] [hetero] [-- RUN-OPTIONS]        # example workloads, see below
 ```
 
@@ -126,6 +127,7 @@ EOF
 | CUDA out of memory | Model rank too big for the GPU | Larger `--tp` (still one GPU), or a larger GPU |
 | `ops without a working parent` > 0 or `profile exit 1` | Profiler could not run some operation | Keep the run folder; report `profile.log` to the user (lines with `no working parent`) |
 | `argument --profiler-args: expected one argument` | Space form | Use `--profiler-args=...` |
+| `profile exit 0 ... 0 result rows` on a rerun | Same `--out`: everything already in its `profile.db` | New `--out`, or `--profiler-args=--overwrite` |
 | `[WARN] Calls recorded on K-rank groups are not profiled` (`profile.log`) | Fewer GPUs than group size | Rerun with `--gpus K` if the user wants those measured |
 | `[WARN] the K GPUs of this group are not all linked by NVLink` (`profile.log`) | Run got GPUs from different NVLink islands | Results are stored under the `-pcie` label; rerun without `--devices`/`DOOLY_ANY_LINK` for NVLink numbers |
 
@@ -136,7 +138,13 @@ EOF
 - Do not download weights, edit the image, or install system packages; report missing
   prerequisites to the user.
 - Do not use `pkill -f` with broad patterns over SSH; it can match your own session.
-- A run folder is overwritten only by a run with the same `--out`; pick a new name per run.
+- A run into an existing `--out` folder reuses its `profile.db`: operations already in it are not
+  profiled again and the summary reports only the new rows (possibly `0 result rows`). Use a new
+  `--out` per run, or `--profiler-args=--overwrite` to measure again. `example.sh` clears each
+  example's folder itself.
+- Before each command the script warns if Docker Hub has a newer image than the machine
+  (`Docker Hub has a newer ...`). It still runs the local copy; tell the user, and pull only if
+  they agree (`DOOLY_UPDATE_CHECK=0` silences it).
 - Results from different GPUs or link types are kept apart by their topology label; do not
   merge databases from different machines unless the user asks.
 
