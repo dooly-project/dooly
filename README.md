@@ -7,6 +7,26 @@ Downstream consumers (e.g., discrete-event simulator, prediction-based scheduler
 
 Check our pre-print at [Dooly: Configuration-Agnostic, Redundancy-Aware Profiling for LLM Inference Simulation](https://arxiv.org/abs/2605.07985).
 
+## Run with Docker
+
+The quickest way to try DoolyProf. The public image `jhkjames1110/doolyprof` has DoolyProf,
+vLLM 0.33, PyTorch 2.14 and CUDA 13.0, and `docker/dooly-docker.sh` runs it on free GPUs.
+You need Linux, an NVIDIA GPU with driver 580 or newer, and Docker with the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+
+```bash
+git clone https://github.com/dooly-project/doolyprof.git
+cd doolyprof
+docker pull jhkjames1110/doolyprof
+docker/dooly-docker.sh download Qwen/Qwen3-0.6B                          # config and tokenizer, no weights
+docker/dooly-docker.sh run --model Qwen/Qwen3-0.6B --out /out/qwen3-0.6b  # results: ./dooly-out/qwen3-0.6b/profile.db
+```
+
+`docker/example.sh` profiles three larger models: a dense Llama-3.1-8B at TP 2 together with
+its all-reduces, the Qwen3-30B-A3B mixture of experts, and gpt-oss-20b, whose layers alternate
+sliding-window and full attention. [docker/README.md](docker/README.md) explains every command,
+option and output; [docker/AGENTS.md](docker/AGENTS.md) is the version for coding agents.
+
 ## Installation
 
 Requires Python 3.10+, a CUDA-capable GPU, and a compatible PyTorch / vLLM build. 
@@ -75,6 +95,7 @@ doolyprof/
     ├── tracer/      # Taint propagation through PyTorch ops
     ├── profiler/    # Layer profiling and operation capture
     └── run/         # Entry points: run-tracer, run-profiler, run-e2e
+└── docker/          # Docker image recipe, runner script (dooly-docker.sh), example.sh, docs
 └── example_traces/  # Example tainted traces (output of run-tracer)
 ```
 
