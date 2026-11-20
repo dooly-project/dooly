@@ -13,8 +13,9 @@
 # Inside the container the chosen GPUs are 0..N-1 in the order chosen (CUDA_VISIBLE_DEVICES; the
 # first k GPUs form a k-rank group). Paths under /out are $DOOLY_OUT on the host.
 # A container cannot see other users' processes, so the free-GPU check runs here: a GPU is free
-# when it has under 4 GB in use, no process of another user, and the lock dir /tmp/jk_gpu<i>.lock
-# can be created (the same lock the queue scripts use).
+# when it has under 4 GB in use, no process of another user, and no lock dir /tmp/dooly_gpu<i>.lock.
+# The script creates that lock for each GPU it takes and removes it when the run ends, so two runs
+# never share a GPU, not even while one of them is starting and uses no memory yet.
 #
 # Collectives are measured on the GPUs the container gets, so of the free GPUs the wrapper takes
 # the N whose weakest link (nvidia-smi topo -m) is the strongest, ordered so that the first k of
@@ -43,6 +44,7 @@ DOCKER=${DOCKER:-docker}
 OUT=${DOOLY_OUT:-$PWD/dooly-out}
 HF=${HF_CACHE:-$HOME/.cache/huggingface}
 CACHE=${DOOLY_CACHE:-$HOME/.cache/dooly-docker}
+LOCK=/tmp/dooly_gpu   # $LOCK<i>.lock: GPU i is taken by a run of this script
 TOPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../doolyprof/profiler/utils/topology.py"
 N="" DEVICES=""
 while [ $# -gt 0 ]; do
@@ -155,7 +157,7 @@ free_gpus() {  # comma-separated indices of the GPUs nobody is on
     mem=$(nvidia-smi -i $g --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
     others=$(nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader | grep "$uuid" |
              while IFS=, read u p; do [ "$(ps -o user= -p $p | tr -d ' ')" != "$USER" ] && echo $p; done)
-    [ "$mem" -lt 4000 ] && [ -z "$others" ] && [ ! -e /tmp/jk_gpu$g.lock ] && free+=($g)
+    [ "$mem" -lt 4000 ] && [ -z "$others" ] && [ ! -e $LOCK$g.lock ] && free+=($g)
   done
   (IFS=,; echo "${free[*]}")
 }
@@ -167,12 +169,12 @@ if ! command -v python3 >/dev/null || [ ! -f "$TOPO" ]; then
 fi
 
 claimed=()
-release() { for g in ${claimed[@]+"${claimed[@]}"}; do rmdir /tmp/jk_gpu$g.lock 2>/dev/null; done; claimed=(); }
+release() { for g in ${claimed[@]+"${claimed[@]}"}; do rmdir $LOCK$g.lock 2>/dev/null; done; claimed=(); }
 trap release EXIT
 claim() {  # lock the chosen GPUs, all or none
   local g
   for g in ${1//,/ }; do
-    if mkdir /tmp/jk_gpu$g.lock 2>/dev/null; then claimed+=($g); else release; return 1; fi
+    if mkdir $LOCK$g.lock 2>/dev/null; then claimed+=($g); else release; return 1; fi
   done
 }
 
