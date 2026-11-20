@@ -29,8 +29,8 @@ option and output; [docker/AGENTS.md](docker/AGENTS.md) is the version for codin
 
 ## Installation
 
-Requires Python 3.10+, a CUDA-capable GPU, and a compatible PyTorch / vLLM build. 
-We test with PyTorch 2.9.1+, vLLM 0.17.1, and CUDA 13.1.
+Requires Linux, Python 3.11 to 3.14, and an NVIDIA GPU with driver 580 or newer (CUDA 13.0).
+We test with vLLM 0.33.0, PyTorch 2.14.0 and Python 3.11, the versions `requirements.txt` installs.
 
 ```bash
 git clone https://github.com/dooly-project/doolyprof.git

@@ -1,14 +1,12 @@
-# Direct dependencies for doolyprof.
-# Versions left unpinned so pip can resolve against your CUDA / Python stack.
-# Tested with PyTorch 2.9.1+, vLLM 0.17.x, transformers 4.57+.
+# What DoolyProf needs, at the versions it is tested with: vLLM 0.33.0 and PyTorch 2.14.0 on
+# Python 3.11 and an NVIDIA driver 580 or newer (CUDA 13.0). vLLM installs the rest of its own
+# dependencies, FlashInfer included. docker/requirements.txt lists every package in the Docker
+# image at its exact version.
 
-torch>=2.9.1
-vllm==0.17.1
-transformers>=4.55.0
+vllm==0.33.0
+torch==2.14.0
+transformers==5.20.2
 numpy
 tqdm
 einops
-
-# Optional: required only if using --attention-backend FLASHINFER (default).
-# Comment out if profiling with FLASH_ATTN or XFORMERS instead.
-flashinfer-python
+nvidia-ml-py
