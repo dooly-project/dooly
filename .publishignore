@@ -1,4 +1,4 @@
-# .publishignore — dev-only paths to keep OUT of the public repo.
+# .publishignore — dev-only paths to keep OUT of the release branch (main).
 #
 # Used by publish.sh as `rsync --exclude-from`. Patterns are relative to each published path
 # (PUBLISH_PATHS in publish.sh: doolyprof/, docker/, doolysim/) and use rsync filter syntax,

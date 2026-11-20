@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
 # publish.sh — one-way, channel-aware publish of the doolyprof and doolysim packages
-# and the docker/ folder (image recipe, runner script and docs) from the private dev
-# repo (dooly-dev) into the public release repo (dooly-public).
+# and the docker/ folder (image recipe, runner script and docs) from the development
+# branch of the dooly repository (dev-branch) into its release branch (main). Check
+# each out in its own worktree, e.g. from a clone that has main checked out:
+#   git worktree add ../dooly-dev dev-branch
 #
-# A "channel" is a (dev-branch -> public-branch) pair. The script publishes the
-# channel matching whatever branch dooly-dev is currently on, and REFUSES to
-# run unless dooly-public is on the matching branch — so you can't cross
-# wires (e.g. publish sglang content onto public main).
+# A "channel" is a (dev branch -> release branch) pair. The script publishes the
+# channel matching whatever branch SRC is on, and REFUSES to run unless DST is on
+# the matching branch — so you can't cross wires.
 #
-#   Channels:   main                   -> main
-#               sglang-port-from-main  -> sglang-branch
+#   Channels:   dev-branch  -> main
 #
 # Publishing is a content copy only. This script NEVER commits or pushes: it
 # syncs the publishable paths into the public working tree and then stops, so
@@ -26,13 +26,12 @@
 set -euo pipefail
 
 # ---- config --------------------------------------------------------------
-SRC="${SRC:-$HOME/dooly-project/dooly-dev}"          # private source of truth
-DST="${DST:-$HOME/dooly-project/dooly-public}"       # public release repo
+SRC="${SRC:-$HOME/dooly-project/dooly-dev}"   # worktree on dev-branch (source of truth)
+DST="${DST:-$HOME/dooly-project/dooly}"       # worktree on main (release)
 
-# dev-branch -> public-branch channel map
+# dev branch -> release branch channel map
 declare -A CHANNELS=(
-  [main]="main"
-  [sglang-port-from-main]="sglang-branch"
+  [dev-branch]="main"
 )
 
 # Paths (relative to repo root, trailing slash) to publish. Synced with --delete.
@@ -66,8 +65,9 @@ for arg in "$@"; do
 done
 
 # ---- preflight -----------------------------------------------------------
-[ -d "$SRC/.git" ] || { echo "ERROR: source is not a git repo: $SRC" >&2; exit 1; }
-[ -d "$DST/.git" ] || { echo "ERROR: dest is not a git repo: $DST"   >&2; exit 1; }
+# .git is a directory in a clone and a file in a worktree
+[ -e "$SRC/.git" ] || { echo "ERROR: source is not a git checkout: $SRC" >&2; exit 1; }
+[ -e "$DST/.git" ] || { echo "ERROR: dest is not a git checkout: $DST"   >&2; exit 1; }
 
 # Resolve the channel from dev's current branch, and verify public matches.
 SRC_BRANCH="$(git -C "$SRC" rev-parse --abbrev-ref HEAD)"
@@ -120,11 +120,11 @@ done
 # ---- review --------------------------------------------------------------
 echo
 if [ "$APPLY" -eq 1 ]; then
-  echo "==> Synced. Review and publish from the public repo:"
+  echo "==> Synced. Review and commit in the release worktree:"
   git -C "$DST" status -s
   echo
   echo "    git -C $DST diff                                    # review changes"
-  echo "    git -C $DST add -A && git -C $DST commit -m 'Sync from dooly-dev ($SRC_BRANCH)'"
+  echo "    git -C $DST add -A && git -C $DST commit -m 'Sync from $SRC_BRANCH'"
   echo "    git -C $DST push origin $DST_BRANCH"
 else
   echo "(dry-run only — nothing changed. Lines above starting with '>f' / '*deleting' show what --apply would write.)"
