@@ -8,6 +8,7 @@
 #   docker/dooly-docker.sh --gpus 2 run --model Qwen/Qwen3-8B --tp 2 --out /out/qwen3 --profile-comm
 #   docker/dooly-docker.sh --devices 2,3 run --model Qwen/Qwen3-8B --tp 2 --out /out/qwen3 --profile-comm
 #   docker/dooly-docker.sh test
+#   docker/dooly-docker.sh check-update                     (is Docker Hub's image newer than yours?)
 #
 # Inside the container the chosen GPUs are 0..N-1 in the order chosen (CUDA_VISIBLE_DEVICES; the
 # first k GPUs form a k-rank group). Paths under /out are $DOOLY_OUT on the host.
@@ -29,6 +30,8 @@
 #                ($HOME/.cache/huggingface)                    caches, the container's HOME ($HOME/.cache/dooly-docker)
 #   DOCKER       docker command (docker); "sudo docker" where your account is not in the docker group
 #   HF_TOKEN     passed to download, for gated models (or a token saved by `hf auth login` in HF_CACHE)
+#   DOOLY_UPDATE_CHECK  0: do not compare the image with Docker Hub's before each command (it only
+#                warns when Docker Hub has a newer one; the copy on this machine is what runs)
 #   DOOLY_*      every other DOOLY_ variable is passed into the container (e.g. DOOLY_TOPOLOGY, the
 #                label collective measurements are stored under)
 #
@@ -49,6 +52,48 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
+
+image_update_check() {  # 0: same as Docker Hub, 1: Docker Hub has a newer one (warned), 2: not checked
+  [ "${DOOLY_UPDATE_CHECK:-1}" = 0 ] && return 2
+  command -v curl > /dev/null || return 2
+  local ref=${IMAGE#docker.io/} repo tag last digests token remote rev
+  [[ $ref == *@* ]] && return 2                                   # pinned by digest
+  last=${ref##*/}
+  if [[ $last == *:* ]]; then tag=${last##*:}; repo=${ref%:*}; else tag=latest; repo=$ref; fi
+  if [[ $repo == */* ]]; then
+    case ${repo%%/*} in *.*|*:*|localhost) return 2 ;; esac       # another registry
+  else
+    repo=library/$repo
+  fi
+  # this machine's copy, as the digests Docker recorded when it was pulled or pushed (none if built here)
+  digests=$($DOCKER image inspect --format '{{join .RepoDigests "\n"}}' "$IMAGE" 2> /dev/null) || return 2
+  digests=$(sed -n "s|^\(docker.io/\)\{0,1\}${repo#library/}@||p" <<< "$digests")
+  [ -n "$digests" ] || return 2
+  # Docker Hub's: a HEAD request for the manifest (does not count as a pull)
+  token=$(curl -fsS --max-time 4 "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$repo:pull" \
+            2> /dev/null | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p')
+  [ -n "$token" ] || return 2
+  remote=$(curl -fsSI --max-time 4 -H "Authorization: Bearer $token" \
+             -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+             "https://registry-1.docker.io/v2/$repo/manifests/$tag" 2> /dev/null |
+           tr -d '\r' | grep -i '^docker-content-digest:' | sed 's/^[^:]*: *//')
+  [ -n "$remote" ] || return 2
+  grep -qxF "$remote" <<< "$digests" && return 0
+  rev=$($DOCKER image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE" 2> /dev/null)
+  echo "[dooly-docker] Docker Hub has a newer $IMAGE than this machine${rev:+ (yours was built from commit ${rev:0:7})}. To update:" >&2
+  echo "  $DOCKER pull $IMAGE        (this run uses the copy here; DOOLY_UPDATE_CHECK=0 skips the check)" >&2
+  return 1
+}
+
+if [ "${1:-}" = "check-update" ]; then
+  DOOLY_UPDATE_CHECK=1 image_update_check
+  case $? in
+    0) echo "[dooly-docker] $IMAGE is up to date" >&2 ;;
+    2) echo "[dooly-docker] could not compare $IMAGE with Docker Hub (not on this machine yet, built here, another registry, or no network)" >&2 ;;
+  esac
+  exit 0
+fi
+image_update_check
 
 if [ "${1:-}" = "download" ]; then  # model config and tokenizer files into $HF; needs no GPU
   shift
@@ -174,7 +219,7 @@ order=$(for g in ${devices//,/ }; do echo "$sorted" | tr , '\n' | grep -nx "$g" 
 envs=(-e CUDA_DEVICE_ORDER=PCI_BUS_ID -e CUDA_VISIBLE_DEVICES="$order")
 for name in $(compgen -e); do
   case $name in
-    DOOLY_IMAGE|DOOLY_OUT|DOOLY_CACHE|DOOLY_ANY_LINK) ;;
+    DOOLY_IMAGE|DOOLY_OUT|DOOLY_CACHE|DOOLY_ANY_LINK|DOOLY_UPDATE_CHECK) ;;
     DOOLY_*) envs+=(-e "$name") ;;
   esac
 done
