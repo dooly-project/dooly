@@ -6,7 +6,7 @@
 # - CUDA 13.0 toolkit, not only the runtime: FlashInfer compiles kernels the first time a shape
 #   needs them and needs nvcc and the CUDA headers; Triton builds its launcher with gcc.
 # - Python 3.11 and the exact package set DoolyProf was tested with on vLLM 0.33
-#   (requirements-vllm0.33.lock: `pip freeze` of that environment, vllm==0.33.0, torch==2.14.0).
+#   (docker/requirements.txt: `pip freeze` of that environment, vllm==0.33.0, torch==2.14.0).
 # - DoolyProf itself is pure Python and is copied in; `dooly` (doolyprof/cli.py) is the entry point.
 # Model weights are not needed (both stages load dummy weights); mount the Hugging Face cache for
 # the config and tokenizer files (see docker/dooly-docker.sh).
@@ -20,8 +20,8 @@ RUN apt-get update \
 COPY --from=uv /uv /usr/local/bin/uv
 ENV UV_PYTHON_INSTALL_DIR=/opt/python UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1
 RUN uv python install 3.11 && uv venv --python 3.11 /opt/venv
-COPY docker/requirements-vllm0.33.lock /tmp/requirements.lock
-RUN uv pip install --python /opt/venv/bin/python --no-cache -r /tmp/requirements.lock
+COPY docker/requirements.txt /tmp/requirements.txt
+RUN uv pip install --python /opt/venv/bin/python --no-cache -r /tmp/requirements.txt
 
 COPY doolyprof /opt/dooly/doolyprof
 ENV PATH=/opt/venv/bin:$PATH \

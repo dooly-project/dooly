@@ -168,5 +168,5 @@ DOOLY_IMAGE=jhkjames1110/doolyprof:latest docker/dooly-docker.sh test     # must
 docker push jhkjames1110/doolyprof:latest
 ```
 
-If the Python dependencies change (`docker/requirements-vllm0.33.lock`), rebuild from
+If the Python dependencies change (`docker/requirements.txt`), rebuild from
 `docker/Dockerfile` instead.
