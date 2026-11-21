@@ -8,6 +8,8 @@
 #   docker/dooly-docker.sh --gpus 2 run --model Qwen/Qwen3-8B --tp 2 --out /out/qwen3 --profile-comm
 #   docker/dooly-docker.sh --devices 2,3 run --model Qwen/Qwen3-8B --tp 2 --out /out/qwen3 --profile-comm
 #   docker/dooly-docker.sh test
+#   docker/dooly-docker.sh export --db /out/qwen3/profile.db --out /out/profiles   (no GPU; CSV tree)
+#   docker/dooly-docker.sh import /out/profiles --db /out/qwen3/profile.db         (no GPU)
 #   docker/dooly-docker.sh check-update                     (is Docker Hub's image newer than yours?)
 #
 # Inside the container the chosen GPUs are 0..N-1 in the order chosen (CUDA_VISIBLE_DEVICES; the
@@ -119,6 +121,11 @@ if [ "${1:-}" = "download" ]; then  # model config and tokenizer files into $HF;
   done
   [ $rc = 0 ] && echo "[dooly-docker] done" >&2
   exit $rc
+fi
+
+if [ "${1:-}" = "export" ] || [ "${1:-}" = "import" ]; then  # database <-> CSV tree under $OUT; needs no GPU
+  mkdir -p "$OUT"
+  exec $DOCKER run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$OUT":/out "$IMAGE" "$@"
 fi
 
 if [ "${1:-}" = "run" ]; then  # the image is offline: say so before a GPU is claimed for nothing

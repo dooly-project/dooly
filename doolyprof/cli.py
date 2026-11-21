@@ -6,12 +6,18 @@
     python -m doolyprof.cli trace   <run-tracer.py arguments>
     python -m doolyprof.cli profile <run-profiler.py arguments>
     python -m doolyprof.cli test    [suite ...]
+    python -m doolyprof.cli export  --db DB --out DIR
+    python -m doolyprof.cli import  DIR --db DB
 
 ``run`` traces the model (DIR/trace/, log DIR/trace.log), then profiles that
 trace into DIR/profile.db (log DIR/profile.log), on the GPUs this process can
 see, and exits non-zero if either stage fails. ``trace`` and ``profile`` pass
 their arguments to the scripts unchanged. ``test`` runs the unit and emulation
-suites in doolyprof/tests.
+suites in doolyprof/tests. ``export`` writes DB's measurements as a tree of CSV
+files under DIR (compute/<gpu>/<engine>/<backend>/<model>/<deployment>/ and
+communication/<topology>/<engine>/, see doolyprof/profiles.py); ``import`` merges
+such a tree into DB, so its measurements are reused by later runs on the same GPU
+and engine.
 """
 import argparse
 import glob
@@ -27,7 +33,7 @@ TRACER = os.path.join(ROOT, "run", "run-tracer.py")
 PROFILER = os.path.join(ROOT, "run", "run-profiler.py")
 SUITES = ["tracer_ops", "taint_parse", "signature_fields", "op_args", "triton_scope", "taint_config_cache",
           "moe_routing", "compile_wrapper", "subprocess_result", "dp_ep_emulation", "sp_moe_emulation",
-          "comm_emulation"]
+          "comm_emulation", "profiles"]
 
 
 def _script(path, args, log=None):
@@ -146,6 +152,38 @@ def cmd_test(argv):
     return 1 if failed else 0
 
 
+def cmd_export(argv):
+    p = argparse.ArgumentParser(prog="dooly export", description="Write a profile database's measurements as a tree "
+                                "of CSV files (doolyprof/profiles.py). Only reads the database.")
+    p.add_argument("--db", required=True, help="profile database (profile.db)")
+    p.add_argument("--out", required=True, help="folder to write compute/ and communication/ into")
+    a = p.parse_args(argv)
+    from doolyprof.profiles import export_db
+    d = export_db(a.db, a.out)
+    print(f"[dooly] exported {d['deployments']} deployment(s): {d['operation_files']} operation files "
+          f"({d['result_rows']} rows), {d['communication_files']} collective files ({d['communication_rows']} rows) "
+          f"to {a.out}", flush=True)
+    if d["skipped_deployments"] or d["skipped_communication_rows"]:
+        print(f"[dooly] not exported: {d['skipped_deployments']} deployment(s) and {d['skipped_communication_rows']} "
+              f"collective rows measured before GPUs and engines were recorded", flush=True)
+    return 0
+
+
+def cmd_import(argv):
+    p = argparse.ArgumentParser(prog="dooly import", description="Merge a tree written by `dooly export` into a "
+                                "profile database; rows it already has are kept.")
+    p.add_argument("tree", help="folder holding compute/ and communication/")
+    p.add_argument("--db", required=True, help="profile database (created if missing)")
+    a = p.parse_args(argv)
+    from doolyprof.profiles import import_tree
+    d = import_tree(a.tree, a.db)
+    print(f"[dooly] imported {d['deployments']} deployment(s) ({d['deployments_added']} new): "
+          f"{d['result_rows_added']} result rows added, {d['result_rows_present']} already present; "
+          f"{d['communication_rows_added']} collective rows added, {d['communication_rows_present']} already present",
+          flush=True)
+    return 0
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] in ("-h", "--help"):
@@ -160,6 +198,10 @@ def main(argv=None):
         return _script(PROFILER, rest)
     if command == "test":
         return cmd_test(rest)
+    if command == "export":
+        return cmd_export(rest)
+    if command == "import":
+        return cmd_import(rest)
     print(f"unknown command {command!r}\n{__doc__}", file=sys.stderr)
     return 2
 

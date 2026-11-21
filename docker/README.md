@@ -167,9 +167,11 @@ Main tables in `profile.db`:
 | Table | One row per |
 |---|---|
 | `signatures` | Distinct operation (`operation_name`, plus its full description in `signature_json`). |
-| `results` | Operation x batch configuration: `num_tokens`, `num_requests`, `is_prefill`, `kv_cache_size`, ... and the measured `mean/median/min/max/std_latency_ms`. |
+| `results` | Operation x batch configuration: `num_tokens`, `num_requests`, `is_prefill`, `kv_cache_size`, ... and the measured `mean/median/min/max/std_latency_ms`, with the GPU (`device`) and engine version (`engine`) it was measured on. |
+| `profiled_models` | Model deployment: backend, tensor parallelism, data types, GPU, engine and backend version. |
 | `model_operations` | How many times each operation runs in one forward pass of the model. |
 | `coll_ops`, `coll_op_results` | The model's collectives, and (with `--profile-comm`) their latency by message size and group size. |
+| `profile_runs` | Profiling run: GPU, engine, backend, package and driver versions, command line. |
 
 For example, the median time of every operation at 64 tokens:
 
@@ -178,6 +180,20 @@ sqlite3 dooly-out/qwen3-0.6b/profile.db "
   SELECT s.operation_name, r.num_tokens, r.num_requests, r.is_prefill, r.median_latency_ms
   FROM results r JOIN signatures s USING (signature_hash)
   WHERE r.num_tokens = 64 ORDER BY r.median_latency_ms DESC"
+```
+
+A run reuses a result only from the same GPU and engine version, so runs on several machines
+can share one database. To share results as files, `export` writes them as a tree of CSV files
+and `import` merges one back into a database:
+
+```
+profiles/
+├── compute/<gpu>/<engine>/<backend>/<model>/<deployment>/
+│   ├── deployment.json   the deployment, and the runs that measured it (versions, options)
+│   ├── model.csv         its operations: file, name, signature, calls per forward pass
+│   ├── collectives.csv   its collectives: topology, group size, calls, how sizes scale
+│   └── <operation>-<signature>.csv   latency of one operation per batch shape
+└── communication/<topology>/<engine>/<collective>.csv   latency per group size and message size
 ```
 
 ---
@@ -196,6 +212,8 @@ docker/dooly-docker.sh [--gpus N | --devices LIST] COMMAND [options]
 | `run --model MODEL --out /out/NAME [options]` | Traces, then profiles. The usual command. |
 | `test` | Runs DoolyProf's unit tests. |
 | `check-update` | Says whether Docker Hub has a newer image than your machine. |
+| `export --db /out/NAME/profile.db --out /out/profiles` | Writes the database's results as CSV files, one per operation, in a folder tree by GPU, engine, backend, model and deployment (below). Uses no GPU. |
+| `import /out/profiles --db /out/NAME/profile.db` | Merges such a tree into a database, so later runs on the same GPU and engine reuse its results. Uses no GPU. |
 | `trace ...` / `profile ...` | Runs only one stage, with the arguments of `doolyprof/run/run-tracer.py` / `run-profiler.py`. |
 
 Options of `run`:
