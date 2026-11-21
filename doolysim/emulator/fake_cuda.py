@@ -208,7 +208,8 @@ def apply_fake_cuda():
             return value.type == "cuda"
         if isinstance(value, str):
             return value.startswith("cuda")
-        return False
+        # a bare index (e.g. current_platform.current_device()) means that CUDA device
+        return isinstance(value, int) and not isinstance(value, bool)
 
     def redirect_device_arg(value):
         if is_cuda_device(value):
@@ -229,7 +230,9 @@ def apply_fake_cuda():
         return tuple(redirected_args), redirected_kwargs
 
     def redirect_device(kwargs):
-        if "device" in kwargs and str(kwargs["device"]).startswith("cuda"):
+        # device=None would be filled in by an active `with torch.device("cuda")` (vLLM builds
+        # models under one), so it goes to the CPU too
+        if "device" in kwargs and (kwargs["device"] is None or is_cuda_device(kwargs["device"])):
             kwargs["device"] = "cpu"
         return kwargs
 
@@ -298,7 +301,7 @@ def apply_fake_cuda():
     def cpu_constructor(fn):
         def constructor(*args, **kwargs):
             if "device" in kwargs:
-                kwargs["device"] = redirect_device_arg(kwargs["device"])
+                kwargs["device"] = "cpu" if kwargs["device"] is None else redirect_device_arg(kwargs["device"])
             if kwargs.get("pin_memory"):
                 kwargs["pin_memory"] = False
             return fn(*args, **kwargs)
