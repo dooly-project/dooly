@@ -101,7 +101,14 @@ if [ "${1:-}" = "download" ]; then  # model config and tokenizer files into $HF;
   shift
   [ $# -gt 0 ] || { echo "usage: dooly-docker.sh download MODEL [MODEL ...]" >&2; exit 2; }
   mkdir -p "$HF" "$CACHE"
-  token=(); [ -n "${HF_TOKEN:-}" ] && token=(-e HF_TOKEN)
+  # The token goes in an env file only this user can read: `-e HF_TOKEN` alone passes nothing
+  # through `sudo docker`, and `-e HF_TOKEN=...` would show it in the process list.
+  token=()
+  if [ -n "${HF_TOKEN:-}" ]; then
+    tokfile=$(mktemp) && chmod 600 "$tokfile" && printf 'HF_TOKEN=%s\n' "$HF_TOKEN" > "$tokfile"
+    trap 'rm -f "$tokfile"' EXIT
+    token=(--env-file "$tokfile")
+  fi
   rc=0
   for model in "$@"; do
     echo "[dooly-docker] downloading $model into $HF (config and tokenizer files; no weights)" >&2
@@ -222,7 +229,7 @@ envs=(-e CUDA_DEVICE_ORDER=PCI_BUS_ID -e CUDA_VISIBLE_DEVICES="$order")
 for name in $(compgen -e); do
   case $name in
     DOOLY_IMAGE|DOOLY_OUT|DOOLY_CACHE|DOOLY_ANY_LINK|DOOLY_UPDATE_CHECK) ;;
-    DOOLY_*) envs+=(-e "$name") ;;
+    DOOLY_*) envs+=(-e "$name=${!name}") ;;  # with its value: `-e NAME` alone passes nothing through sudo
   esac
 done
 
