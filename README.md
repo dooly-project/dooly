@@ -1,12 +1,13 @@
 # Dooly
 
-Dooly predicts LLM serving performance across deployment configurations (hardware, attention
-backend, model, parallelism) with little profiling. This repository has both of its parts:
+Dooly provides a profiler that **automatically finds the set of operations** called by your deployment configuration (hardware, attention backend, model, parallelism),
+and **reduces profiling time by re-using profiles** from the [DoolyDB](https://huggingface.co/dooly-project).
+As an example use case, we also provide a simulator (DoolySim) that predicts LLM serving performance across deployment configurations.
 
-- **DoolyProf** ([`doolyprof/`](doolyprof/README.md)) profiles a deployment into a SQLite database.
-- **DoolySim** ([`doolysim/`](doolysim/README.md)) simulates serving from that database.
+- **DoolyProf** ([`doolyprof/`](doolyprof/README.md)): our per-operation granularity profiler used to populate DoolyDB
+- **DoolySim** ([`doolysim/`](doolysim/README.md)): emulates the source serving engine's scheduling logic and replaces GPU compute with latency predictions from models trained from DoolyDB
 
-Check our pre-print at [Dooly: Configuration-Agnostic, Redundancy-Aware Profiling for LLM Inference Simulation](https://arxiv.org/abs/2605.07985).
+Check our paper at [Dooly: Configuration-Agnostic, Redundancy-Aware Profiling for LLM Inference Simulation](https://arxiv.org/abs/2605.07985) (NeuRIPS 2026).
 
 ## Installation
 
