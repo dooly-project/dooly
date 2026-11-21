@@ -23,6 +23,12 @@ DoolySim's regression models do not extrapolate beyond the batch sizes and seque
 the database, so profile at the scale you will simulate (for example `--max-batch-size 32
 --max-seq-len 8192`).
 
+A database can hold results of several GPUs and engine versions (see
+[DoolyProf](../doolyprof/README.md#sharing-results-export-and-import)). The estimator and the
+simulator use the GPU and engine given with `--device` and `--engine`, by default the only ones
+the database has for the deployment; collectives use the topology given with `--topology`, by
+default the one the deployment's collectives were recorded under.
+
 ## Quick start
 
 ### 1. Train models and generate the prediction cache
