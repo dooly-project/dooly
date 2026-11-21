@@ -6,7 +6,7 @@
 </p>
 
 <h3 align="center">
-Fast and Cheap Profiling for LLM Inference Simulation Workflows
+Configuration-Agnostic, Redundancy-Aware Profiling for LLM Inference Simulation
 </h3>
 
 <p align="center">
