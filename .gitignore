@@ -47,3 +47,6 @@ results/
 cache/
 core/cache/
 dataset/
+
+# Logos the README shows
+!/assets/logos/*.png

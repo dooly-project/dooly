@@ -1,4 +1,17 @@
-# Dooly
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/dooly-project/dooly/main/assets/logos/dooly-logo-dark.png">
+    <img alt="Dooly" src="https://raw.githubusercontent.com/dooly-project/dooly/main/assets/logos/dooly-logo-light.png" width=55%>
+  </picture>
+</p>
+
+<h3 align="center">
+Fast and Cheap Profiling for LLM Inference Simulation Workflows
+</h3>
+
+<p align="center">
+| <a href="https://dooly-project.github.io"><b>Website</b></a> | <a href="https://arxiv.org/abs/2605.07985"><b>Paper</b></a> |
+</p>
 
 Dooly provides a profiler that **automatically finds the set of operations** called by your deployment configuration (hardware, attention backend, model, parallelism),
 and **reduces profiling time by re-using profiles** from the [DoolyDB](https://huggingface.co/dooly-project).
