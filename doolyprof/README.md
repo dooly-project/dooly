@@ -79,6 +79,43 @@ python -m doolyprof.run.run-tracer --model meta-llama/Llama-3.1-70B --tp 4
 
 The tracer sets `VLLM_FAKE_TP=4` and patches vLLM's `parallel_state` and collective ops to no-ops, so the model executes on one GPU while reporting TP=4 communication shapes. 
 
+## Sharing results: export and import
+
+Every result in the database records the GPU it was measured on (`device`, e.g.
+`nvidia-rtx-pro-6000-blackwell-server-edition`) and the serving engine and version (`engine`,
+e.g. `vllm-0.33.0`), and `profile_runs` records each run with its package and driver versions.
+A run reuses a result only when both match, so one database can hold several GPUs and engine
+versions. `DOOLY_DEVICE` and `DOOLY_ENGINE` override the two labels.
+
+`export` writes a database as a tree of CSV files, one per operation, to share or keep under
+version control; `import` merges such a tree into a database, after which runs on the same GPU
+and engine reuse its results:
+
+```bash
+python -m doolyprof.cli export --db ./dooly_data.db --out ./profiles
+python -m doolyprof.cli import ./profiles --db ./dooly_data.db
+```
+
+With Docker: `docker/dooly-docker.sh export --db /out/NAME/profile.db --out /out/profiles`.
+
+```
+profiles/
+├── compute/<gpu>/<engine>/<backend>/<model>/<deployment>/
+│   ├── deployment.json   the deployment, and the runs that measured it (versions, options)
+│   ├── model.csv         its operations: file, name, signature, calls per forward pass
+│   ├── collectives.csv   its collectives: topology, group size, calls, how sizes scale
+│   └── <operation>-<signature>.csv   latency of one operation per batch shape
+└── communication/<topology>/<engine>/<collective>.csv   latency per group size and message size
+```
+
+For example `compute/nvidia-rtx-pro-6000-blackwell-server-edition/vllm-0.33.0/FLASH_ATTN-fa2/Qwen/Qwen3.8-27B/tp2-bfloat16-kvauto/`.
+The backend folder names the version of what implements it (`FLASH_ATTN-fa2`,
+`FLASHINFER-0.7.2.post1`, `TRITON_ATTN-3.8.0`). Each model folder is self-contained, so an
+operation two models share is in both. Exporting into an existing tree replaces the folders of
+the deployments the database has (and its collectives' files), and leaves the others; importing
+never overwrites a result the database already has. Results measured before GPUs and engines
+were recorded are not exported.
+
 ## Layout
 
 ```

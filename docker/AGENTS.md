@@ -33,6 +33,8 @@ docker/dooly-docker.sh --gpus N run --model MODEL --tp N --out /out/NAME --profi
 docker/dooly-docker.sh --devices 2,3 run ...                      # exact host GPUs, in this order
 docker/dooly-docker.sh test
 docker/dooly-docker.sh check-update                               # is Docker Hub's image newer?
+docker/dooly-docker.sh export --db /out/NAME/profile.db --out /out/profiles   # no GPU; CSV tree
+docker/dooly-docker.sh import /out/profiles --db /out/NAME/profile.db         # no GPU; merge a tree
 docker/example.sh [dense] [moe] [hetero] [-- RUN-OPTIONS]        # example workloads, see below
 ```
 
