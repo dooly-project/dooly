@@ -25,6 +25,8 @@ derived from the hardware: the model of the first visible GPU and whether a grou
 
 The GPU count is not part of the label: the group size is stored separately (tp_size).
 ``machine_topology()`` is the label without a group (NVLink if the GPU has an active link).
+``device_label()`` is the label compute measurements (``results``) are stored under: the GPU
+model without the link part, since one GPU runs each operation.
 
 The hardware is read through NVML, so no CUDA context is created in the caller (which matters
 for processes that spawn vLLM workers afterwards); without NVML the GPU name comes from torch
@@ -156,6 +158,29 @@ def group_topology(group_size):
 def machine_topology():
     """DOOLY_TOPOLOGY if set, else the label of this machine's GPUs without a group size."""
     return os.environ.get("DOOLY_TOPOLOGY") or _derived_topology(None)
+
+
+def gpu_name():
+    """The model name of the first visible GPU (NVML, else CUDA), or None without a GPU."""
+    name = _links(None)[0]
+    if name is None:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                name = torch.cuda.get_device_name(0)
+        except Exception:  # noqa: BLE001
+            name = None
+    return name
+
+
+def device_label():
+    """DOOLY_DEVICE if set, else the label of the first visible GPU's model, e.g.
+    ``nvidia-a100-80gb-pcie`` or ``nvidia-rtx-pro-6000-blackwell-server-edition``; ``no-gpu``
+    without one. Compute measurements are stored and reused under it."""
+    if os.environ.get("DOOLY_DEVICE"):
+        return os.environ["DOOLY_DEVICE"]
+    name = gpu_name()
+    return _slug(name) if name else NO_GPU
 
 
 def group_link_warning(group_size):

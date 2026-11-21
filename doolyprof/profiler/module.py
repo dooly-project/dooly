@@ -380,17 +380,34 @@ class ModuleComparator:
         canonical = json.dumps(signature, sort_keys=True, default=str)
         return hashlib.sha256(canonical.encode()).hexdigest()
 
-    def _load_existing_signatures(self, db_path: str) -> Set[str]:
-        """Load existing signature hashes from the database."""
+    def _load_existing_signatures(self, db_path: str, device: Optional[str] = None,
+                                  engine: Optional[str] = None) -> Set[str]:
+        """Signature hashes the database already has measurements of on ``device`` with
+        ``engine`` (doolyprof.profiler.db). Rows of other devices or engines, and rows written
+        before devices were recorded, are not reused."""
         if not os.path.exists(db_path):
             return set()
 
         conn = sqlite3.connect(db_path)
         try:
-            cursor = conn.execute("SELECT signature_hash FROM signatures")
-            return {row[0] for row in cursor}
+            measured = {row[0] for row in conn.execute(
+                "SELECT DISTINCT signature_hash FROM results WHERE device = ? AND engine = ?", (device, engine))}
+            elsewhere = conn.execute(
+                "SELECT COUNT(DISTINCT signature_hash) FROM results WHERE device IS NOT ? OR engine IS NOT ?",
+                (device, engine)).fetchone()[0]
+            if elsewhere:
+                print(f"[COMPARATOR] {elsewhere} operation(s) in the database were measured on another device or "
+                      f"engine (or before devices were recorded); they are measured again for {device}, {engine}")
+            return measured
         except sqlite3.OperationalError:
-            # Table doesn't exist yet
+            # No results table yet, or one from before devices were recorded
+            try:
+                n = conn.execute("SELECT COUNT(DISTINCT signature_hash) FROM results").fetchone()[0]
+                if n:
+                    print(f"[COMPARATOR] the database predates GPU and engine labels; its {n} operation(s) are "
+                          f"measured again for {device}, {engine}")
+            except sqlite3.OperationalError:
+                pass
             return set()
         finally:
             conn.close()
@@ -401,6 +418,8 @@ class ModuleComparator:
         model_names: Optional[List[str]] = None,
         db_path: Optional[str] = None,
         overwrite: bool = False,
+        device: Optional[str] = None,
+        engine: Optional[str] = None,
     ) -> Dict[str, List[Tuple[ModuleInfo, Callable, str, str]]]:
         if model_names is None:
             model_names = [f"Model{i+1}" for i in range(len(model_module_infos))]
@@ -414,9 +433,9 @@ class ModuleComparator:
         # Load existing signatures from database (unless overwrite is True)
         existing_hashes = set()
         if db_path and not overwrite:
-            existing_hashes = self._load_existing_signatures(db_path)
+            existing_hashes = self._load_existing_signatures(db_path, device, engine)
             if existing_hashes:
-                print(f"[COMPARATOR] Loaded {len(existing_hashes)} existing signatures from database")
+                print(f"[COMPARATOR] Loaded {len(existing_hashes)} signatures already measured on {device} with {engine}")
         elif overwrite:
             print(f"[COMPARATOR] Overwrite mode enabled - ignoring existing signatures in database")
 
@@ -438,7 +457,7 @@ class ModuleComparator:
 
                 # Skip if already in database (for profiling)
                 if sig_hash in existing_hashes:
-                    print(f" - {module.module_name} with hash {sig_hash[:16]}... already in database, skipping profiling")
+                    print(f" - {module.module_name} with hash {sig_hash[:16]}... already measured on this device and engine, skipping profiling")
                     continue
 
                 # Skip if already seen this session (for profiling)

@@ -28,6 +28,7 @@ from doolyprof.profiler.model import ModelInfo as ProfileModel
 from vllm.config import set_current_vllm_config
 from doolyprof.profiler.utils.vllm_compat import set_forward_context
 from doolyprof.profiler.importer import OpImporter
+from doolyprof.profiler import db as profile_db
 from doolyprof.profiler.module import ModuleInfo
 from doolyprof.profiler.input_generator import InputGenerator 
 from doolyprof.profiler.resolver import ModuleResolver
@@ -410,8 +411,16 @@ class Profiler:
         gpu: str = "0",
         kv_cache_dtype: str = "auto",
         gpu_memory_cap: float = 0.9,
+        stack: Optional[Dict[str, Any]] = None,
     ):
         self.importer = OpImporter()
+        # The hardware and software this run measures on (doolyprof.profiler.db.run_stack):
+        # every latency row is stored with its device and engine and reused only for the same
+        # ones, and the run is recorded in profile_runs (run_id on its rows).
+        self.stack = stack or profile_db.run_stack(attention_backend, flash_attn_version)
+        self.device = self.stack["device"]
+        self.engine = self.stack["engine"]
+        self.run_id = None
         # largest GPU fraction the profiling engine may take (run-profiler --gpu-memory-cap)
         self.gpu_memory_cap = gpu_memory_cap
         # vLLM KV-cache dtype literal; part of the deployment key in
@@ -639,172 +648,18 @@ class Profiler:
         return timings
 
     def _init_db(self) -> None:
-        """Initialize SQLite database with required tables."""
-        # Create parent directory if needed
+        """Create the database's tables or bring them up to date (doolyprof.profiler.db), and
+        record this run in profile_runs."""
         db_dir = os.path.dirname(self.db_path)
         if db_dir:
             Path(db_dir).mkdir(parents=True, exist_ok=True)
 
         conn = sqlite3.connect(self.db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS signatures (
-                operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signature_hash TEXT UNIQUE NOT NULL,
-                operation_name TEXT NOT NULL,
-                signature_json TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signature_hash TEXT NOT NULL,
-                mean_latency_ms REAL,
-                median_latency_ms REAL,
-                max_latency_ms REAL,
-                min_latency_ms REAL,
-                std_latency_ms REAL,
-                num_tokens INTEGER,
-                num_requests INTEGER,
-                is_context BOOLEAN NULL,
-                is_prefill BOOLEAN NULL,
-                kv_cache_size INTEGER NULL,
-                prefill_chunk_size INTEGER NULL,
-                activated_experts INTEGER NULL,
-                num_tensor_parallel_workers INTEGER,
-                input_shapes TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (signature_hash) REFERENCES signatures(signature_hash)
-            )
-        """)
-        # Composite index covering the upsert WHERE-clause in _write_results.
-        # Without this, the per-row "does this exact (sig, workload_params) row
-        # already exist?" SELECT degrades to a full scan, making the write
-        # phase O(N²) in result-row count. With it: O(N log N).
-        # Backward-compat: add activated_experts to a pre-existing results table
-        # (CREATE TABLE IF NOT EXISTS won't add a column to an existing table).
-        try:
-            conn.execute("ALTER TABLE results ADD COLUMN activated_experts INTEGER NULL")
-        except sqlite3.OperationalError:
-            pass  # column already present
-        # Backward-compat: local_pairs (expert-parallel MoE rows: pairs routed to
-        # this rank's experts). NULL on every other row, where all pairs are local.
-        try:
-            conn.execute("ALTER TABLE results ADD COLUMN local_pairs INTEGER NULL")
-        except sqlite3.OperationalError:
-            pass  # column already present
-        conn.execute("DROP INDEX IF EXISTS idx_results_lookup")
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_results_lookup_v2
-            ON results (signature_hash, num_tokens, num_requests,
-                        is_context, is_prefill, kv_cache_size,
-                        prefill_chunk_size, activated_experts, local_pairs,
-                        num_tensor_parallel_workers)
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS profiled_models (
-                model_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                model_name TEXT NOT NULL,
-                model_family TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                tp_degree INTEGER NOT NULL,
-                dtype TEXT NOT NULL,
-                kv_cache_dtype TEXT NOT NULL DEFAULT 'auto',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Backward-compat: pre-existing DBs lack kv_cache_dtype; every row in
-        # them was profiled with vLLM's default ("auto").
-        try:
-            conn.execute("ALTER TABLE profiled_models ADD COLUMN kv_cache_dtype TEXT NOT NULL DEFAULT 'auto'")
-        except sqlite3.OperationalError:
-            pass  # column already present
-        # Enforce uniqueness on the (model, backend, tp, dtype, kv_cache_dtype)
-        # deployment tuple. Must be an INDEX rather than an inline UNIQUE
-        # constraint so it can be added to existing DBs without recreating the
-        # table. The pre-kv_cache_dtype index is dropped so two cache dtypes of
-        # the same model can coexist.
-        # Backward-compat: rows written before fake EP were all profiled with
-        # experts TP-sharded (ep_degree 1).
-        try:
-            conn.execute("ALTER TABLE profiled_models ADD COLUMN ep_degree INTEGER NOT NULL DEFAULT 1")
-        except sqlite3.OperationalError:
-            pass  # column already present
-        conn.execute("DROP INDEX IF EXISTS ix_profiled_models_unique")
-        conn.execute("DROP INDEX IF EXISTS ix_profiled_models_unique_v2")
-        conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS ix_profiled_models_unique_v3
-                ON profiled_models(model_name, backend, tp_degree, dtype, kv_cache_dtype, ep_degree)
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS model_operations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                model_id INTEGER NOT NULL,
-                operation_id INTEGER NOT NULL,
-                count INTEGER NOT NULL DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (model_id) REFERENCES profiled_models(model_id),
-                FOREIGN KEY (operation_id) REFERENCES signatures(operation_id),
-                UNIQUE(model_id, operation_id, count)
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS coll_ops (
-                collective_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signature_hash TEXT UNIQUE NOT NULL,
-                operation_name TEXT NOT NULL,
-                topology TEXT NOT NULL,
-                tp_degree INTEGER NOT NULL,
-                num_dims INTEGER,
-                dim_param INTEGER
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS model_collectives (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                model_id INTEGER NOT NULL,
-                collective_id INTEGER NOT NULL,
-                count INTEGER NOT NULL DEFAULT 1,
-                FOREIGN KEY (model_id) REFERENCES profiled_models(model_id),
-                FOREIGN KEY (collective_id) REFERENCES coll_ops(collective_id),
-                UNIQUE(model_id, collective_id)
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS model_collective_configs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                model_id INTEGER NOT NULL,
-                collective_id INTEGER NOT NULL,
-                batch_param TEXT NOT NULL,
-                model_config_dim INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (model_id) REFERENCES profiled_models(model_id),
-                FOREIGN KEY (collective_id) REFERENCES coll_ops(collective_id),
-                UNIQUE(model_id, collective_id)
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_model_collective_configs_lookup
-            ON model_collective_configs(model_id, collective_id)
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS coll_op_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                operation TEXT NOT NULL,
-                topology TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                tp_size INTEGER NOT NULL,
-                size_bytes INTEGER NOT NULL,
-                dtype TEXT,
-                dim_param INTEGER,
-                num_dims INTEGER,
-                latency_ms REAL NOT NULL,
-                UNIQUE(operation, topology, backend, dtype, tp_size, size_bytes, dim_param, num_dims)
-            )
-        """)
-        conn.commit()
+        profile_db.init_schema(conn)
+        self.run_id = profile_db.record_run(conn, self.stack)
         conn.close()
-        print(f"[PROFILER] Initialized database at {self.db_path}")
+        print(f"[PROFILER] Initialized database at {self.db_path} (run {self.run_id}: "
+              f"device {self.device}, engine {self.engine}, backend {self.stack['backend']})")
 
     # ------------------------------------------------------------------
     # Per-operation timing log
@@ -1616,20 +1471,24 @@ class Profiler:
                 cursor = conn.execute(
                     """SELECT model_id FROM profiled_models
                        WHERE model_name = ? AND model_family = ? AND backend = ? AND tp_degree = ? AND dtype = ?
-                       AND kv_cache_dtype = ? AND ep_degree = ?""",
-                    (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str, self.kv_cache_dtype, self.ep_config)
+                       AND kv_cache_dtype = ? AND ep_degree = ? AND device IS ? AND engine IS ?""",
+                    (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str, self.kv_cache_dtype,
+                     self.ep_config, self.device, self.engine)
                 )
                 existing = cursor.fetchone()
 
                 if existing:
                     # Model already exists, use existing model_id
                     model_id = existing[0]
-                    print(f"[PROFILER] Model {model.name} (backend={self.attention_backend}, tp={self.tp_config}, ep={self.ep_config}, dtype={dtype_str}, kv_cache_dtype={self.kv_cache_dtype}) already exists (model_id={model_id})")
+                    print(f"[PROFILER] Model {model.name} (backend={self.attention_backend}, tp={self.tp_config}, ep={self.ep_config}, dtype={dtype_str}, kv_cache_dtype={self.kv_cache_dtype}, device={self.device}, engine={self.engine}) already exists (model_id={model_id})")
                 else:
                     # Insert new model and get the auto-generated model_id
                     cursor = conn.execute(
-                        """INSERT INTO profiled_models (model_name, model_family, backend, tp_degree, dtype, kv_cache_dtype, ep_degree) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str, self.kv_cache_dtype, self.ep_config)
+                        """INSERT INTO profiled_models (model_name, model_family, backend, tp_degree, dtype, kv_cache_dtype, ep_degree,
+                                                        device, engine, backend_version)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str, self.kv_cache_dtype,
+                         self.ep_config, self.device, self.engine, self.stack["backend"])
                     )
                     model_id = cursor.lastrowid
                     print(f"[PROFILER] Created new model entry (model_id={model_id}, dtype={dtype_str}, kv_cache_dtype={self.kv_cache_dtype})")
@@ -1896,7 +1755,8 @@ class Profiler:
                        AND (prefill_chunk_size = ? OR (prefill_chunk_size IS NULL AND ? IS NULL))
                        AND (activated_experts = ? OR (activated_experts IS NULL AND ? IS NULL))
                        AND (local_pairs = ? OR (local_pairs IS NULL AND ? IS NULL))
-                       AND num_tensor_parallel_workers = ?""",
+                       AND num_tensor_parallel_workers = ?
+                       AND device IS ? AND engine IS ?""",
                     (sig_hash,
                      num_tokens, num_tokens,
                      num_requests, num_requests,
@@ -1906,7 +1766,7 @@ class Profiler:
                      prefill_chunk_size, prefill_chunk_size,
                      activated_experts, activated_experts,
                      local_pairs, local_pairs,
-                     tp_workers)
+                     tp_workers, self.device, self.engine)
                 ).fetchone()
 
                 if existing:
@@ -1915,7 +1775,7 @@ class Profiler:
                         """UPDATE results
                            SET mean_latency_ms = ?, median_latency_ms = ?,
                                max_latency_ms = ?, min_latency_ms = ?, std_latency_ms = ?,
-                               input_shapes = ?, created_at = CURRENT_TIMESTAMP
+                               input_shapes = ?, run_id = ?, created_at = CURRENT_TIMESTAMP
                            WHERE id = ?""",
                         (
                             result.get('mean_latency_ms'),
@@ -1924,6 +1784,7 @@ class Profiler:
                             result.get('min_latency_ms'),
                             result.get('std_latency_ms'),
                             json.dumps(result.get('input_shapes', [])),
+                            self.run_id,
                             existing[0]
                         )
                     )
@@ -1938,8 +1799,9 @@ class Profiler:
                             activated_experts,
                             local_pairs,
                             num_tensor_parallel_workers,
-                            input_shapes
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            input_shapes,
+                            device, engine, run_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             sig_hash,
                             result.get('mean_latency_ms'),
@@ -1957,6 +1819,7 @@ class Profiler:
                             local_pairs,
                             tp_workers,
                             json.dumps(result.get('input_shapes', [])),
+                            self.device, self.engine, self.run_id,
                         )
                     )
 
