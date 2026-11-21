@@ -25,8 +25,13 @@ def main():
     parser.add_argument("--kv-cache-dtype", type=str, default="auto",
                         help="vLLM KV-cache dtype literal (auto, fp8, fp8_e4m3, fp8_e5m2); passed to the emulated engine and "
                              "used to select the profiled KV-cache dtype")
-    parser.add_argument("--topology", type=str, default="mew1",
-                       help="GPU interconnect topology for collective operations (default: mew1)")
+    parser.add_argument("--topology", type=str, default=None,
+                       help="Topology label of the collective timings (default: the one the deployment's collectives "
+                            "were recorded under)")
+    parser.add_argument("--device", type=str, default=None,
+                       help="GPU of the measurements, as DoolyProf labels it (default: the database's only one)")
+    parser.add_argument("--engine", type=str, default=None,
+                       help="Serving engine and version of the measurements, e.g. vllm-0.33.0 (default: the only one)")
     # Paths ################################################
     parser.add_argument("--cache-dir", type=str,
                        default=os.environ.get("DOOLYSIM_CACHE_DIR"),
@@ -194,6 +199,8 @@ def main():
         db_path=args.db_path,
         backend=args.backend,
         topology=args.topology,  # Pass topology for collective operations
+        device=args.device,
+        engine=args.engine,
         tensor_parallel_size=args.tp,  # Set TP size for profiling and simulation
         cpu_overhead=args.cpu_overhead_ms,
     )

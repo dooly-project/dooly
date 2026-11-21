@@ -30,7 +30,9 @@ class DoolySim:
         cache_dir: Optional[str] = None,
         db_path: Optional[str] = None,
         backend: str = "FLASHINFER",
-        topology: str = "mew1",  # GPU interconnect topology for collective operations
+        topology: Optional[str] = None,  # topology label of the collective timings (default: the deployment's)
+        device: Optional[str] = None,  # GPU of the measurements (default: the database's only one)
+        engine: Optional[str] = None,  # serving engine and version of the measurements (default: the only one)
         cpu_overhead: float = 10.0,
         use_actual_process_outputs: bool = True  # Use actual vLLM process_outputs for CPU overhead
     ):
@@ -85,6 +87,8 @@ class DoolySim:
             topology=topology,  # Pass topology for collective operations
             fallback_duration_ms=step_duration_ms,
             kv_cache_dtype=str(cache_cfg.cache_dtype),
+            device=device,
+            engine=engine,
         )
 
         # Tracking (all in milliseconds)

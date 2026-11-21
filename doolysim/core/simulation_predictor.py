@@ -58,10 +58,12 @@ class SimulationPredictor:
         vllm_config,
         cache_dir: str,
         db_path: str,
-        topology: str = "mew1",
+        topology: Optional[str] = None,
         fallback_duration_ms: float = 10.0,
         use_csv_cache: bool = True,
         kv_cache_dtype: str = "auto",
+        device: Optional[str] = None,
+        engine: Optional[str] = None,
     ):
         """Initialize latency estimator.
 
@@ -99,6 +101,25 @@ class SimulationPredictor:
             "AND pm.dtype = ? AND pm.kv_cache_dtype = ?"
         )
         self._deployment_params = (model_name, backend, tensor_parallel_size, self.dtype_name, kv_cache_dtype)
+        # The device and engine to use (doolysim/deployment.py), and the topology of the collectives
+        self._results_where, self._results_params = "", []
+        self.device = self.engine = None
+        if os.path.exists(db_path):
+            from doolysim.deployment import resolve_device_engine, filter_sql, resolve_topology
+            conn = sqlite3.connect(db_path)
+            try:
+                self.device, self.engine, labelled = resolve_device_engine(
+                    conn, model_name, backend, tensor_parallel_size, self.dtype_name, kv_cache_dtype, device, engine)
+                where, params = filter_sql("pm", self.device, self.engine, labelled)
+                self._deployment_where += where
+                self._deployment_params += tuple(params)
+                self._results_where, self._results_params = filter_sql("r", self.device, self.engine, labelled)
+                self.topology = resolve_topology(conn, model_name, backend, tensor_parallel_size, self.dtype_name,
+                                                 kv_cache_dtype, self.device, self.engine, labelled, topology)
+            finally:
+                conn.close()
+            if labelled:
+                print(f"Device {self.device}, engine {self.engine}, topology {self.topology}")
 
         # Extract model config for size calculations
         self.dtype_bytes = DTYPE_TO_BYTES.get(dtype)
@@ -240,9 +261,9 @@ class SimulationPredictor:
                 JOIN model_operations mo ON mo.operation_id = s.operation_id
                 JOIN profiled_models pm ON pm.model_id = mo.model_id
                 WHERE {where}
-                  AND r.is_context = 1
-                """.format(where=self._deployment_where),
-                self._deployment_params,
+                  AND r.is_context = 1{results}
+                """.format(where=self._deployment_where, results=self._results_where),
+                self._deployment_params + tuple(self._results_params),
             ).fetchall()
             conn.close()
             result = {(op, sig) for op, sig in rows}

@@ -53,7 +53,9 @@ class EstimatorConfig:
     tp_size: Optional[int] = None  # Tensor parallel size filter
     dtype: Optional[str] = None  # Model dtype filter, as stored by the profiler (e.g. "bfloat16")
     kv_cache_dtype: Optional[str] = None  # KV-cache dtype filter (vLLM literal, e.g. "auto", "fp8")
-    topology: Optional[str] = None  # Network topology filter
+    topology: Optional[str] = None  # Network topology filter (default: that of the deployment's collectives)
+    device: Optional[str] = None  # GPU the measurements were taken on (default: the database's only one)
+    engine: Optional[str] = None  # Serving engine and version, e.g. vllm-0.33.0 (default: the database's only one)
     collective_backend: Optional[str] = None  # Collective backend filter (e.g., "NCCL")
     embedding_dim: int = 4096  # Model embedding dimension (for calculating max size_bytes)
 
@@ -97,6 +99,18 @@ class SimplifiedExecutionTimeEstimator:
         """Load data from the results database."""
         conn = sqlite3.connect(self.config.db_path)
 
+        # The device and engine to train on (doolysim/deployment.py): a database can hold several
+        from doolysim.deployment import resolve_device_engine, filter_sql, resolve_topology, columns
+        c = self.config
+        self.device, self.engine, self.labelled = resolve_device_engine(
+            conn, c.model_name, c.backend, c.tp_size, c.dtype, c.kv_cache_dtype, c.device, c.engine)
+        if self.labelled:
+            print(f"Device {self.device}, engine {self.engine}")
+        if c.train_comm_models:
+            c.topology = resolve_topology(conn, c.model_name, c.backend, c.tp_size, c.dtype, c.kv_cache_dtype,
+                                          self.device, self.engine, self.labelled, c.topology)
+            print(f"Topology {c.topology}")
+
         # First, get the list of operation signatures that should be trained for this model
         model_ops_query = """
             SELECT DISTINCT s.operation_name, s.signature_hash
@@ -126,6 +140,10 @@ class SimplifiedExecutionTimeEstimator:
             model_where_conditions.append("pm.kv_cache_dtype = ?")
             model_params.append(self.config.kv_cache_dtype)
 
+        if self.labelled:
+            model_where_conditions += ["pm.device IS ?", "pm.engine IS ?"]
+            model_params += [self.device, self.engine]
+
         if model_where_conditions:
             model_ops_query += " WHERE " + " AND ".join(model_where_conditions)
 
@@ -154,9 +172,11 @@ class SimplifiedExecutionTimeEstimator:
                 JOIN signatures s ON r.signature_hash = s.signature_hash
                 WHERE s.signature_hash IN ({})
             """.format(','.join('?' * len(signature_list)))
+            device_sql, device_params = filter_sql("r", self.device, self.engine, self.labelled)
+            query += device_sql
 
-            # Load results data for these signatures from ALL models/backends/tp
-            self.results_df = pd.read_sql_query(query, conn, params=signature_list)
+            # Load results data for these signatures from ALL models/backends/tp (of this device and engine)
+            self.results_df = pd.read_sql_query(query, conn, params=signature_list + device_params)
 
             print(f"Loaded training data:")
             for (op, sig), group_df in self.results_df.groupby(['operation_name', 'signature_hash']):
@@ -252,6 +272,11 @@ class SimplifiedExecutionTimeEstimator:
             if self.config.collective_backend is not None:
                 query += " AND cor.backend = ?"
                 params.append(self.config.collective_backend)
+
+            from doolysim.deployment import columns
+            if self.labelled and "engine" in columns(conn, "coll_op_results"):
+                query += " AND cor.engine IS ?"
+                params.append(self.engine)
 
             self.comm_df = pd.read_sql_query(query, conn, params=params)
 
@@ -1002,7 +1027,7 @@ class SimplifiedExecutionTimeEstimator:
 def main(model_name=None, backend=None, db_path=None, cache_dir=None,
          max_tokens=16384, max_batch_size=32,
          train_comm=False, train_comm_only=False, tp_size=None, embedding_dim=4096,
-         topology="DGX", collective_backend="NCCL", dtype=None, kv_cache_dtype=None):
+         topology=None, collective_backend="NCCL", dtype=None, kv_cache_dtype=None, device=None, engine=None):
 
     # Initialize estimator with optional filtering. Resolution order:
     # explicit arg > DOOLYSIM_CACHE_DIR/DB_PATH env var > error.
@@ -1026,6 +1051,8 @@ def main(model_name=None, backend=None, db_path=None, cache_dir=None,
         embedding_dim=embedding_dim,
         topology=topology,
         collective_backend=collective_backend,
+        device=device,
+        engine=engine,
         prediction_max_tokens=max_tokens,
         prediction_max_batch_size=max_batch_size
     )
@@ -1076,7 +1103,15 @@ if __name__ == "__main__":
     parser.add_argument("--kv-cache-dtype", type=str, default=None,
                         help="Filter by KV-cache dtype (vLLM literal: auto, fp8, fp8_e4m3, fp8_e5m2)")
     parser.add_argument("--embedding-dim", type=int, default=4096, help="Model embedding dimension (for max size_bytes calculation)")
-    parser.add_argument("--topology", type=str, default="mew1", help="Filter comm data by topology (e.g., 'DGX', 'NVLINK')")
+    parser.add_argument("--topology", type=str, default=None,
+                        help="Topology label of the collective timings (default: the one the deployment's collectives "
+                             "were recorded under, e.g. nvidia-a100-80gb-pcie-nvlink)")
+    parser.add_argument("--device", type=str, default=None,
+                        help="GPU of the measurements, as DoolyProf labels it (e.g. nvidia-a100-80gb-pcie); "
+                             "default: the database's only one for this deployment")
+    parser.add_argument("--engine", type=str, default=None,
+                        help="Serving engine and version of the measurements (e.g. vllm-0.33.0); "
+                             "default: the database's only one for this deployment")
     parser.add_argument("--collective-backend", type=str, default="NCCL", help="Collective communication backend (e.g., 'NCCL')")
 
     args = parser.parse_args()
@@ -1094,6 +1129,8 @@ if __name__ == "__main__":
         embedding_dim=args.embedding_dim,
         topology=args.topology,
         collective_backend=args.collective_backend,
+        device=args.device,
+        engine=args.engine,
         max_tokens=args.max_token_count,
         max_batch_size=args.max_batch_size
     )
