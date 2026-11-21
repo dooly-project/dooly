@@ -341,53 +341,14 @@ class CommProfiler:
         self.profile_method = config.profile_method
 
     def make_db(self):
-        # create table in db
+        """Create the database's tables or bring them up to date (doolyprof.profiler.db)."""
+        from doolyprof.profiler import db as profile_db
         conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS coll_op_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                operation TEXT NOT NULL,
-                topology TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                tp_size INTEGER NOT NULL,
-                size_bytes INTEGER NOT NULL,
-                dtype TEXT,
-                dim_param INTEGER,
-                num_dims INTEGER,
-                latency_ms REAL NOT NULL,
-                UNIQUE(operation, topology, backend, dtype, tp_size, size_bytes, dim_param, num_dims)
-            )
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS coll_ops (
-                collective_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signature_hash TEXT UNIQUE NOT NULL,
-                operation_name TEXT NOT NULL,
-                topology TEXT NOT NULL,
-                tp_degree INTEGER NOT NULL,
-                num_dims INTEGER,
-                dim_param INTEGER
-            )
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS model_collectives (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                model_id INTEGER NOT NULL,
-                collective_id INTEGER NOT NULL,
-                count INTEGER NOT NULL DEFAULT 1,
-                FOREIGN KEY (model_id) REFERENCES profiled_models(model_id),
-                FOREIGN KEY (collective_id) REFERENCES coll_ops(collective_id),
-                UNIQUE(model_id, collective_id)
-               )
-            """)
-
-        conn.commit()
+        profile_db.init_schema(conn)
         conn.close()
-
-        print(f"✓ Database initialized at {self.db_path}")
+        self.engine = profile_db.engine_label()
+        self.run_id = int(os.environ["DOOLY_RUN_ID"]) if os.environ.get("DOOLY_RUN_ID") else None
+        print(f"✓ Database initialized at {self.db_path} (engine {self.engine})")
 
     def profile_all_reduce(self, tp_group, sizes, warmup_iters, measure_iters, batch_size, dtype_str):
         """Profile all_reduce operation using selected method."""
@@ -559,8 +520,8 @@ class CommProfiler:
             # Check if this operation already has data
             existing_count = cursor.execute("""
                 SELECT COUNT(*) FROM coll_op_results
-                WHERE operation = ? AND topology = ? AND tp_size = ?
-            """, (op_name, topology, tp_size)).fetchone()[0]
+                WHERE operation = ? AND topology = ? AND tp_size = ? AND engine IS ?
+            """, (op_name, topology, tp_size, getattr(self, "engine", None))).fetchone()[0]
 
             if existing_count == 0:
                 needs_profiling = True
@@ -621,10 +582,10 @@ class CommProfiler:
                 cursor.execute("""
                     DELETE FROM coll_op_results
                     WHERE operation = ? AND topology = ? AND tp_size = ?
-                    AND size_bytes = ? AND dim_param IS ? AND num_dims = ?
+                    AND size_bytes = ? AND dim_param IS ? AND num_dims = ? AND engine IS ?
                 """, (
                     result['operation'], topology or group_topology(result.get('tp_size') or tp_size), result.get('tp_size') or tp_size,
-                    result['size_bytes'], result.get('dim_param'), result.get('num_dims', 2)
+                    result['size_bytes'], result.get('dim_param'), result.get('num_dims', 2), getattr(self, "engine", None)
                 ))
 
         # Insert new results
@@ -633,25 +594,25 @@ class CommProfiler:
                 cursor.execute("""
                     INSERT INTO coll_op_results
                     (operation, topology, backend, tp_size, size_bytes, dtype,
-                     dim_param, num_dims, latency_ms)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     dim_param, num_dims, latency_ms, engine, run_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     result['operation'], topology or group_topology(result.get('tp_size') or tp_size), backend, result.get('tp_size') or tp_size,
                     result['size_bytes'], result['dtype'],
                     result.get('dim_param'), result.get('num_dims', 2),
-                    result['latency_ms']
+                    result['latency_ms'], getattr(self, "engine", None), getattr(self, "run_id", None)
                 ))
             except sqlite3.IntegrityError:
                 # Update existing entry
                 cursor.execute("""
                     UPDATE coll_op_results
-                    SET latency_ms = ?
+                    SET latency_ms = ?, run_id = ?
                     WHERE operation = ? AND topology = ? AND tp_size = ?
-                    AND size_bytes = ? AND dim_param IS ? AND num_dims = ?
+                    AND size_bytes = ? AND dim_param IS ? AND num_dims = ? AND engine IS ?
                 """, (
-                    result['latency_ms'],
+                    result['latency_ms'], getattr(self, "run_id", None),
                     result['operation'], topology or group_topology(result.get('tp_size') or tp_size), result.get('tp_size') or tp_size,
-                    result['size_bytes'], result.get('dim_param'), result.get('num_dims', 2)
+                    result['size_bytes'], result.get('dim_param'), result.get('num_dims', 2), getattr(self, "engine", None)
                 ))
 
         conn.commit()

@@ -459,53 +459,14 @@ class CommProfiler:
         self.db_path = db_path
 
     def make_db(self):
-        # create table in db
+        """Create the database's tables or bring them up to date (doolyprof.profiler.db)."""
+        from doolyprof.profiler import db as profile_db
         conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS coll_op_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                operation TEXT NOT NULL,
-                topology TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                tp_size INTEGER NOT NULL,
-                size_bytes INTEGER NOT NULL,
-                dtype TEXT,
-                dim_param INTEGER,
-                num_dims INTEGER,
-                latency_ms REAL NOT NULL,
-                UNIQUE(operation, topology, backend, dtype, tp_size, size_bytes, dim_param, num_dims)
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS coll_ops (
-                collective_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signature_hash TEXT UNIQUE NOT NULL,
-                operation_name TEXT NOT NULL,  
-                topology TEXT NOT NULL,        
-                tp_degree INTEGER NOT NULL,   
-                num_dims INTEGER,
-                dim_param INTEGER
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS model_collectives (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                model_id INTEGER NOT NULL,
-                collective_id INTEGER NOT NULL,
-                count INTEGER NOT NULL DEFAULT 1,
-                FOREIGN KEY (model_id) REFERENCES profiled_models(model_id),
-                FOREIGN KEY (collective_id) REFERENCES coll_ops(collective_id),
-                UNIQUE(model_id, collective_id)
-               ) 
-            """)
-        
-        conn.commit()
+        profile_db.init_schema(conn)
         conn.close()
-        
-        print(f"✓ Database initialized at {self.db_path}")
+        self.engine = profile_db.engine_label()
+        self.run_id = int(os.environ["DOOLY_RUN_ID"]) if os.environ.get("DOOLY_RUN_ID") else None
+        print(f"✓ Database initialized at {self.db_path} (engine {self.engine})")
 
     def should_profile(self, tp_size, overwrite=False, topology=None):
         """Check if we should profile based on existing data and overwrite flag.
@@ -528,8 +489,9 @@ class CommProfiler:
             existing_count = cursor.execute("""
                 SELECT COUNT(*) FROM coll_op_results
                 WHERE operation = ? AND topology = ? AND tp_size = ?
-                AND dim_param IS ? AND num_dims = ?
-            """, (entry["operation"], topology, tp_size, entry["dim_param"], entry["num_dims"])).fetchone()[0]
+                AND dim_param IS ? AND num_dims = ? AND engine IS ?
+            """, (entry["operation"], topology, tp_size, entry["dim_param"], entry["num_dims"],
+                  getattr(self, "engine", None))).fetchone()[0]
             tag = f"{entry['operation']} (dim={entry['dim_param']}, ndims={entry['num_dims']})"
             if existing_count == 0:
                 needs_profiling = True
@@ -666,26 +628,26 @@ class CommProfiler:
                 SELECT id FROM coll_op_results
                 WHERE operation = ? AND topology = ? AND backend = ?
                 AND tp_size = ? AND size_bytes = ? AND dtype = ?
-                AND dim_param = ? AND num_dims = ?
+                AND dim_param IS ? AND num_dims = ? AND engine IS ?
             """, (
                 result['operation'], result['topology'], result['backend'],
                 result['tp_size'], result['size_bytes'], result['dtype'],
-                result['dim_param'], result['num_dims']
+                result['dim_param'], result['num_dims'], getattr(self, "engine", None)
             )).fetchone()
 
             if existing and overwrite:
                 # Update existing result
                 cursor.execute("""
                     UPDATE coll_op_results
-                    SET latency_ms = ?
+                    SET latency_ms = ?, run_id = ?
                     WHERE id = ?
-                """, (result['latency_ms'], existing[0]))
+                """, (result['latency_ms'], getattr(self, "run_id", None), existing[0]))
             elif not existing:
                 # Insert new result
                 cursor.execute("""
                     INSERT INTO coll_op_results
-                    (operation, topology, backend, tp_size, size_bytes, dtype, dim_param, num_dims, latency_ms)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (operation, topology, backend, tp_size, size_bytes, dtype, dim_param, num_dims, latency_ms, engine, run_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                 result['operation'],
                 result['topology'],
@@ -695,7 +657,9 @@ class CommProfiler:
                 result['dtype'],
                 result['dim_param'],
                 result['num_dims'],
-                result['latency_ms']
+                result['latency_ms'],
+                getattr(self, "engine", None),
+                getattr(self, "run_id", None),
             ))
             
             # track unique collective operations for coll_ops table

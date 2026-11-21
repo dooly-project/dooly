@@ -275,8 +275,15 @@ def main() -> None:
         if p.exitcode != 0:
             print(f"Run {i + 1} failed with exit code {p.exitcode}")
             
+    # What this run measures on (CUDA_VISIBLE_DEVICES is --gpu, so the first visible GPU is the
+    # one profiled): results are stored, and reused, under its device and engine labels.
+    from doolyprof.profiler import db as profile_db
+    stack = profile_db.run_stack(args.attention_backend, args.flash_attn_version, argv=sys.argv)
+    print(f"[RUNNER] device {stack['device']}, engine {stack['engine']}, backend {stack['backend']}")
+
     # Compare modules across models
-    models[0].compare_with_many(models[1:], db_path=args.db_path, overwrite=args.overwrite)
+    models[0].compare_with_many(models[1:], db_path=args.db_path, overwrite=args.overwrite,
+                                device=stack["device"], engine=stack["engine"])
     
     print("Profiling Plan (Computation): ")
     
@@ -306,7 +313,10 @@ def main() -> None:
         gpu=args.gpu,
         kv_cache_dtype=args.kv_cache_dtype,
         gpu_memory_cap=args.gpu_memory_cap,
+        stack=stack,
     )
+    if profiler.run_id is not None:
+        os.environ["DOOLY_RUN_ID"] = str(profiler.run_id)  # the comm workers' rows carry it too
     
     import time
     start_time = time.perf_counter()
