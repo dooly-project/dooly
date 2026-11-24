@@ -47,6 +47,7 @@ for this GPU and engine), `export --db /out/dooly.db --out /out/DoolyDB`, `verif
 and on the host `hf upload dooly-project/DoolyDB dooly-out/DoolyDB . --repo-type dataset
 --create-pr`. The pull request opens as a draft; the user publishes it on its page (the
 dataset's Community tab). Uploading needs the user's `hf auth login`; never ask for or type a token.
+The full walkthrough (and what to do when `verify` fails) is docs/how-to-contribute.md.
 
 `docker/example.sh` runs `Qwen/Qwen3.8-27B` at `--tp 2` (`FLASH_ATTN`; on 2 GPUs with
 `--profile-comm` when the machine has two), `Qwen/Qwen3-30B-A3B` (`FLASHINFER`, needs an 80 GB GPU)

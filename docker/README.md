@@ -240,6 +240,8 @@ Options of `run`:
 
 ## Contributing to DoolyDB
 
+Step by step, with what to do when `verify` fails: [docs/how-to-contribute.md](../docs/how-to-contribute.md).
+
 [DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB) is the shared tree of DoolyProf results. Start from it, so your run only
 measures what is not there yet for your GPU and engine, then send what you added as a pull
 request. `hf` downloads and uploads it on your machine (`pip install huggingface_hub`, then

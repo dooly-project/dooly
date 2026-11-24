@@ -126,7 +126,8 @@ engines were recorded are not exported.
 
 [DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB) is the shared tree of DoolyProf results on Hugging Face, in the layout
 above. Start from it, so your run only measures what nobody has measured on your GPU and
-engine yet, then send what you added as a pull request:
+engine yet, then send what you added as a pull request (step by step, with Docker and what to do
+when `verify` fails: [docs/how-to-contribute.md](../docs/how-to-contribute.md)):
 
 ```bash
 hf download dooly-project/DoolyDB --repo-type dataset --local-dir DoolyDB     # the current tree
