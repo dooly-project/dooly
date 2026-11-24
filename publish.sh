@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# publish.sh — one-way, channel-aware publish of the doolyprof and doolysim packages
-# and the docker/ folder (image recipe, runner script and docs) from the development
+# publish.sh — one-way, channel-aware publish of the doolyprof and doolysim packages,
+# the docker/ folder (image recipe, runner script and docs) and docs/ from the development
 # branch of the dooly repository (dev-branch) into its release branch (main). Check
 # each out in its own worktree, e.g. from a clone that has main checked out:
 #   git worktree add ../dooly-dev dev-branch
@@ -39,6 +39,7 @@ PUBLISH_PATHS=(
   "doolyprof/"
   "doolysim/"
   "docker/"
+  "docs/"
 )
 
 EXCLUDES=(
