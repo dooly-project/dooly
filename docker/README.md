@@ -214,6 +214,7 @@ docker/dooly-docker.sh [--gpus N | --devices LIST] COMMAND [options]
 | `check-update` | Says whether Docker Hub has a newer image than your machine. |
 | `export --db /out/NAME/profile.db --out /out/profiles` | Writes the database's results as CSV files, one per operation, in a folder tree by GPU, engine, backend, model and deployment (below). Uses no GPU. |
 | `import /out/profiles --db /out/NAME/profile.db` | Merges such a tree into a database, so later runs on the same GPU and engine reuse its results. Uses no GPU. |
+| `verify /out/profiles` | Checks that a tree is exactly what `export` writes, e.g. before contributing it to [DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB). Uses no GPU. |
 | `trace ...` / `profile ...` | Runs only one stage, with the arguments of `doolyprof/run/run-tracer.py` / `run-profiler.py`. |
 
 Options of `run`:
@@ -222,6 +223,7 @@ Options of `run`:
 |---|---|---|
 | `--model` | (required) | Hugging Face model name, e.g. `meta-llama/Llama-3.1-8B`. Download it first. |
 | `--out` | (required) | Output folder; start it with `/out/` so it lands in `./dooly-out/`. |
+| `--db` | `OUT/profile.db` | Profile database to write to and reuse results from, e.g. one [DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB) was imported into. |
 | `--tp N` | 1 | Tensor parallelism: profile one rank of an N-way split. Runs on one GPU. |
 | `--dp N` | 1 | Data parallelism (with `--enable-expert-parallel` for MoE expert parallelism). |
 | `--enable-expert-parallel` | off | Split MoE experts across the `tp x dp` ranks. |

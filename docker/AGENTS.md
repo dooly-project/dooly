@@ -35,6 +35,8 @@ docker/dooly-docker.sh test
 docker/dooly-docker.sh check-update                               # is Docker Hub's image newer?
 docker/dooly-docker.sh export --db /out/NAME/profile.db --out /out/profiles   # no GPU; CSV tree
 docker/dooly-docker.sh import /out/profiles --db /out/NAME/profile.db         # no GPU; merge a tree
+docker/dooly-docker.sh verify /out/profiles                                   # no GPU; tree == export?
+docker/dooly-docker.sh run --model MODEL --out /out/NAME --db /out/dooly.db   # profile into, reuse from, a db
 docker/example.sh [dense] [moe] [hetero] [-- RUN-OPTIONS]        # example workloads, see below
 ```
 

@@ -1,6 +1,6 @@
 """DoolyProf command line, the container's entry point.
 
-    python -m doolyprof.cli run --model M --out DIR [--tp N] [--dp N] [--enable-expert-parallel]
+    python -m doolyprof.cli run --model M --out DIR [--db DB] [--tp N] [--dp N] [--enable-expert-parallel]
                                 [--attention-backend B] [--gpu-memory-cap F] [--max-batch-size N]
                                 [--max-seq-len N] [--profile-comm] [--tracer-args=...] [--profiler-args=...]
     python -m doolyprof.cli trace   <run-tracer.py arguments>
@@ -8,16 +8,18 @@
     python -m doolyprof.cli test    [suite ...]
     python -m doolyprof.cli export  --db DB --out DIR
     python -m doolyprof.cli import  DIR --db DB
+    python -m doolyprof.cli verify  DIR
 
 ``run`` traces the model (DIR/trace/, log DIR/trace.log), then profiles that
-trace into DIR/profile.db (log DIR/profile.log), on the GPUs this process can
-see, and exits non-zero if either stage fails. ``trace`` and ``profile`` pass
+trace into DIR/profile.db, or DB (log DIR/profile.log), on the GPUs this process
+can see, and exits non-zero if either stage fails. Results DB already has for this
+GPU and engine (e.g. imported from DoolyDB) are reused, not measured again. ``trace`` and ``profile`` pass
 their arguments to the scripts unchanged. ``test`` runs the unit and emulation
 suites in doolyprof/tests. ``export`` writes DB's measurements as a tree of CSV
 files under DIR (compute/<gpu>/<engine>/<backend>/<model>/<deployment>/ and
 communication/<topology>/<engine>/, see doolyprof/profiles.py); ``import`` merges
 such a tree into DB, so its measurements are reused by later runs on the same GPU
-and engine.
+and engine; ``verify`` checks that a tree is exactly what ``export`` writes.
 """
 import argparse
 import glob
@@ -76,6 +78,9 @@ def cmd_run(argv):
     p = argparse.ArgumentParser(prog="dooly run", description="Trace a model, then profile the trace.")
     p.add_argument("--model", required=True)
     p.add_argument("--out", required=True, help="output folder (trace/, trace.log, profile.db, profile.log)")
+    p.add_argument("--db", default=None,
+                   help="profile database to write and reuse results from (default: OUT/profile.db), e.g. one "
+                        "DoolyDB was imported into")
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--dp", type=int, default=1)
     p.add_argument("--enable-expert-parallel", action="store_true")
@@ -106,19 +111,23 @@ def cmd_run(argv):
                  "--trace_dir", os.path.join(out, "trace"), "--gpu", gpu.split(",")[0]] + cap
                  + shlex.split(a.tracer_args),
                  log=os.path.join(out, "trace.log"))
-    traces = sorted(glob.glob(os.path.join(out, "trace", "*.json")))
+    # the trace this run just wrote: an --out folder used before also holds earlier models' traces
+    traces = sorted((t for t in glob.glob(os.path.join(out, "trace", "*.json")) if os.path.getmtime(t) >= t0 - 1),
+                    key=os.path.getmtime)
     if rc != 0 or not traces:
         print(f"[dooly] trace failed (exit {rc}); see {out}/trace.log", flush=True)
         return rc or 1
-    print(f"[dooly] traced in {time.time() - t0:.0f}s: {traces[0]}", flush=True)
+    trace = traces[-1]
+    print(f"[dooly] traced in {time.time() - t0:.0f}s: {trace}", flush=True)
+    db = os.path.abspath(a.db) if a.db else os.path.join(out, "profile.db")
 
     t0 = time.time()
     log = os.path.join(out, "profile.log")
-    rc = _script(PROFILER, ["--models", a.model, "--traces", traces[0]] + par + [
+    rc = _script(PROFILER, ["--models", a.model, "--traces", trace] + par + [
                  "--profile-output", os.path.join(out, "profile"), "--dtype", a.dtype,
                  "--attention-backend", a.attention_backend, "--max-batch-size", str(a.max_batch_size),
                  "--max-seq-len", str(a.max_seq_len), "--gpu", gpu,
-                 "--db-path", os.path.join(out, "profile.db")] + cap + (["--profile-comm"] if a.profile_comm else [])
+                 "--db-path", db] + cap + (["--profile-comm"] if a.profile_comm else [])
                  + shlex.split(a.profiler_args), log=log)
     text = open(log, errors="replace").read()
     rows = re.findall(r"Wrote (\d+) results", text)
@@ -126,7 +135,7 @@ def cmd_run(argv):
     comm = ""
     if a.profile_comm:
         skipped = re.findall(r"Calls recorded on (\d+)-rank groups are not profiled", text)
-        comm = ", collective measurements: " + (_comm_rows(os.path.join(out, "profile.db")) or "none")
+        comm = ", collective measurements: " + (_comm_rows(db) or "none")
         comm += f" (skipped {'/'.join(skipped)}-rank groups)" if skipped else ""
     print(f"[dooly] profile exit {rc} in {time.time() - t0:.0f}s: "
           f"{rows[-1] if rows else 0} result rows, {unresolved} ops without a working parent{comm}", flush=True)
@@ -184,6 +193,24 @@ def cmd_import(argv):
     return 0
 
 
+def cmd_verify(argv):
+    p = argparse.ArgumentParser(prog="dooly verify", description="Check that a tree (dooly export's layout, e.g. a "
+                                "DoolyDB contribution) imports and is exactly what dooly export writes.")
+    p.add_argument("tree", help="folder holding compute/ and communication/")
+    a = p.parse_args(argv)
+    from doolyprof.profiles import verify_tree
+    problems, counts = verify_tree(a.tree)
+    for line in problems[:50]:
+        print(f"[dooly] {line}", flush=True)
+    if problems:
+        print(f"[dooly] {len(problems)} problem(s) in {a.tree}", flush=True)
+        return 1
+    print(f"[dooly] {a.tree} is valid: {counts.get('deployments', 0)} deployment(s), "
+          f"{counts.get('result_rows_added', 0)} result rows, {counts.get('communication_rows_added', 0)} "
+          f"collective rows", flush=True)
+    return 0
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] in ("-h", "--help"):
@@ -202,6 +229,8 @@ def main(argv=None):
         return cmd_export(rest)
     if command == "import":
         return cmd_import(rest)
+    if command == "verify":
+        return cmd_verify(rest)
     print(f"unknown command {command!r}\n{__doc__}", file=sys.stderr)
     return 2
 
