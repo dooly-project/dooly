@@ -10,11 +10,11 @@ Configuration-Agnostic, Redundancy-Aware Profiling for LLM Inference Simulation
 </h3>
 
 <p align="center">
-| <a href="https://dooly-project.github.io"><b>Website</b></a> | <a href="https://arxiv.org/abs/2605.07985"><b>Paper</b></a> | <a href="https://huggingface.co/dooly-project"><b>DoolyDB</b></a> |
+| <a href="https://dooly-project.github.io"><b>Website</b></a> | <a href="https://arxiv.org/abs/2605.07985"><b>Paper</b></a> | <a href="https://huggingface.co/datasets/dooly-project/DoolyDB"><b>DoolyDB</b></a> |
 </p>
 
 Dooly provides a profiler that **automatically finds the set of operations** called by your deployment configuration (hardware, attention backend, model, parallelism),
-and **reduces profiling time by re-using profiles** from the [DoolyDB](https://huggingface.co/dooly-project).
+and **reduces profiling time by re-using profiles** from the [DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB).
 As an example use case, we also provide a simulator (DoolySim) that predicts LLM serving performance across deployment configurations.
 
 - **DoolyProf** ([`doolyprof/`](doolyprof/README.md)): our per-operation granularity profiler used to populate DoolyDB
