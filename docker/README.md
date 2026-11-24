@@ -12,7 +12,8 @@ It works in two stages:
    (all-reduce, all-gather, ...) on real groups of GPUs.
 
 The Docker image has everything this needs: CUDA 13.0, Python 3.11, vLLM 0.33, PyTorch 2.14,
-FlashInfer and DoolyProf. You only need a Linux machine with an NVIDIA GPU and this folder.
+FlashInfer and DoolyProf (and DoolySim, see [doolysim/README.md](../doolysim/README.md)). You
+only need a Linux machine with an NVIDIA GPU and this folder.
 Model weights are never downloaded: DoolyProf only needs a model's config and tokenizer.
 
 ---
@@ -65,7 +66,7 @@ docker/dooly-docker.sh test
 It ends with:
 
 ```
-[dooly] 12/12 suites passed
+[dooly] 13/13 suites passed
 ```
 
 **4. Download a model's config and tokenizer** (a few MB, no weights):

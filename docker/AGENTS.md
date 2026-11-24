@@ -6,7 +6,7 @@ This file is for coding agents that run DoolyProf for a user. People should read
 ## What this is
 
 - `docker/dooly-docker.sh` runs the public image `jhkjames1110/doolyprof:latest` (vLLM 0.33,
-  PyTorch 2.14, CUDA 13.0, DoolyProf; `latest` is the repository's main branch).
+  PyTorch 2.14, CUDA 13.0, DoolyProf and DoolySim; `latest` is the repository's main branch).
 - `run` traces a model (records every distinct GPU operation and how its shapes depend on the
   batch), then profiles it (times each operation over batch sizes) into a SQLite database.
 - The image is **offline** (`HF_HUB_OFFLINE=1`). A model must be fetched with `download` first.
@@ -162,23 +162,20 @@ EOF
 
 ## Maintainers: publishing a new image
 
-The image is the full build (`docker/Dockerfile`) plus the current `doolyprof/` package.
-When `doolyprof/` changes on main, rebuild and push a thin image (needs `docker login` as the
-image owner; an agent must not enter credentials):
+The image is the full build (`docker/Dockerfile`) of a commit of main: its Python packages
+(`docker/requirements.txt`) and the `doolyprof/` and `doolysim/` packages, with the commit in the
+label `org.opencontainers.image.revision`. Rebuild and push it when main changes (needs `docker
+login` as the image owner; an agent must not enter credentials), from a clean copy of the commit:
 
 ```bash
-SHA=$(git rev-parse HEAD); SRC=$(mktemp -d)
-git archive "$SHA" doolyprof | tar -x -C "$SRC"
-cat > "$SRC/Dockerfile" <<EOF
-FROM jhkjames1110/doolyprof:latest
-RUN rm -rf /opt/dooly/doolyprof
-COPY doolyprof /opt/dooly/doolyprof
-LABEL org.opencontainers.image.revision=$SHA
-EOF
-docker build -t jhkjames1110/doolyprof:latest "$SRC"
-DOOLY_IMAGE=jhkjames1110/doolyprof:latest docker/dooly-docker.sh test     # must be 12/12
+SHA=$(git rev-parse main); SRC=$(mktemp -d)
+git archive "$SHA" docker doolyprof doolysim | tar -x -C "$SRC"
+docker build -f "$SRC/docker/Dockerfile" --label org.opencontainers.image.revision=$SHA \
+  -t jhkjames1110/doolyprof:latest "$SRC"
+DOOLY_IMAGE=jhkjames1110/doolyprof:latest docker/dooly-docker.sh test     # every suite must pass
 docker push jhkjames1110/doolyprof:latest
 ```
 
-If the Python dependencies change (`docker/requirements.txt`), rebuild from
-`docker/Dockerfile` instead.
+When only `doolyprof/` or `doolysim/` changed, a thin image on top of the published one builds in
+seconds: `FROM jhkjames1110/doolyprof:latest`, `RUN rm -rf /opt/dooly/doolyprof
+/opt/dooly/doolysim`, `COPY` both from the archive, and the same label.
