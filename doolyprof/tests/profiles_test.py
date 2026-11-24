@@ -2,6 +2,8 @@
 
 - export -> import into an empty database -> export gives byte-identical files
 - import is a union: importing twice adds nothing; rows of another device are kept apart
+- an operation is measured once per batch shape: a run of another TP degree adds nothing, and
+  export writes one row per batch shape of a database that has two
 - the profiler's reuse lookup sees only rows of its own device and engine
 - an older database (no device, engine or run columns) is brought up to date, keeps its rows,
   and its unlabelled rows are neither reused nor exported
@@ -25,7 +27,7 @@ def _stack(device, engine="vllm-0.33.0", uid=None):
             "backend": "FLASH_ATTN-fa2", "versions": {"vllm": engine.split("-")[-1]}, "argv": ["run-profiler.py"]}
 
 
-def _fill(path, device, engine="vllm-0.33.0", model="org/model-a", sigs=("s1", "s2"), latency=1.0):
+def _fill(path, device, engine="vllm-0.33.0", model="org/model-a", sigs=("s1", "s2"), latency=1.0, tp=2):
     """A database with one deployment of ``model`` measured on ``device`` (the rows the profiler writes)."""
     con = sqlite3.connect(path)
     profile_db.init_schema(con)
@@ -33,8 +35,8 @@ def _fill(path, device, engine="vllm-0.33.0", model="org/model-a", sigs=("s1", "
     run_id = profile_db.record_run(con, stack, started_at="2026-11-20 10:00:00")
     model_id = con.execute("""INSERT INTO profiled_models (model_name, model_family, backend, tp_degree, dtype,
                                   kv_cache_dtype, ep_degree, device, engine, backend_version, created_at)
-                              VALUES (?, 'fam', 'FLASH_ATTN', 2, 'bfloat16', 'auto', 1, ?, ?, 'FLASH_ATTN-fa2',
-                                      '2026-11-20 10:00:01')""", (model, device, engine)).lastrowid
+                              VALUES (?, 'fam', 'FLASH_ATTN', ?, 'bfloat16', 'auto', 1, ?, ?, 'FLASH_ATTN-fa2',
+                                      '2026-11-20 10:00:01')""", (model, tp, device, engine)).lastrowid
     for i, sig in enumerate(sigs):
         op = con.execute("SELECT operation_id FROM signatures WHERE signature_hash = ?", (sig,)).fetchone()
         op = op[0] if op else con.execute("INSERT INTO signatures (signature_hash, operation_name, signature_json) "
@@ -45,9 +47,10 @@ def _fill(path, device, engine="vllm-0.33.0", model="org/model-a", sigs=("s1", "
             con.execute("""INSERT INTO results (signature_hash, mean_latency_ms, median_latency_ms, max_latency_ms,
                                min_latency_ms, std_latency_ms, num_tokens, num_requests, is_context, is_prefill,
                                kv_cache_size, num_tensor_parallel_workers, input_shapes, created_at, device, engine, run_id)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 2, '[[1, 4096]]', '2026-11-20 10:00:02', ?, ?, ?)""",
+                           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, '[[1, 4096]]', '2026-11-20 10:00:02', ?, ?, ?)""",
                         (sig, latency * n + 0.1, latency * n, latency * n * 1.5, latency * n * 0.9, 1e-3 / 3,
-                         n, 1 if i == 0 else 0, 1 if i == 0 else None, 64 if i == 0 else None, device, engine, run_id))
+                         n, 1 if i == 0 else 0, 1 if i == 0 else None, 64 if i == 0 else None, tp, device, engine,
+                         run_id))
     co = con.execute("""INSERT OR IGNORE INTO coll_ops (signature_hash, operation_name, topology, tp_degree, num_dims,
                             dim_param) VALUES ('c1', 'all_reduce', ?, 2, 2, -1)""", (device + "-pcie",)).lastrowid
     co = con.execute("SELECT collective_id FROM coll_ops WHERE signature_hash = 'c1'").fetchone()[0]
@@ -128,6 +131,55 @@ def test_import_is_a_union_and_keeps_devices_apart():
         y = con.execute("SELECT mean_latency_ms FROM results WHERE device = 'gpu-y' AND num_tokens = 128 "
                         "AND signature_hash = 's2'").fetchone()[0]
         assert y == 2.0 * 128 + 0.1, y
+
+
+def test_one_measurement_per_batch_shape_whatever_the_tp_degree():
+    # The same operations measured at the same batch shapes by a TP 1 and a TP 2 run that did not
+    # share a database (two contributors, or the seed of a dataset built from two runs)
+    with tempfile.TemporaryDirectory() as d:
+        _fill(f"{d}/tp1.db", "gpu-x", tp=1, latency=1.0)
+        _fill(f"{d}/tp2.db", "gpu-x", tp=2, latency=1.1)
+        profiles.export_db(f"{d}/tp1.db", f"{d}/t1")
+        profiles.export_db(f"{d}/tp2.db", f"{d}/t2")
+        profiles.import_tree(f"{d}/t1", f"{d}/m.db")
+        done = profiles.import_tree(f"{d}/t2", f"{d}/m.db")
+        assert done["deployments_added"] == 1 and done["result_rows_added"] == 0, done
+        assert done["result_rows_present"] == 6, done
+        con = sqlite3.connect(f"{d}/m.db")
+        assert con.execute("SELECT COUNT(*), MIN(num_tensor_parallel_workers), MAX(num_tensor_parallel_workers) "
+                           "FROM results").fetchone() == (6, 1, 1)
+        con.close()
+        done = profiles.export_db(f"{d}/m.db", f"{d}/m")
+        assert done["deployments"] == 2 and done["duplicate_rows"] == 0, done
+        base = f"{d}/m/compute/gpu-x/vllm-0.33.0/FLASH_ATTN-fa2/org/model-a"
+        for f in ("Attention-s1.csv", "aten-linear-s2.csv"):   # both deployments: the TP 1 run's rows, once
+            assert filecmp.cmp(f"{base}/tp1-bfloat16-kvauto/{f}", f"{base}/tp2-bfloat16-kvauto/{f}", shallow=False)
+            assert filecmp.cmp(f"{base}/tp1-bfloat16-kvauto/{f}",
+                               f"{d}/t1/compute/gpu-x/vllm-0.33.0/FLASH_ATTN-fa2/org/model-a/tp1-bfloat16-kvauto/{f}",
+                               shallow=False)
+        assert profiles.verify_tree(f"{d}/m")[0] == []
+
+        # A database that already has both measurements exports the first one, once
+        con = sqlite3.connect(f"{d}/tp1.db")
+        con.execute("""INSERT INTO results (signature_hash, mean_latency_ms, median_latency_ms, max_latency_ms,
+                           min_latency_ms, std_latency_ms, num_tokens, num_requests, is_context, is_prefill,
+                           kv_cache_size, num_tensor_parallel_workers, input_shapes, created_at, device, engine, run_id)
+                       SELECT signature_hash, mean_latency_ms * 1.1, median_latency_ms * 1.1, max_latency_ms,
+                           min_latency_ms, std_latency_ms, num_tokens, num_requests, is_context, is_prefill,
+                           kv_cache_size, 2, input_shapes, created_at, device, engine, run_id FROM results""")
+        con.commit()
+        con.close()
+        done = profiles.export_db(f"{d}/tp1.db", f"{d}/both")
+        assert done["result_rows"] == 6 and done["duplicate_rows"] == 6, done
+        _same_tree(f"{d}/t1", f"{d}/both")
+
+        # verify names a file that measures a batch shape twice
+        path = f"{d}/t1/compute/gpu-x/vllm-0.33.0/FLASH_ATTN-fa2/org/model-a/tp1-bfloat16-kvauto/aten-linear-s2.csv"
+        lines = open(path).read().splitlines(True)
+        open(path, "w").write("".join(lines + [lines[1]]))
+        problems, _ = profiles.verify_tree(f"{d}/t1")
+        assert len(problems) == 1 and "aten-linear-s2.csv: 1 batch shape(s) measured more than once" in problems[0], \
+            problems
 
 
 def test_reuse_only_for_the_same_device_and_engine():

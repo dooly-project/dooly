@@ -172,6 +172,9 @@ def cmd_export(argv):
     print(f"[dooly] exported {d['deployments']} deployment(s): {d['operation_files']} operation files "
           f"({d['result_rows']} rows), {d['communication_files']} collective files ({d['communication_rows']} rows) "
           f"to {a.out}", flush=True)
+    if d["duplicate_rows"]:
+        print(f"[dooly] not exported: {d['duplicate_rows']} second measurement(s) of an operation at a batch shape "
+              f"(e.g. by runs of different TP degrees); the first is kept", flush=True)
     if d["skipped_deployments"] or d["skipped_communication_rows"]:
         print(f"[dooly] not exported: {d['skipped_deployments']} deployment(s) and {d['skipped_communication_rows']} "
               f"collective rows measured before GPUs and engines were recorded", flush=True)
