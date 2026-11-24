@@ -43,7 +43,7 @@ pip install -r requirements.txt
 - **Simulate serving** with DoolySim: [doolysim/README.md](doolysim/README.md).
 - **Reuse and share profiles** with [DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB):
   import it before profiling so that only what it does not have yet is measured, and send what
-  you add as a pull request ([how](doolyprof/README.md#contributing-to-doolydb)).
+  you add as a pull request ([how](docs/how-to-contribute.md)).
 
 ## Repository layout
 
