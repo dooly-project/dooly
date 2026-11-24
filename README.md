@@ -41,6 +41,9 @@ pip install -r requirements.txt
   way is the Docker image and `docker/dooly-docker.sh` ([docker/README.md](docker/README.md));
   the installed packages work too.
 - **Simulate serving** with DoolySim: [doolysim/README.md](doolysim/README.md).
+- **Reuse and share profiles** with [DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB):
+  import it before profiling so that only what it does not have yet is measured, and send what
+  you add as a pull request ([how](doolyprof/README.md#contributing-to-doolydb)).
 
 ## Repository layout
 
