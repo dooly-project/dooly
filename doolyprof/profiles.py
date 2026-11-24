@@ -17,6 +17,13 @@ Face name (``Qwen/Qwen3.8-27B``, two folders), ``<deployment>``
 ``tp<N>[-ep<M>]-<dtype>-kv<KV-cache dtype>`` (``tp2-bfloat16-kvauto``). Every folder is
 self-contained: an operation several models share is written into each model's folder.
 
+An operation is measured once per batch shape on a device and engine. The tensor-parallel
+degree of the run that measured it is recorded (``num_tensor_parallel_workers``) but does not
+make a second measurement: a deployment of another degree that runs the same operation (the
+same signature, so the same shapes and kernels, e.g. RMSNorm over the full hidden size) does the
+same work. A database holding two measurements of one batch shape (two runs that did not share a
+database) exports the first one it got.
+
 Export only reads the database. Import is the reverse, a union into a database: rows the
 database already has (the same signature, batch shape, device and engine) are kept as they
 are. Rows written before devices and engines were recorded (doolyprof.profiler.db) are not
@@ -36,10 +43,12 @@ import sqlite3
 
 from doolyprof.profiler import db as profile_db
 
-# A measured batch shape (the key of a latency row, with device and engine) and its statistics,
-# in the order of the columns of an operation's CSV.
-SHAPE = ["num_tokens", "num_requests", "is_context", "is_prefill", "kv_cache_size", "prefill_chunk_size",
-         "activated_experts", "local_pairs", "num_tensor_parallel_workers"]
+# A measured batch shape (with the signature, device and engine, the key of a latency row), then the
+# TP degree of the run that measured it (recorded, not part of the key) and the statistics, in the
+# order of the columns of an operation's CSV.
+BATCH = ["num_tokens", "num_requests", "is_context", "is_prefill", "kv_cache_size", "prefill_chunk_size",
+         "activated_experts", "local_pairs"]
+SHAPE = BATCH + ["num_tensor_parallel_workers"]
 STATS = ["mean_latency_ms", "median_latency_ms", "min_latency_ms", "max_latency_ms", "std_latency_ms"]
 RESULT_COLUMNS = SHAPE + STATS + ["input_shapes", "created_at", "run"]
 MODEL_COLUMNS = ["file", "operation_name", "signature_hash", "count", "signature_json"]
@@ -117,7 +126,8 @@ def export_db(db_path, out_dir):
     labelled = "device" in cols["profiled_models"] and "device" in cols["results"]
     runs = {r["run_id"]: r for r in con.execute("SELECT * FROM profile_runs")} if cols["profile_runs"] else {}
     done = {"deployments": 0, "operation_files": 0, "result_rows": 0, "communication_files": 0,
-            "communication_rows": 0, "skipped_deployments": 0, "skipped_communication_rows": 0}
+            "communication_rows": 0, "skipped_deployments": 0, "skipped_communication_rows": 0, "duplicate_rows": 0}
+    counted = set()   # (signature, device, engine) whose second measurements are counted
 
     models = con.execute("SELECT * FROM profiled_models ORDER BY model_id").fetchall() if cols["profiled_models"] else []
     for pm in models:
@@ -134,9 +144,17 @@ def export_db(db_path, out_dir):
                           (pm["model_id"],)).fetchall()
         model_rows, used_runs, files = [], set(), set()
         for op in ops:
-            rows = con.execute(f"""SELECT * FROM results WHERE signature_hash = ? AND device = ? AND engine = ?
-                                   ORDER BY {_order(SHAPE)}""",
-                               (op["signature_hash"], pm["device"], pm["engine"])).fetchall()
+            key = (op["signature_hash"], pm["device"], pm["engine"])
+            # One row per batch shape: the first measurement the database got, should it have several
+            rows = con.execute(f"""SELECT * FROM results WHERE id IN (
+                                       SELECT MIN(id) FROM results WHERE signature_hash = ? AND device = ? AND engine = ?
+                                       GROUP BY {', '.join(BATCH)})
+                                   ORDER BY {_order(BATCH)}""", key).fetchall()
+            if key not in counted:
+                counted.add(key)
+                done["duplicate_rows"] += con.execute(
+                    "SELECT COUNT(*) FROM results WHERE signature_hash = ? AND device = ? AND engine = ?",
+                    key).fetchone()[0] - len(rows)
             fname = f"{_name(op['operation_name'])}-{op['signature_hash'][:8]}.csv" if rows else ""
             if rows:
                 out = []
@@ -256,9 +274,10 @@ def _import_deployment(con, folder, done):
         if not op["file"]:
             continue
         for r in _read_csv(os.path.join(folder, op["file"])):
-            where = " AND ".join(f"{c} IS ?" for c in SHAPE)
+            # Already measured at this batch shape, by a run of any TP degree
+            where = " AND ".join(f"{c} IS ?" for c in BATCH)
             if con.execute(f"SELECT 1 FROM results WHERE signature_hash = ? AND {where} AND device IS ? AND engine IS ?",
-                           [op["signature_hash"]] + [r[c] for c in SHAPE] + [d["device"], d["engine"]]).fetchone():
+                           [op["signature_hash"]] + [r[c] for c in BATCH] + [d["device"], d["engine"]]).fetchone():
                 done["result_rows_present"] += 1
                 continue
             cols = ["signature_hash"] + SHAPE + STATS + ["input_shapes", "created_at", "device", "engine", "run_id"]
@@ -340,7 +359,7 @@ def verify_tree(tree_dir):
     (a README) are not checked."""
     import filecmp
     import tempfile
-    missing = []   # files a model.csv lists that are not there: the round trip cannot run without them
+    missing = []   # files a model.csv lists that are not there, or that measure a batch shape twice
     for root, _dirs, files in sorted(os.walk(os.path.join(tree_dir, "compute"))):
         if "model.csv" not in files:
             continue
@@ -350,7 +369,17 @@ def verify_tree(tree_dir):
         except Exception as e:  # noqa: BLE001
             missing.append(f"{rel}/model.csv: unreadable ({type(e).__name__}: {e})")
             continue
-        missing += [f"{rel}/{f}: missing (model.csv lists it)" for f in listed if not os.path.exists(os.path.join(root, f))]
+        for f in listed:
+            if not os.path.exists(os.path.join(root, f)):
+                missing.append(f"{rel}/{f}: missing (model.csv lists it)")
+                continue
+            try:
+                shapes = [tuple(r[c] for c in BATCH) for r in _read_csv(os.path.join(root, f))]
+            except Exception:  # noqa: BLE001 -- malformed: the round trip below reports it
+                continue
+            if len(set(shapes)) < len(shapes):
+                missing.append(f"{rel}/{f}: {len(shapes) - len(set(shapes))} batch shape(s) measured more than once "
+                               f"(e.g. by runs of different TP degrees); dooly export writes one row per batch shape")
     if missing:
         return missing, {}
     with tempfile.TemporaryDirectory() as tmp:

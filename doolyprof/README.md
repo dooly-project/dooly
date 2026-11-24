@@ -114,10 +114,13 @@ profiles/
 For example `compute/nvidia-rtx-pro-6000-blackwell-server-edition/vllm-0.33.0/FLASH_ATTN-fa2/Qwen/Qwen3.8-27B/tp2-bfloat16-kvauto/`.
 The backend folder names the version of what implements it (`FLASH_ATTN-fa2`,
 `FLASHINFER-0.7.2.post1`, `TRITON_ATTN-3.8.0`). Each model folder is self-contained, so an
-operation two models share is in both. Exporting into an existing tree replaces the folders of
-the deployments the database has (and its collectives' files), and leaves the others; importing
-never overwrites a result the database already has. Results measured before GPUs and engines
-were recorded are not exported.
+operation two models share is in both. An operation is measured once per batch shape: a
+deployment of another tensor-parallel degree that has the same operation (the same shapes and
+kernels, e.g. RMSNorm over the full hidden size) reuses it, and `num_tensor_parallel_workers`
+records the degree of the run that measured it. Exporting into an existing tree replaces the
+folders of the deployments the database has (and its collectives' files), and leaves the others;
+importing never overwrites a result the database already has. Results measured before GPUs and
+engines were recorded are not exported.
 
 ## Contributing to DoolyDB
 
