@@ -23,6 +23,9 @@ are. Rows written before devices and engines were recorded (doolyprof.profiler.d
 exported. Exporting a database, importing the tree into an empty one and exporting that gives
 the same files.
 
+``verify_tree()`` (``dooly verify``) checks a tree the same way: it imports it into an empty
+database and requires the export to give back exactly its files.
+
 Only the standard library is used.
 """
 import csv
@@ -323,3 +326,51 @@ def import_tree(tree_dir, db_path):
     con.commit()
     con.close()
     return done
+
+
+# --------------------------------------------------------------------------------------------
+# Verify
+# --------------------------------------------------------------------------------------------
+
+def verify_tree(tree_dir):
+    """(problems, counts): what is wrong with the tree under ``tree_dir`` (an empty list when it
+    is valid). Valid means it imports into an empty database and exporting that database gives
+    back exactly the files under compute/ and communication/: every file parses, every value is
+    as export writes it, nothing is missing and nothing else is there. Other files at the top
+    (a README) are not checked."""
+    import filecmp
+    import tempfile
+    missing = []   # files a model.csv lists that are not there: the round trip cannot run without them
+    for root, _dirs, files in sorted(os.walk(os.path.join(tree_dir, "compute"))):
+        if "model.csv" not in files:
+            continue
+        rel = os.path.relpath(root, tree_dir)
+        try:
+            listed = [r["file"] for r in _read_csv(os.path.join(root, "model.csv")) if r["file"]]
+        except Exception as e:  # noqa: BLE001
+            missing.append(f"{rel}/model.csv: unreadable ({type(e).__name__}: {e})")
+            continue
+        missing += [f"{rel}/{f}: missing (model.csv lists it)" for f in listed if not os.path.exists(os.path.join(root, f))]
+    if missing:
+        return missing, {}
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            counts = import_tree(tree_dir, os.path.join(tmp, "check.db"))
+        except Exception as e:  # noqa: BLE001 -- a malformed file: report it, do not crash
+            return [f"does not import: {type(e).__name__}: {e}"], {}
+        export_db(os.path.join(tmp, "check.db"), os.path.join(tmp, "export"))
+        problems = []
+        for sub in ("compute", "communication"):
+            ours, theirs = os.path.join(tmp, "export", sub), os.path.join(tree_dir, sub)
+            mine = {os.path.relpath(os.path.join(r, f), ours) for r, _, fs in os.walk(ours) for f in fs}
+            given = {os.path.relpath(os.path.join(r, f), theirs) for r, _, fs in os.walk(theirs) for f in fs}
+            for rel in sorted(given - mine):
+                problems.append(f"{sub}/{rel}: not written by dooly export (a stray file, or a deployment without "
+                                f"GPU and engine labels)")
+            for rel in sorted(mine - given):
+                problems.append(f"{sub}/{rel}: missing (its deployment references it)")
+            for rel in sorted(mine & given):
+                if not filecmp.cmp(os.path.join(ours, rel), os.path.join(theirs, rel), shallow=False):
+                    problems.append(f"{sub}/{rel}: differs from what dooly export writes for the same data "
+                                    f"(edited by hand, or two exports disagree)")
+        return problems, counts

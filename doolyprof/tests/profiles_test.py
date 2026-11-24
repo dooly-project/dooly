@@ -89,6 +89,27 @@ def test_export_import_round_trip():
         _same_tree(f"{d}/t1", f"{d}/t2")
 
 
+def test_verify_accepts_an_export_and_rejects_changes():
+    with tempfile.TemporaryDirectory() as d:
+        _fill(f"{d}/a.db", "gpu-x")
+        profiles.export_db(f"{d}/a.db", f"{d}/t")
+        problems, counts = profiles.verify_tree(f"{d}/t")
+        assert problems == [] and counts["deployments"] == 1, problems
+        assert profiles.verify_tree(f"{d}/empty")[0] == []   # no tree yet: nothing wrong
+        folder = f"{d}/t/compute/gpu-x/vllm-0.33.0/FLASH_ATTN-fa2/org/model-a/tp2-bfloat16-kvauto"
+        path = f"{folder}/aten-linear-s2.csv"
+        text = open(path).read()
+        lines = text.splitlines(True)
+        open(path, "w").write("".join([lines[0], lines[2], lines[1]] + lines[3:]))   # rows reordered by hand
+        open(f"{folder}/notes.txt", "w").write("x")                    # a stray file
+        problems, _ = profiles.verify_tree(f"{d}/t")
+        assert any("aten-linear-s2.csv" in p and "differs" in p for p in problems), problems
+        assert any("notes.txt" in p and "not written" in p for p in problems), problems
+        os.remove(f"{folder}/notes.txt"); open(path, "w").write(text); os.remove(f"{folder}/Attention-s1.csv")
+        problems, _ = profiles.verify_tree(f"{d}/t")
+        assert problems and all("Attention-s1.csv" in p for p in problems), problems
+
+
 def test_import_is_a_union_and_keeps_devices_apart():
     with tempfile.TemporaryDirectory() as d:
         _fill(f"{d}/x.db", "gpu-x")

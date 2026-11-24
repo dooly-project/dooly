@@ -94,7 +94,10 @@ and engine reuse its results:
 ```bash
 python -m doolyprof.cli export --db ./dooly_data.db --out ./profiles
 python -m doolyprof.cli import ./profiles --db ./dooly_data.db
+python -m doolyprof.cli verify ./profiles     # the tree is exactly what export writes
 ```
+
+`dooly run --db DB` profiles into DB instead of `OUT/profile.db`, reusing what it already has.
 
 With Docker: `docker/dooly-docker.sh export --db /out/NAME/profile.db --out /out/profiles`.
 
@@ -115,6 +118,28 @@ operation two models share is in both. Exporting into an existing tree replaces 
 the deployments the database has (and its collectives' files), and leaves the others; importing
 never overwrites a result the database already has. Results measured before GPUs and engines
 were recorded are not exported.
+
+## Contributing to DoolyDB
+
+[DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB) is the shared tree of DoolyProf results on Hugging Face, in the layout
+above. Start from it, so your run only measures what nobody has measured on your GPU and
+engine yet, then send what you added as a pull request:
+
+```bash
+hf download dooly-project/DoolyDB --repo-type dataset --local-dir DoolyDB     # the current tree
+python -m doolyprof.cli import DoolyDB --db dooly.db                          # into a database
+python -m doolyprof.cli run --model ORG/MODEL --out runs/model --db dooly.db --max-batch-size 32 --max-seq-len 8192
+python -m doolyprof.cli export --db dooly.db --out DoolyDB                    # your results join the tree
+python -m doolyprof.cli verify DoolyDB                                        # exactly what export writes?
+hf upload dooly-project/DoolyDB DoolyDB . --repo-type dataset --create-pr --commit-message "ORG/MODEL on <gpu>"
+```
+
+`hf` comes with `huggingface_hub` (`pip install huggingface_hub`); `hf auth login` first. The
+pull request shows the folders you added. Check each `deployment.json` before uploading: it
+records the run's command line, which may include local paths. Profile at a scale DoolySim can
+use (e.g. `--max-batch-size 32 --max-seq-len 8192`), and add `--tp N --profile-comm` on N
+linked GPUs to include collectives. With Docker, the same commands run through
+`docker/dooly-docker.sh` (`import`, `run --db`, `export`, `verify`), with paths under `/out/`.
 
 ## Layout
 

@@ -10,6 +10,7 @@
 #   docker/dooly-docker.sh test
 #   docker/dooly-docker.sh export --db /out/qwen3/profile.db --out /out/profiles   (no GPU; CSV tree)
 #   docker/dooly-docker.sh import /out/profiles --db /out/qwen3/profile.db         (no GPU)
+#   docker/dooly-docker.sh verify /out/profiles                                     (no GPU)
 #   docker/dooly-docker.sh check-update                     (is Docker Hub's image newer than yours?)
 #
 # Inside the container the chosen GPUs are 0..N-1 in the order chosen (CUDA_VISIBLE_DEVICES; the
@@ -123,7 +124,7 @@ if [ "${1:-}" = "download" ]; then  # model config and tokenizer files into $HF;
   exit $rc
 fi
 
-if [ "${1:-}" = "export" ] || [ "${1:-}" = "import" ]; then  # database <-> CSV tree under $OUT; needs no GPU
+if [ "${1:-}" = "export" ] || [ "${1:-}" = "import" ] || [ "${1:-}" = "verify" ]; then  # database <-> CSV tree; no GPU
   mkdir -p "$OUT"
   exec $DOCKER run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$OUT":/out "$IMAGE" "$@"
 fi
