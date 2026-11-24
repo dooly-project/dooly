@@ -40,6 +40,13 @@ docker/dooly-docker.sh run --model MODEL --out /out/NAME --db /out/dooly.db   # 
 docker/example.sh [dense] [moe] [hetero] [-- RUN-OPTIONS]        # example workloads, see below
 ```
 
+Contributing to [DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB) (the shared result tree on Hugging Face): `hf download
+dooly-project/DoolyDB --repo-type dataset --local-dir dooly-out/DoolyDB` on the host, then
+`import /out/DoolyDB --db /out/dooly.db`, `run ... --db /out/dooly.db` (reuses what DoolyDB has
+for this GPU and engine), `export --db /out/dooly.db --out /out/DoolyDB`, `verify /out/DoolyDB`,
+and on the host `hf upload dooly-project/DoolyDB dooly-out/DoolyDB . --repo-type dataset
+--create-pr`. Uploading needs the user's `hf auth login`; never ask for or type a token.
+
 `docker/example.sh` runs `Qwen/Qwen3.8-27B` at `--tp 2` (`FLASH_ATTN`; on 2 GPUs with
 `--profile-comm` when the machine has two), `Qwen/Qwen3-30B-A3B` (`FLASHINFER`, needs an 80 GB GPU)
 and `openai/gpt-oss-20b` (`TRITON_ATTN`), downloading configs it does not find in `HF_CACHE`.
