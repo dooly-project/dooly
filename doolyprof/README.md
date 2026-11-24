@@ -138,7 +138,11 @@ hf upload dooly-project/DoolyDB DoolyDB . --repo-type dataset --create-pr --comm
 ```
 
 `hf` comes with `huggingface_hub` (`pip install huggingface_hub`); `hf auth login` first. The
-pull request shows the folders you added. Check each `deployment.json` before uploading: it
+pull request opens as a draft, which cannot be merged: find it on the dataset's Community tab
+(Files changed lists the folders you added) and click **Publish**. Maintainers check it by
+verifying its revision (`hf download dooly-project/DoolyDB --repo-type dataset --revision
+refs/pr/<N> --local-dir pr-<N>`, then `python -m doolyprof.cli verify pr-<N>`; no GPU needed).
+Check each `deployment.json` before uploading: it
 records the run's command line, which may include local paths. Profile at a scale DoolySim can
 use (e.g. `--max-batch-size 32 --max-seq-len 8192`), and add `--tp N --profile-comm` on N
 linked GPUs to include collectives. With Docker, the same commands run through

@@ -256,8 +256,9 @@ hf upload dooly-project/DoolyDB dooly-out/DoolyDB . --repo-type dataset --create
 
 `run --db` reuses every result `dooly.db` already has for your GPU and engine, so a model whose
 operations are already in DoolyDB only measures what is new. The pull request adds your model's
-folder (an operation it shares with another model is copied into it unchanged). Check each
-`deployment.json` before uploading: it records the run's command line. Add
+folder (an operation it shares with another model is copied into it unchanged). It opens as a
+draft, which cannot be merged: find it on the dataset's Community tab and click **Publish**.
+Check each `deployment.json` before uploading: it records the run's command line. Add
 `--gpus N --tp N --profile-comm` to include collectives.
 
 ---
