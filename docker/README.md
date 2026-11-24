@@ -237,6 +237,31 @@ Options of `run`:
 
 ---
 
+## Contributing to DoolyDB
+
+[DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB) is the shared tree of DoolyProf results. Start from it, so your run only
+measures what is not there yet for your GPU and engine, then send what you added as a pull
+request. `hf` downloads and uploads it on your machine (`pip install huggingface_hub`, then
+`hf auth login`); the rest runs in the container, with `./dooly-out/` as `/out/`:
+
+```bash
+hf download dooly-project/DoolyDB --repo-type dataset --local-dir dooly-out/DoolyDB
+docker/dooly-docker.sh import /out/DoolyDB --db /out/dooly.db
+docker/dooly-docker.sh download ORG/MODEL
+docker/dooly-docker.sh run --model ORG/MODEL --out /out/model --db /out/dooly.db --max-batch-size 32 --max-seq-len 8192
+docker/dooly-docker.sh export --db /out/dooly.db --out /out/DoolyDB
+docker/dooly-docker.sh verify /out/DoolyDB
+hf upload dooly-project/DoolyDB dooly-out/DoolyDB . --repo-type dataset --create-pr --commit-message "ORG/MODEL on <gpu>"
+```
+
+`run --db` reuses every result `dooly.db` already has for your GPU and engine, so a model whose
+operations are already in DoolyDB only measures what is new. The pull request adds your model's
+folder (an operation it shares with another model is copied into it unchanged). Check each
+`deployment.json` before uploading: it records the run's command line. Add
+`--gpus N --tp N --profile-comm` to include collectives.
+
+---
+
 ## Choosing GPUs
 
 By default the script takes **one free GPU**. A GPU counts as free when it has less than 4 GB in
