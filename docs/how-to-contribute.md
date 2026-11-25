@@ -21,7 +21,13 @@ database that DoolyProf and DoolySim work with is built from it on your machine 
    pip install -r requirements.txt
    ```
 
-   Or use the Docker image ([docker/README.md](../docker/README.md)); see
+   You also need a CUDA toolkit (nvcc) of the CUDA version PyTorch is built for, 13.0 with
+   `requirements.txt`: FlashInfer, which vLLM uses, compiles some kernels the first time they are
+   used, with the nvcc of `CUDA_HOME`. Point it there, e.g.
+   `export CUDA_HOME=/usr/local/cuda-13.0 PATH=/usr/local/cuda-13.0/bin:$PATH`; `dooly run`
+   prints a note when the nvcc it finds is of another version.
+
+   Or use the Docker image ([docker/README.md](../docker/README.md)), which has all of this; see
    [With Docker](#with-docker) for the same steps through `docker/dooly-docker.sh`.
 
 2. **Install the Hugging Face command line and sign in**: `pip install huggingface_hub`, then
@@ -58,6 +64,14 @@ database that DoolyProf and DoolySim work with is built from it on your machine 
    `--max-batch-size 32 --max-seq-len 8192`), and add `--tp N --profile-comm` on N linked GPUs
    to include collectives.
 
+   The run takes a GPU nobody else is on (under 4 GiB in use, no other user's process), or N
+   linked ones with `--profile-comm`, and stops when there are too few; set
+   `CUDA_VISIBLE_DEVICES` to choose them yourself. Attention runs on vLLM's `FLASH_ATTN` backend
+   unless you pass `--attention-backend` (e.g. `FLASHINFER`, `TRITON_ATTN`); each backend gets
+   its own folder in DoolyDB. The run ends with
+   `[dooly] profile exit 0 in Ns: R result rows, 0 ops without a working parent`, where R is the
+   number of rows it added to `dooly.db`.
+
 4. **Export into the downloaded folder**:
 
    ```bash
@@ -79,7 +93,8 @@ database that DoolyProf and DoolySim work with is built from it on your machine 
    [If verify fails](#if-verify-fails) otherwise.
 
 6. **Look over what you will upload**: the new folder should be your model's, and each new
-   `deployment.json` records the run's command line, which may include local paths.
+   `deployment.json` records the run's command line. Paths under your home directory are
+   written as `~/…`; other paths (e.g. under `/mnt`) are kept as they were.
 
 7. **Upload it as a pull request**:
 
@@ -87,7 +102,9 @@ database that DoolyProf and DoolySim work with is built from it on your machine 
    hf upload dooly-project/DoolyDB DoolyDB . --repo-type dataset --create-pr --commit-message "ORG/MODEL on <gpu>"
    ```
 
-   `hf` compares the folder with DoolyDB and uploads only the files that are new or changed.
+   `hf` compares the folder with DoolyDB and uploads only the files that are new or changed. It
+   prints the URL of the commit it made, not of the pull request; the pull request is on the
+   dataset's Community tab, https://huggingface.co/datasets/dooly-project/DoolyDB/discussions.
 
 8. **Publish the pull request**: it opens as a draft, which cannot be merged. On the dataset's
    page, open the **Community** tab and your pull request, check **Files changed** (your
