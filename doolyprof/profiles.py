@@ -5,9 +5,12 @@
     │   ├── deployment.json      the deployment, and the runs that measured it (versions, options)
     │   ├── model.csv            its operations: file, name, signature, calls per forward pass
     │   ├── collectives.csv      its collectives: topology, group size, calls, how sizes scale
-    │   └── <operation>-<signature prefix>.csv   latency of one operation per batch shape
+    │   ├── <operation>-<signature prefix>.csv   latency of one operation per batch shape
+    │   └── runs/<run_uid>/      files a run kept (dooly run: trace.log.gz, profile.log.gz,
+    │                            trace.json.gz), for each run deployment.json lists that has some
     └── communication/<topology>/<engine>/
         ├── runs.json            the runs that measured them
+        ├── runs/<run_uid>/      the same, for those runs
         └── <collective>.csv     latency per group size and message size
 
 ``<device>`` is the GPU model (e.g. ``nvidia-rtx-pro-6000-blackwell-server-edition``),
@@ -15,7 +18,9 @@
 backend and the version of what implements it (``FLASH_ATTN-fa2``), ``<model>`` the Hugging
 Face name (``Qwen/Qwen3.8-27B``, two folders), ``<deployment>``
 ``tp<N>[-ep<M>]-<dtype>-kv<KV-cache dtype>`` (``tp2-bfloat16-kvauto``). Every folder is
-self-contained: an operation several models share is written into each model's folder.
+self-contained: an operation several models share is written into each model's folder, and so
+are the files of the runs that measured it. Run files are written byte for byte as the database
+holds them (``run_files``), and read back the same way.
 
 An operation is measured once per batch shape on a device and engine. The tensor-parallel
 degree of the run that measured it is recorded (``num_tensor_parallel_workers``) but does not
@@ -39,6 +44,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import sqlite3
 
 from doolyprof.profiler import db as profile_db
@@ -108,6 +114,39 @@ def _run_entry(row):
             "stack": json.loads(row["stack_json"]) if row["stack_json"] else {}}
 
 
+_FILE_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")   # a run_uid or a run file name: no path, not hidden
+
+
+def _write_run_files(con, folder, run_uids, done):
+    """``folder``/runs/<run_uid>/<name> for every file each of ``run_uids`` kept (run_files; ``con`` is
+    None when the database has no such table). What a previous export left there for other runs or
+    files is removed; runs/ is left out when there is nothing to write."""
+    root = os.path.join(folder, "runs")
+    want = {}
+    for uid in sorted(run_uids) if con is not None else ():
+        for r in con.execute("SELECT name, data FROM run_files WHERE run_uid = ? ORDER BY name", (uid,)):
+            if _FILE_NAME.match(uid) and _FILE_NAME.match(r["name"]):
+                want.setdefault(uid, {})[r["name"]] = bytes(r["data"])
+    if os.path.isdir(root):
+        for uid in os.listdir(root):
+            path = os.path.join(root, uid)
+            if uid not in want:
+                shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+                continue
+            for name in os.listdir(path) if os.path.isdir(path) else ():
+                if name not in want[uid]:
+                    stale = os.path.join(path, name)
+                    shutil.rmtree(stale) if os.path.isdir(stale) else os.remove(stale)
+    for uid, files in want.items():
+        os.makedirs(os.path.join(root, uid), exist_ok=True)
+        for name, data in files.items():
+            with open(os.path.join(root, uid, name), "wb") as f:
+                f.write(data)
+            done["run_files"] += 1
+    if os.path.isdir(root) and not os.listdir(root):
+        os.rmdir(root)
+
+
 def _order(columns):
     # NULLs first, then by value, so the files come out in the same order from every database
     return ", ".join(f"{c} IS NOT NULL, {c}" for c in columns)
@@ -125,8 +164,11 @@ def export_db(db_path, out_dir):
             for t in ("profiled_models", "results", "coll_op_results", "profile_runs")}
     labelled = "device" in cols["profiled_models"] and "device" in cols["results"]
     runs = {r["run_id"]: r for r in con.execute("SELECT * FROM profile_runs")} if cols["profile_runs"] else {}
+    files_con = con if con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_files'"
+                                   ).fetchone() else None
     done = {"deployments": 0, "operation_files": 0, "result_rows": 0, "communication_files": 0,
-            "communication_rows": 0, "skipped_deployments": 0, "skipped_communication_rows": 0, "duplicate_rows": 0}
+            "communication_rows": 0, "skipped_deployments": 0, "skipped_communication_rows": 0, "duplicate_rows": 0,
+            "run_files": 0}
     counted = set()   # (signature, device, engine) whose second measurements are counted
 
     models = con.execute("SELECT * FROM profiled_models ORDER BY model_id").fetchall() if cols["profiled_models"] else []
@@ -189,6 +231,7 @@ def export_db(db_path, out_dir):
         for stale in os.listdir(folder):   # operation files a previous export left that this model no longer has
             if stale.endswith(".csv") and stale not in files | {"model.csv", "collectives.csv"}:
                 os.remove(os.path.join(folder, stale))
+        _write_run_files(files_con, folder, {runs[i]["run_uid"] for i in used_runs}, done)
         done["deployments"] += 1
 
     if "engine" not in cols["coll_op_results"]:   # collectives measured before engines were recorded
@@ -219,6 +262,7 @@ def export_db(db_path, out_dir):
     for folder in {os.path.join(out_dir, "communication", g["topology"], g["engine"]) for g in groups}:
         _write_json(os.path.join(folder, "runs.json"), {"runs": sorted(
             (_run_entry(runs[i]) for i in comm_runs.get(folder, ())), key=lambda r: (r["started_at"], r["run_uid"]))})
+        _write_run_files(files_con, folder, {runs[i]["run_uid"] for i in comm_runs.get(folder, ())}, done)
     con.close()
     return done
 
@@ -237,6 +281,21 @@ def _runs(con, entries):
     return ids
 
 
+def _import_run_files(con, folder, done):
+    """The files under ``folder``/runs/<run_uid>/ into run_files, byte for byte; files the database
+    already has for that run and name are kept as they are."""
+    root = os.path.join(folder, "runs")
+    for uid in sorted(os.listdir(root)) if os.path.isdir(root) else ():
+        path = os.path.join(root, uid)
+        if not (_FILE_NAME.match(uid) and os.path.isdir(path)):
+            continue   # not something export writes: verify reports it
+        for name in sorted(os.listdir(path)):
+            if _FILE_NAME.match(name) and os.path.isfile(os.path.join(path, name)):
+                with open(os.path.join(path, name), "rb") as f:
+                    added = profile_db.add_run_file(con, uid, name, f.read())
+                done["run_files_added" if added else "run_files_present"] += 1
+
+
 def _operation_id(con, signature_hash, operation_name, signature_json):
     row = con.execute("SELECT operation_id FROM signatures WHERE signature_hash = ?", (signature_hash,)).fetchone()
     if row:
@@ -249,6 +308,7 @@ def _import_deployment(con, folder, done):
     with open(os.path.join(folder, "deployment.json")) as f:
         d = json.load(f)
     run_ids = _runs(con, d.get("runs", []))
+    _import_run_files(con, folder, done)
     key = (d["model"], d["model_family"], d["backend"], d["tp_degree"], d["dtype"], d["kv_cache_dtype"],
            d["ep_degree"], d["device"], d["engine"])
     row = con.execute("""SELECT model_id FROM profiled_models WHERE model_name = ? AND model_family = ? AND backend = ?
@@ -307,6 +367,7 @@ def _import_communication(con, folder, topology, engine, done):
     if os.path.exists(runs_file):
         with open(runs_file) as f:
             run_ids = _runs(con, json.load(f).get("runs", []))
+    _import_run_files(con, folder, done)
     for fname in sorted(os.listdir(folder)):
         if not fname.endswith(".csv"):
             continue
@@ -331,7 +392,8 @@ def import_tree(tree_dir, db_path):
     con = sqlite3.connect(db_path)
     profile_db.init_schema(con)
     done = {"deployments": 0, "deployments_added": 0, "result_rows_added": 0, "result_rows_present": 0,
-            "communication_rows_added": 0, "communication_rows_present": 0}
+            "communication_rows_added": 0, "communication_rows_present": 0, "run_files_added": 0,
+            "run_files_present": 0}
     for root, _dirs, files in sorted(os.walk(os.path.join(tree_dir, "compute"))):
         if "deployment.json" in files:
             _import_deployment(con, root, done)
@@ -355,9 +417,11 @@ def verify_tree(tree_dir):
     """(problems, counts): what is wrong with the tree under ``tree_dir`` (an empty list when it
     is valid). Valid means it imports into an empty database and exporting that database gives
     back exactly the files under compute/ and communication/: every file parses, every value is
-    as export writes it, nothing is missing and nothing else is there. Other files at the top
+    as export writes it, nothing is missing and nothing else is there. A run's files (runs/) are
+    read back byte for byte, so for them this checks where they are and that each gzip file reads. Other files at the top
     (a README) are not checked."""
     import filecmp
+    import gzip
     import tempfile
     missing = []   # files a model.csv lists that are not there, or that measure a batch shape twice
     for root, _dirs, files in sorted(os.walk(os.path.join(tree_dir, "compute"))):
@@ -380,6 +444,17 @@ def verify_tree(tree_dir):
             if len(set(shapes)) < len(shapes):
                 missing.append(f"{rel}/{f}: {len(shapes) - len(set(shapes))} batch shape(s) measured more than once "
                                f"(e.g. by runs of different TP degrees); dooly export writes one row per batch shape")
+    for sub in ("compute", "communication"):   # run files: export writes them gzipped
+        for root, _dirs, files in sorted(os.walk(os.path.join(tree_dir, sub))):
+            if os.path.basename(os.path.dirname(root)) != "runs":
+                continue
+            for name in sorted(f for f in files if f.endswith(".gz")):
+                try:
+                    with open(os.path.join(root, name), "rb") as f:
+                        gzip.decompress(f.read())
+                except Exception as e:  # noqa: BLE001
+                    missing.append(f"{os.path.relpath(os.path.join(root, name), tree_dir)}: not a readable gzip "
+                                   f"file ({type(e).__name__})")
     if missing:
         return missing, {}
     with tempfile.TemporaryDirectory() as tmp:

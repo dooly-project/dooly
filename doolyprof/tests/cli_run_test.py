@@ -1,13 +1,15 @@
 """What ``dooly run`` decides before and after it measures, with NVML and psutil stood in for.
 
 - GPUs: CUDA_VISIBLE_DEVICES wins; else the free GPUs by docker/dooly-docker.sh's rule (under
-  4 GiB in use, no process of another user, no lock dir), each claimed with a lock dir; too few
-  free GPUs stop the run and say which are busy and why
+  4 GiB in use, no kernels running, no process of another user, no lock dir), each claimed with a
+  lock dir; too few free GPUs stop the run and say which are busy and why
 - memory already in use when an engine starts is blamed on other processes only when NVML shows
   other processes: this run's own earlier stages are named as such
 - the command line a run records has the home directory as ~; the DoolyProf commit it records
   comes from git, or from doolyprof/REVISION where the code is not a checkout (the Docker image)
 - the summary counts the rows this run wrote, not the database's
+- the run's logs and trace are kept with it in the database, gzipped, without this machine's
+  home directory, user or host names
 
 Runs directly: ``python doolyprof/tests/cli_run_test.py``. CPU only, standard library only.
 """
@@ -33,8 +35,20 @@ PARENT = 424242  # a process that started this one (an earlier stage of the run)
 
 
 def _nvml(gpus):
-    """A pynvml stand-in: ``gpus`` is [(bytes in use, [(pid, bytes)] or None when NVML cannot list)]."""
+    """A pynvml stand-in: ``gpus`` is [(bytes in use, [(pid, bytes)] or None when NVML cannot list[,
+    utilization %: one value, one per sample, or None when NVML cannot read it (default 0)])]."""
     m = types.ModuleType("pynvml")
+    calls = {}
+
+    def util(h):
+        u = gpus[h][2] if len(gpus[h]) > 2 else 0
+        if u is None:
+            raise RuntimeError("NVML: not supported")
+        if isinstance(u, list):
+            calls[h] = calls.get(h, 0) + 1
+            u = u[min(calls[h], len(u)) - 1]
+        return types.SimpleNamespace(gpu=u, memory=0)
+    m.nvmlDeviceGetUtilizationRates = util
     m.nvmlInit = m.nvmlShutdown = lambda: None
     m.nvmlDeviceGetCount = lambda: len(gpus)
     m.nvmlDeviceGetHandleByIndex = lambda i: i
@@ -77,7 +91,8 @@ def _machine(gpus, users=None, visible=None, lock_dir=None):
     lock dirs under ``lock_dir``; no nvidia-smi on PATH."""
     saved_mods = {k: sys.modules.get(k) for k in ("pynvml", "psutil")}
     saved_env = {k: os.environ.get(k) for k in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "PATH")}
-    saved_lock = gpu_memory.LOCK
+    saved_lock, saved_interval = gpu_memory.LOCK, gpu_memory.UTIL_INTERVAL
+    gpu_memory.UTIL_INTERVAL = 0
     sys.modules["pynvml"], sys.modules["psutil"] = _nvml(gpus), _psutil({PARENT: ME, **(users or {})})
     os.environ.pop("CUDA_VISIBLE_DEVICES", None)
     if visible is not None:
@@ -89,7 +104,7 @@ def _machine(gpus, users=None, visible=None, lock_dir=None):
     try:
         yield
     finally:
-        gpu_memory.LOCK = saved_lock
+        gpu_memory.LOCK, gpu_memory.UTIL_INTERVAL = saved_lock, saved_interval
         os.rmdir(empty)
         for k, v in saved_mods.items():
             if v is None:
@@ -120,6 +135,20 @@ def test_free_gpus_by_the_wrappers_rule():
         assert busy[1] == "processes of other users (pid 1001)", busy
         assert busy[2] == "5.0 GiB in use", busy
         assert busy[3].startswith("taken by another dooly run"), busy
+
+
+def test_free_gpus_counts_gpus_running_kernels_as_busy():
+    # another person's job on a shared account looks like ours: its utilization tells
+    with tempfile.TemporaryDirectory() as d:
+        gpus = [(0, [], 0),                       # idle
+                (GiB, [(2003, GiB)], 37),         # "mine" (same account) and small, but running kernels
+                (0, [], [0, 60, 0]),              # busy in one of the three samples
+                (0, [], 4),                       # under 5%
+                (0, [], None)]                    # utilization not readable: idle
+        with _machine(gpus, users={2003: ME}, lock_dir=d):
+            free, busy = gpu_memory.free_gpus()
+    assert free == [0, 3, 4], free
+    assert busy == {1: "running kernels (37% utilization)", 2: "running kernels (60% utilization)"}, busy
 
 
 def test_choose_gpus_takes_free_ones_and_locks_them():
@@ -176,6 +205,43 @@ def test_command_line_has_the_home_directory_as_tilde():
         "~/dooly/doolyprof/run/run-profiler.py", "--db-path", "~/dooly.db", "--out=~/runs/x",
         "--traces", "~/a.json,~/b.json", "/home/user2/x", "~", "/data/home/u/y", "--tp", "1"]
     assert profile_db.portable_argv(["/x"], home="/") == ["/x"]
+
+
+def test_logs_without_home_directory_user_or_host():
+    text = ("loading /home/u/hf/hub/x from '/home/u/cache' (\"/home/u\")\n/tmp/torchinductor_alice/abc (alice)\n"
+            "host gpu-box-7 says hi; gpu-box-7.example.org; xgpu-box-7 stays\n/home/user2/x stays\n")
+    got = profile_db.portable_text(text, home="/home/u/", user="alice", host="gpu-box-7.example.org")
+    assert got == ("loading ~/hf/hub/x from '~/cache' (\"~\")\n/tmp/torchinductor_<user>/abc (alice)\n"
+                   "host <host> says hi; <host>; xgpu-box-7 stays\n/home/user2/x stays\n"), got
+    assert profile_db.portable_text("/x ab", home="/", user="ab", host="ab") == "/x ab"   # too short to tell
+
+
+def test_run_keeps_its_logs_and_trace_in_the_database():
+    import gzip
+    import sqlite3
+    import profiles_test
+    with tempfile.TemporaryDirectory() as d:
+        db = f"{d}/p.db"
+        profiles_test._fill(db, "gpu-x")          # an earlier run
+        before = cli._last_run(db)
+        profiles_test._fill(db, "gpu-y")          # this run
+        texts = {"trace.log": f"[Tracer] cache {os.path.expanduser('~')}/.cache/x\n",
+                 "profile.log": "Wrote 6 results\n", "trace.json": '{"traceEvents": []}'}
+        paths = {}
+        for name, text in texts.items():
+            paths[name] = os.path.join(d, name)
+            with open(paths[name], "w") as f:
+                f.write(text)
+        kept = cli._keep_run_files(db, before, {**paths, "missing.log": os.path.join(d, "none")})
+        con = sqlite3.connect(db)
+        uids = [r[0] for r in con.execute("SELECT run_uid FROM profile_runs ORDER BY run_id")]
+        assert kept == uids[1:], (kept, uids)
+        files = {n: gzip.decompress(b).decode() for n, b in con.execute(
+            "SELECT name, data FROM run_files WHERE run_uid = ?", (kept[0],))}
+        assert files == {f"{n}.gz": profile_db.portable_text(t) for n, t in texts.items()}, files
+        assert not con.execute("SELECT 1 FROM run_files WHERE run_uid = ?", (uids[0],)).fetchone()
+        con.close()
+        assert cli._keep_run_files(db, cli._last_run(db), paths) == []   # no run recorded after it
 
 
 def test_revision_without_git_comes_from_the_revision_file():

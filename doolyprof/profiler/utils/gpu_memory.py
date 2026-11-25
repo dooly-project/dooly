@@ -22,10 +22,13 @@ tensors, in this process or in the one that started it) from other jobs' memory;
 docker/dooly-docker.sh applies.
 """
 import os
+import time
 
 MIN_FRACTION = 0.05  # below this the engine cannot hold a model's weights in any useful case
 LOCK = "/tmp/dooly_gpu{}.lock"  # GPU i is taken by a dooly run (the lock dir docker/dooly-docker.sh uses)
 BUSY_BYTES = 4 << 30  # a GPU with this much in use is busy (docker/dooly-docker.sh's threshold)
+BUSY_UTIL = 5         # a GPU this busy (%) in any utilization sample is running kernels: busy (the same)
+UTIL_SAMPLES, UTIL_INTERVAL = 3, 1.0  # samples a second apart: one can fall between a job's kernels
 GiB = 1 << 30
 
 
@@ -149,9 +152,11 @@ def engine_memory_fraction(cap=0.9, devices=None, who="vLLM engine"):
 
 def free_gpus():
     """([free GPUs], {busy GPU: why}) in nvidia-smi's numbering, by docker/dooly-docker.sh's rule:
-    a GPU is free when it has under 4 GiB in use, no compute process of another user and no lock
-    dir LOCK. A process this machine does not show (a container is shown the host's PIDs) cannot
-    be told apart, so only its memory counts. None when NVML is not available."""
+    a GPU is free when it has under 4 GiB in use, runs no kernels (utilization under BUSY_UTIL in
+    each of UTIL_SAMPLES samples), has no compute process of another user and no lock dir LOCK. A
+    process this machine does not show (a container is shown the host's PIDs), or one of another
+    person on a shared account, cannot be told apart from ours: its memory and utilization count.
+    A GPU whose utilization NVML cannot read counts as idle. None when NVML is not available."""
     try:
         import pynvml
         pynvml.nvmlInit()
@@ -160,8 +165,17 @@ def free_gpus():
     try:
         me = os.getuid()
         free, busy = [], {}
-        for i in range(pynvml.nvmlDeviceGetCount()):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+        handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())]
+        peak = [0] * len(handles)   # highest utilization (%) seen
+        for s in range(UTIL_SAMPLES):
+            if s:
+                time.sleep(UTIL_INTERVAL)
+            for i, handle in enumerate(handles):
+                try:
+                    peak[i] = max(peak[i], int(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu))
+                except Exception:  # noqa: BLE001 -- not supported on this GPU
+                    pass
+        for i, handle in enumerate(handles):
             m = pynvml.nvmlDeviceGetMemoryInfo(handle)
             used = int(m.total) - int(m.free)
             others = sorted({pid for pid, _ in (_procs(pynvml, handle) or []) if _uid(pid) not in (me, None)})
@@ -171,6 +185,8 @@ def free_gpus():
                 busy[i] = "processes of other users (pid " + ", ".join(map(str, others)) + ")"
             elif used >= BUSY_BYTES:
                 busy[i] = f"{used / GiB:.1f} GiB in use"
+            elif peak[i] >= BUSY_UTIL:
+                busy[i] = f"running kernels ({peak[i]}% utilization)"
             else:
                 free.append(i)
         return free, busy

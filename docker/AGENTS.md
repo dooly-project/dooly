@@ -140,9 +140,13 @@ Check before uploading (stop and report on any failure; do not upload a folder y
    `--attention-backend`, and `<deployment>` your `tp<N>-<dtype>-kv<cache dtype>`.
 3. **deployment.json** has the right `model`, `device`, `engine`, `backend` and `dtype`, and the
    command line in `runs[].stack.argv` holds no path you would not share (paths under `/out/` are
-   fine).
+   fine). The same goes for your run's logs and trace in the folder's `runs/<run_uid>/` (`run_uid`
+   from `runs[]`): `zcat .../runs/<run_uid>/*.gz | grep -nE "/home/|$(whoami)|$(hostname)"` should
+   print nothing you would not share. DoolyProf writes home directories as `~`, and your user and
+   host names as `<user>` and `<host>`; in Docker the logs only show paths inside the container.
 4. **model.csv lists every operation file and nothing is missing**: each `file` it names exists,
-   and every other CSV in the folder is `model.csv` or `collectives.csv`. Per-layer operations have a `count`
+   and every other CSV in the folder is `model.csv` or `collectives.csv`; `runs/<run_uid>/` of your run
+   holds `trace.log.gz`, `profile.log.gz` and `trace.json.gz`. Per-layer operations have a `count`
    equal to the model's `num_hidden_layers` (its `config.json` in `HF_CACHE`) or a multiple of it;
    the embedding and the sampler run once.
 5. **The numbers are sane**: every operation file has rows; all latencies are positive and finite,
@@ -199,6 +203,7 @@ Run anything longer than ~2 minutes in the background and poll its output.
 ```
 [dooly] traced in Ns: /out/NAME/trace/<model>_<tp>_dooly_trace.json
 [dooly] profile exit 0 in Ns: R result rows, 0 ops without a working parent[, collective measurements: ...]
+[dooly] kept trace.log, profile.log and the trace in /out/... with run <run_uid> (dooly export writes them ...)
 ```
 
 A run succeeded only if **all** hold:
@@ -229,6 +234,13 @@ EOF
 measure). With `--db /out/FILE.db` the results go into that file and `profile_timings.csv` next to
 it, and the run folder has no `profile.db`.
 
+The database also keeps the run's `trace.log`, `profile.log` and trace, gzipped (table `run_files`,
+the `kept ...` line of `run`), and `export` writes them into the deployment's folder as
+`runs/<run_uid>/trace.log.gz`, `profile.log.gz` and `trace.json.gz` (for collectives also under
+`communication/.../runs/`). They go to DoolyDB with your measurements, so a run can be debugged
+later from DoolyDB alone: `zcat .../runs/<run_uid>/profile.log.gz | less`. A run that fails before
+the profiler records it keeps its logs only in `dooly-out/NAME/`.
+
 `profile.db` tables:
 
 - `signatures(signature_hash, operation_name, signature_json)`: one row per distinct operation.
@@ -240,6 +252,8 @@ it, and the run folder has no `profile.db`.
   the model's collectives.
 - `coll_op_results(operation, topology, backend, tp_size, size_bytes, dtype, dim_param, num_dims,
   latency_ms)`: collective latencies (only with `--profile-comm`).
+- `profile_runs(run_uid, device, engine, backend, stack_json)`, `run_files(run_uid, name, data)`:
+  each run's versions and command line, and its gzipped logs and trace.
 
 ## Failures and what to do
 

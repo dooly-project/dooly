@@ -13,7 +13,9 @@
 
 ``run`` traces the model (DIR/trace/, log DIR/trace.log), then profiles that
 trace into DIR/profile.db, or DB (log DIR/profile.log), and exits non-zero if
-either stage fails. It runs on the GPUs CUDA_VISIBLE_DEVICES names when that is set
+either stage fails. The database also keeps both logs and the trace with the run
+(gzipped, home directory, user and host written generically), and ``export`` writes
+them under runs/<run>/ next to the run's measurements, for debugging later. It runs on the GPUs CUDA_VISIBLE_DEVICES names when that is set
 (docker/dooly-docker.sh sets it), else on GPUs nobody else is on: one, or with
 --profile-comm one per rank of the largest group (--gpus N to say how many).
 Results DB already has for this
@@ -169,10 +171,41 @@ def _run_rows(db, after):
         return None, []
 
 
+def _keep_run_files(db, after, files):
+    """Keep ``files`` ({name: path}: this run's logs and trace) with each run after run_id ``after``
+    in DB (run_files, as ``<name>.gz``), with the home directory, user and host written generically
+    (profile_db.portable_text), so that ``dooly export`` ships them with the run's measurements. The
+    run_uids they were kept with; [] when DB recorded no run (the profiler stopped before it could)
+    or cannot be written."""
+    import sqlite3
+    from doolyprof.profiler import db as profile_db
+    blobs = {}
+    for name, path in files.items():
+        if path and os.path.isfile(path):
+            with open(path, encoding="utf-8", errors="replace") as f:
+                blobs[name + ".gz"] = profile_db.gzip_bytes(profile_db.portable_text(f.read()).encode())
+    try:
+        con = sqlite3.connect(db)
+        try:
+            profile_db.init_schema(con)
+            uids = [r[0] for r in con.execute("SELECT run_uid FROM profile_runs WHERE run_id > ? ORDER BY run_id",
+                                              (after,))]
+            for uid in uids:
+                for name, data in sorted(blobs.items()):
+                    profile_db.add_run_file(con, uid, name, data)
+            con.commit()
+            return uids
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+
+
 def cmd_run(argv):
     p = argparse.ArgumentParser(prog="dooly run", description="Trace a model, then profile the trace.")
     p.add_argument("--model", required=True)
-    p.add_argument("--out", required=True, help="output folder (trace/, trace.log, profile.db, profile.log)")
+    p.add_argument("--out", required=True, help="output folder (trace/, trace.log, profile.db, profile.log); the "
+                                                "database also keeps the logs and the trace with the run")
     p.add_argument("--db", default=None,
                    help="profile database to write and reuse results from (default: OUT/profile.db), e.g. one "
                         "DoolyDB was imported into")
@@ -258,6 +291,11 @@ def _run(a, gpu):
         comm += f" (skipped {'/'.join(skipped)}-rank groups)" if skipped else ""
     print(f"[dooly] profile exit {rc} in {time.time() - t0:.0f}s: "
           f"{rows} result rows, {unresolved} ops without a working parent{comm}", flush=True)
+    kept = _keep_run_files(db, before, {"trace.log": os.path.join(out, "trace.log"), "profile.log": log,
+                                        "trace.json": trace})
+    if kept:
+        print(f"[dooly] kept trace.log, profile.log and the trace in {db} with run {', '.join(kept)} "
+              f"(dooly export writes them under runs/<run>/ next to its measurements)", flush=True)
     return rc or (1 if unresolved else 0)
 
 
@@ -289,8 +327,8 @@ def cmd_export(argv):
     from doolyprof.profiles import export_db
     d = export_db(a.db, a.out)
     print(f"[dooly] exported {d['deployments']} deployment(s): {d['operation_files']} operation files "
-          f"({d['result_rows']} rows), {d['communication_files']} collective files ({d['communication_rows']} rows) "
-          f"to {a.out}", flush=True)
+          f"({d['result_rows']} rows), {d['communication_files']} collective files ({d['communication_rows']} rows), "
+          f"{d['run_files']} run files (logs and traces) to {a.out}", flush=True)
     if d["duplicate_rows"]:
         print(f"[dooly] not exported: {d['duplicate_rows']} second measurement(s) of an operation at a batch shape "
               f"(e.g. by runs of different TP degrees); the first is kept", flush=True)
@@ -310,8 +348,8 @@ def cmd_import(argv):
     d = import_tree(a.tree, a.db)
     print(f"[dooly] imported {d['deployments']} deployment(s) ({d['deployments_added']} new): "
           f"{d['result_rows_added']} result rows added, {d['result_rows_present']} already present; "
-          f"{d['communication_rows_added']} collective rows added, {d['communication_rows_present']} already present",
-          flush=True)
+          f"{d['communication_rows_added']} collective rows added, {d['communication_rows_present']} already present; "
+          f"{d['run_files_added']} run files added, {d['run_files_present']} already present", flush=True)
     return 0
 
 
@@ -329,7 +367,7 @@ def cmd_verify(argv):
         return 1
     print(f"[dooly] {a.tree} is valid: {counts.get('deployments', 0)} deployment(s), "
           f"{counts.get('result_rows_added', 0)} result rows, {counts.get('communication_rows_added', 0)} "
-          f"collective rows", flush=True)
+          f"collective rows, {counts.get('run_files_added', 0)} run files", flush=True)
     return 0
 
 
