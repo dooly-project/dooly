@@ -206,7 +206,9 @@ profiles/
 │   ├── model.csv         its operations: file, name, signature, calls per forward pass
 │   ├── collectives.csv   its collectives: topology, group size, calls, how sizes scale
 │   └── <operation>-<signature>.csv   latency of one operation per batch shape
-└── communication/<topology>/<engine>/<collective>.csv   latency per group size and message size
+└── communication/<topology>/<engine>/
+    ├── runs.json         the runs that measured them
+    └── <collective>.csv  latency per group size and message size
 ```
 
 ---
@@ -282,7 +284,8 @@ you to check and publish ([AGENTS.md](AGENTS.md#contributing-to-doolydb)). Check
 `--gpus N --tp N --profile-comm` to include collectives.
 
 - `download-db` leaves Hugging Face's download bookkeeping in `.cache/huggingface/` inside the
-  folder; `verify` and `upload` ignore it.
+  folder; `verify` and `upload` ignore it. `hf` may also leave its own `.agent_harnesses.json` in
+  `HF_CACHE`; it is harmless.
 - On an account other people use too, set `HF_CACHE` and `DOOLY_CACHE` (see [Settings](#settings))
   to folders of your own first.
 - `DOOLY_DB_REPO` points `download-db` and `upload` at another dataset (e.g. a copy to try this on).
@@ -292,8 +295,10 @@ you to check and publish ([AGENTS.md](AGENTS.md#contributing-to-doolydb)). Check
 ## Choosing GPUs
 
 By default the script takes **one free GPU**. A GPU counts as free when it has less than 4 GB in
-use, no other user's process, and no other run of this script on it (a run locks each GPU it takes
-with `/tmp/dooly_gpu<i>.lock` until it ends). If none is free, it prints
+use, runs no kernels (under 5% utilization over three seconds), has no other user's process, and no
+other run of this script on it (a run locks each GPU it takes with `/tmp/dooly_gpu<i>.lock` until it
+ends). On an account several people share, their processes look like yours, so memory, utilization
+and the locks are what keep runs off their GPUs. If none is free, it prints
 `waiting for 1 free GPU(s)` and checks again every minute.
 
 - `--gpus N` takes N free GPUs. It picks the N with the fastest links between them
@@ -386,7 +391,7 @@ only when your machine has no copy, so before each command the script compares y
 Docker Hub's and, if Docker Hub's was built later, prints a warning with both build dates and
 commits and the command to update (it still runs your copy; `DOOLY_UPDATE_CHECK=0` turns the
 check off). `docker/dooly-docker.sh check-update` runs the check by itself, and also says when
-your copy is the newer one (e.g. built here from a newer commit). To update:
+your copy is the newer one (e.g. built here from a newer commit) or a build of the same commit. To update:
 
 ```bash
 docker pull jhkjames1110/doolyprof

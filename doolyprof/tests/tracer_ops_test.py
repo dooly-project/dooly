@@ -253,6 +253,12 @@ def test_untainted_component_used_only_when_sizes_agree():
 
 
 _inner_linear = torch.nn.Linear(8, 4)
+# install_hooks() makes Tensor.uniform_ a no-op (it speeds up loading a model's dummy weights), so
+# nn.Linear's own init leaves these weights as uninitialized memory, and the value check of
+# test_module_inside_custom_op_strips_taints_of_inner_outputs failed whenever it held inf or NaN
+with torch.no_grad():
+    _inner_linear.weight.fill_(0.125)
+    _inner_linear.bias.fill_(0.5)
 
 
 @torch.library.custom_op("dooly_test::linear_inside", mutates_args=())

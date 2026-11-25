@@ -94,7 +94,8 @@ database that DoolyProf and DoolySim work with is built from it on your machine 
    python -m doolyprof.cli verify DoolyDB
    ```
 
-   It ends with `DoolyDB is valid` when the folder is exactly what `dooly export` writes. See
+   It ends with `[dooly] DoolyDB is valid: N deployment(s), ...` (the folder as you named it, e.g.
+   `/out/DoolyDB` with Docker) when the folder is exactly what `dooly export` writes. See
    [If verify fails](#if-verify-fails) otherwise.
 
 6. **Look over what you will upload**: the new folder should be your model's, and each new

@@ -20,7 +20,8 @@ This file is for coding agents that run DoolyProf for a user. People should read
 - On an account other people use too (e.g. a shared `ubuntu`), first point `HF_CACHE` and
   `DOOLY_CACHE` at folders of your own (e.g. in your workspace): the defaults,
   `~/.cache/huggingface` and `~/.cache/dooly-docker`, are that account's. Keep the same `HF_CACHE`
-  from `download` to `run`.
+  from `download` to `run`. There the script cannot tell other people's GPU processes from yours:
+  it goes by memory in use, utilization and the lock folders ([Rules](#rules)).
 
 ## Tested GPUs, and what to do on others
 
@@ -120,7 +121,8 @@ prints which), always as a pull request (never a commit to main), and prints the
 number and URL and what it adds, changes and removes compared with main.
 
 `download-db` leaves Hugging Face's download bookkeeping in `.cache/huggingface/` inside the
-folder; `verify` and `upload` ignore it (hence `--exclude=.cache` below). While DoolyDB has nothing
+folder; `verify` and `upload` ignore it (hence `--exclude=.cache` below). `hf` may also leave its own
+`.agent_harnesses.json` in `HF_CACHE`; it is harmless. While DoolyDB has nothing
 for this GPU and engine version, `import` adds 0 rows and the run measures every operation; later
 runs reuse what is there (a model's variants share most operations).
 
@@ -144,9 +146,12 @@ Check before uploading (stop and report on any failure; do not upload a folder y
    equal to the model's `num_hidden_layers` (its `config.json` in `HF_CACHE`) or a multiple of it;
    the embedding and the sampler run once.
 5. **The numbers are sane**: every operation file has rows; all latencies are positive and finite,
-   and min <= median <= max on each row; a linear operation's median latency does not fall as
-   `num_tokens` grows (beyond noise). The folder's rows add up to R from the run's summary when the
-   database had none of these operations before.
+   and min <= median <= max on each row; a linear operation's median latency is higher at the
+   largest `num_tokens` than at the smallest. Between neighbouring sizes it may dip (the matrix
+   library switches kernels) or stay flat (the output layer, whose large weight dominates small
+   batches): that is normal. A curve that falls overall, or the same latency at every size, is not.
+   The folder's rows add up to R from the run's summary when the database had none of these
+   operations before.
 
 Check after uploading:
 
@@ -157,7 +162,7 @@ Check after uploading:
    `diff -rq --exclude=.cache dooly-out/DoolyDB dooly-out/pr-N` prints nothing, and
    `docker/dooly-docker.sh verify /out/pr-N` is valid.
 8. **It is an open draft by that account** (public dataset, no token needed):
-   `${DOCKER:-docker} run --rm -e HF_HUB_OFFLINE=0 --entrypoint python jhkjames1110/doolyprof -c
+   `${DOCKER:-docker} run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_HUB_OFFLINE=0 --entrypoint python jhkjames1110/doolyprof -c
    "from huggingface_hub import HfApi; d = HfApi().get_discussion_details('dooly-project/DoolyDB', N, repo_type='dataset'); print(d.status, d.author, d.title)"`
    prints `draft <account> <your message>`.
 
@@ -245,7 +250,7 @@ it, and the run folder has no `profile.db`.
 | `a Hugging Face token is required` / `HF_TOKEN_FILE=... is not a readable, non-empty file` (script, exit 2) | No token given, or a wrong path | Ask the user for the path of their token file |
 | `401` / `gated repo` (download), `download failed (...)` (example.sh), `the Hugging Face token was not accepted` (upload) | Token invalid or expired, or a gated model whose license the account has not accepted | Tell the user; do not look for another token |
 | `not uploaded: dooly verify found problems` (upload) | The folder is not what `dooly export` writes | docs/how-to-contribute.md, *If verify fails* |
-| `waiting for N free GPU(s)` / `waiting for GPU(s) ...` (script, repeats every 60 s) | GPUs in use by others or locked by another run (`/tmp/dooly_gpu<i>.lock`) | Wait, or tell the user. **Never** kill other processes or remove lock dirs you did not create. |
+| `waiting for N free GPU(s)` / `waiting for GPU(s) ...` (script, repeats every 60 s) | GPUs in use (4 GB or more used, kernels running, or another user's process) or locked by another run (`/tmp/dooly_gpu<i>.lock`) | Wait, or tell the user. **Never** kill other processes or remove lock dirs you did not create. |
 | `waiting for N free GPUs linked by ...` | Only worse-connected GPUs are free | Wait, or `DOOLY_ANY_LINK=1` if the user accepts measurements on those links |
 | `trace failed (exit N)` (script) + vLLM error about the attention backend or head size (`trace.log`) | vLLM does not support that backend on this GPU/model | Retry with another `--attention-backend`; report which ones vLLM rejected |
 | KV cache cannot hold the trace batch (`trace.log`/`profile.log`) | Not enough memory for the batch | `--gpu-memory-cap 0.95` |
@@ -260,7 +265,8 @@ it, and the run folder has no `profile.db`.
 
 ## Rules
 
-- Do not run on GPUs other users are using; the script checks this, so do not bypass it with raw
+- Do not run on GPUs other users are using; the script checks this (a GPU is free with under 4 GB
+  in use, under 5% utilization, no other user's process and no lock), so do not bypass it with raw
   `docker run --gpus`.
 - Do not download weights or install system packages; report missing prerequisites to the user.
   Do not change or push the published image; a local image with your own fix is fine (see
@@ -274,7 +280,8 @@ it, and the run folder has no `profile.db`.
   (`Docker Hub has a newer ... (built DATE from commit C) than this machine (built ...)`). It still
   runs the local copy; tell the user, and pull only if they agree (`DOOLY_UPDATE_CHECK=0` silences
   it). `check-update` says `... is not older than Docker Hub's ...: nothing to update` when the
-  copy here was built later (e.g. from a newer commit of main).
+  copy here was built later (e.g. from a newer commit of main), and `... are builds of the same
+  commit: nothing to update` when both come from one commit; neither warns before other commands.
 - Results from different GPUs or link types are kept apart by their topology label; do not
   merge databases from different machines unless the user asks.
 
