@@ -22,6 +22,32 @@ This file is for coding agents that run DoolyProf for a user. People should read
   `~/.cache/huggingface` and `~/.cache/dooly-docker`, are that account's. Keep the same `HF_CACHE`
   from `download` to `run`.
 
+## Tested GPUs, and what to do on others
+
+DoolyProf has been tested only on NVIDIA **RTX PRO 6000 Blackwell Server Edition** (96 GB, compute
+capability 12.0) and **A100 80GB PCIe** (8.0) GPUs, with the image's vLLM, PyTorch and CUDA. On any
+other GPU expect bugs nobody has hit yet, typically where vLLM picks a different implementation for
+that GPU: FlashAttention 4 or a newer FlashInfer path on other Blackwell GPUs, other Triton or
+CUTLASS kernels, or kernels compiled on first use that fail for that compute capability. These bugs
+are yours to deal with; do not hand them back to the user as they are:
+
+1. Find the cause in `trace.log`, `profile.log` and the traceback: which operation, which library,
+   which call.
+2. Try what needs no code change first: another `--attention-backend` that vLLM supports on this GPU,
+   `--gpu-memory-cap`, or an empty `DOOLY_CACHE` of your own if a compiled kernel is broken.
+3. If DoolyProf itself is wrong (the tracer misses or misrecords an operation, the profiler cannot
+   run one, `ops without a working parent` > 0), fix it in your clone of the repository. The fix
+   must be general: no special case for one GPU, library version, model or configuration (no
+   hard-coded names, versions or shapes), and nothing other GPUs measure may change. Commit it in
+   your clone, build a thin local image with it (the recipe at the end of this file, tagged e.g.
+   `doolyprof:local-fix`, with `--build-arg DOOLY_REVISION=$(git rev-parse HEAD)`) and run every
+   command with `DOOLY_IMAGE=doolyprof:local-fix`. Never push that image.
+4. With a fix, `docker/dooly-docker.sh test` must still pass every suite and the run must meet the
+   success criteria below.
+5. Tell the user what failed, why, and what you changed (the diff or the commit in your clone), so
+   the fix can go into the repository. If you contribute to DoolyDB with it, say so in your report:
+   the pull request stays a draft until the user has looked.
+
 ## Preflight (run in order; stop and report on the first failure)
 
 | Check | Command | Expected |
@@ -236,8 +262,9 @@ it, and the run folder has no `profile.db`.
 
 - Do not run on GPUs other users are using; the script checks this, so do not bypass it with raw
   `docker run --gpus`.
-- Do not download weights, edit the image, or install system packages; report missing
-  prerequisites to the user.
+- Do not download weights or install system packages; report missing prerequisites to the user.
+  Do not change or push the published image; a local image with your own fix is fine (see
+  [Tested GPUs](#tested-gpus-and-what-to-do-on-others)).
 - Do not use `pkill -f` with broad patterns over SSH; it can match your own session.
 - A run into an existing `--out` folder reuses its `profile.db`: operations already in it are not
   profiled again and the summary reports only the new rows (possibly `0 result rows`). Use a new
