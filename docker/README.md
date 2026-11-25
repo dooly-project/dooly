@@ -66,7 +66,7 @@ docker/dooly-docker.sh test
 It ends with:
 
 ```
-[dooly] 13/13 suites passed
+[dooly] 14/14 suites passed
 ```
 
 **4. Download a model's config and tokenizer** (a few MB, no weights):

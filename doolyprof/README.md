@@ -98,6 +98,13 @@ python -m doolyprof.cli verify ./profiles     # the tree is exactly what export 
 ```
 
 `dooly run --db DB` profiles into DB instead of `OUT/profile.db`, reusing what it already has.
+It runs on a GPU nobody else is on (under 4 GiB in use, no other user's process, not taken by
+another `dooly run`), and with `--profile-comm` on one per rank of the largest group, as well
+linked as the free ones allow (`--gpus N` for another count); it stops when too few are free.
+`CUDA_VISIBLE_DEVICES` picks the GPUs instead. Without Docker, FlashInfer (used by vLLM) compiles
+some kernels the first time they are used, with the nvcc of `CUDA_HOME`: point it at a toolkit of
+the CUDA version PyTorch is built for (13.0 with `requirements.txt`); `run` prints a note when the
+nvcc it finds is of another version.
 
 With Docker: `docker/dooly-docker.sh export --db /out/NAME/profile.db --out /out/profiles`.
 
@@ -138,13 +145,14 @@ python -m doolyprof.cli verify DoolyDB                                        # 
 hf upload dooly-project/DoolyDB DoolyDB . --repo-type dataset --create-pr --commit-message "ORG/MODEL on <gpu>"
 ```
 
-`hf` comes with `huggingface_hub` (`pip install huggingface_hub`); `hf auth login` first. The
-pull request opens as a draft, which cannot be merged: find it on the dataset's Community tab
+`hf` comes with `huggingface_hub` (`pip install huggingface_hub`); `hf auth login` first. `hf
+upload` prints the URL of the commit it made, not of the pull request. The pull request opens as
+a draft, which cannot be merged: find it on the dataset's Community tab
 (Files changed lists the folders you added) and click **Publish**. Maintainers check it by
 verifying its revision (`hf download dooly-project/DoolyDB --repo-type dataset --revision
 refs/pr/<N> --local-dir pr-<N>`, then `python -m doolyprof.cli verify pr-<N>`; no GPU needed).
-Check each `deployment.json` before uploading: it
-records the run's command line, which may include local paths. Profile at a scale DoolySim can
+Check each `deployment.json` before uploading: it records the run's command line, with paths
+under your home directory written as `~/…`, but other paths as they were. Profile at a scale DoolySim can
 use (e.g. `--max-batch-size 32 --max-seq-len 8192`), and add `--tp N --profile-comm` on N
 linked GPUs to include collectives. With Docker, the same commands run through
 `docker/dooly-docker.sh` (`import`, `run --db`, `export`, `verify`), with paths under `/out/`.

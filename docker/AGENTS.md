@@ -22,7 +22,7 @@ This file is for coding agents that run DoolyProf for a user. People should read
 | Docker access | `docker info >/dev/null && echo ok` | `ok`. If permission denied: `export DOCKER="sudo docker"` and use `$DOCKER` below (do not run `sudo` for anything else). |
 | Image | `${DOCKER:-docker} pull jhkjames1110/doolyprof` | `Status: ...` with digest; 8 GB the first time |
 | GPUs in containers | `${DOCKER:-docker} run --rm --gpus all --entrypoint nvidia-smi jhkjames1110/doolyprof -L` | One `GPU i: ...` line per GPU. `could not select device driver` = NVIDIA Container Toolkit missing: report to the user, do not install system packages yourself. |
-| Self-test | `docker/dooly-docker.sh test` | Last line `[dooly] 12/12 suites passed`, exit 0, ~1 min |
+| Self-test | `docker/dooly-docker.sh test` | Last line `[dooly] N/N suites passed` (every suite passed), exit 0, ~1 min |
 
 ## Commands
 
@@ -94,7 +94,9 @@ A run succeeded only if **all** hold:
 
 1. the script's exit status is 0;
 2. `profile exit 0` and `0 ops without a working parent`;
-3. `dooly-out/NAME/profile.db` exists and `SELECT COUNT(*) FROM results` is R (> 0);
+3. `dooly-out/NAME/profile.db` exists and has the run's rows:
+   `SELECT COUNT(*) FROM results WHERE run_id = (SELECT MAX(run_id) FROM profile_runs)` is R (> 0).
+   R counts the rows this run added: a batch shape measured twice in one run is one row;
 4. with `--profile-comm`: the `collective measurements:` part names a count > 0 and no
    `skipped ...-rank groups` (unless you gave fewer GPUs than ranks on purpose).
 
