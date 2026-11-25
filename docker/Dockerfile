@@ -1,7 +1,8 @@
 # DoolyProf and DoolySim on vLLM 0.33. Published as jhkjames1110/doolyprof:latest (docker/README.md);
 # to build it:
 #
-#   docker build -f docker/Dockerfile -t doolyprof:vllm0.33 .        (from the repository root)
+#   docker build -f docker/Dockerfile --build-arg DOOLY_REVISION=$(git rev-parse HEAD) -t doolyprof:vllm0.33 .
+#                                                                    (from the repository root)
 #   DOOLY_IMAGE=doolyprof:vllm0.33 docker/dooly-docker.sh test       (to use it)
 #
 # - CUDA 13.0 toolkit, not only the runtime: FlashInfer compiles kernels the first time a shape
@@ -11,6 +12,9 @@
 #   DoolySim's pandas and scikit-learn.
 # - DoolyProf and DoolySim are pure Python and are copied in; `dooly` (doolyprof/cli.py) is the
 #   entry point. DoolySim runs with `--entrypoint python IMAGE -m doolysim.cli ...`.
+# - --build-arg DOOLY_REVISION=$(git rev-parse HEAD) records the commit: in the label
+#   org.opencontainers.image.revision (docker/dooly-docker.sh check-update shows it) and in
+#   doolyprof/REVISION, which every profiling run records (the copy here is not a git checkout).
 # Model weights are not needed (both stages load dummy weights); mount the Hugging Face cache for
 # the config and tokenizer files (see docker/dooly-docker.sh).
 ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04
@@ -28,6 +32,9 @@ RUN uv pip install --python /opt/venv/bin/python --no-cache -r /tmp/requirements
 
 COPY doolyprof /opt/dooly/doolyprof
 COPY doolysim /opt/dooly/doolysim
+ARG DOOLY_REVISION=
+RUN if [ -n "$DOOLY_REVISION" ]; then echo "$DOOLY_REVISION" > /opt/dooly/doolyprof/REVISION; fi
+LABEL org.opencontainers.image.revision=$DOOLY_REVISION
 ENV PATH=/opt/venv/bin:$PATH \
     PYTHONPATH=/opt/dooly \
     PYTHONUNBUFFERED=1 \

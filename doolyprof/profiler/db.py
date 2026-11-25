@@ -82,15 +82,26 @@ def _driver_version():
         return None
 
 
-def _revision():
-    """DOOLY_REVISION if set, else the git commit DoolyProf runs from, else None."""
+PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # doolyprof/
+
+
+def _revision(package_dir=PACKAGE_DIR):
+    """The DoolyProf commit: DOOLY_REVISION if set, else the git commit of the checkout DoolyProf
+    runs from, else the commit in ``doolyprof/REVISION`` (written by docker/Dockerfile, whose copy
+    of the code is not a checkout), else None."""
     if os.environ.get("DOOLY_REVISION"):
         return os.environ["DOOLY_REVISION"]
     try:
-        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__)),
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=package_dir,
                              capture_output=True, text=True, timeout=5)
-        return out.stdout.strip() or None if out.returncode == 0 else None
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
     except Exception:  # noqa: BLE001 -- no git
+        pass
+    try:
+        with open(os.path.join(package_dir, "REVISION")) as f:
+            return f.read().strip() or None
+    except OSError:
         return None
 
 
