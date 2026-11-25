@@ -175,6 +175,12 @@ running an example again replaces them.
 | `profile.log` | The profiler's log. Look here if profiling fails. It may say `Wrote N results` with N above the summary's row count: a batch shape measured twice in one run is stored once. |
 | `profile_timings.csv` | How long the profiler spent on each operation (for the profiler itself, not results). It is written next to the database: here, or next to the `--db` file. |
 
+The database also keeps a copy of both logs and of the trace with the run (gzipped, table
+`run_files`; `run` says `kept trace.log, profile.log and the trace ...`). `export` writes them next
+to the run's measurements (`runs/<run_uid>/` below), so they go to DoolyDB with your results and a
+run can be debugged later from there. Home directories are written as `~`, user and host names as
+`<user>` and `<host>`.
+
 Main tables in `profile.db`:
 
 | Table | One row per |
@@ -185,6 +191,7 @@ Main tables in `profile.db`:
 | `model_operations` | How many times each operation runs in one forward pass of the model. |
 | `coll_ops`, `coll_op_results` | The model's collectives, and (with `--profile-comm`) their latency by message size and group size. |
 | `profile_runs` | Profiling run: GPU, engine, backend, package and driver versions, command line. |
+| `run_files` | A run's logs and trace (`trace.log.gz`, `profile.log.gz`, `trace.json.gz`). |
 
 For example, the median time of every operation at 64 tokens:
 
@@ -205,9 +212,11 @@ profiles/
 │   ├── deployment.json   the deployment, and the runs that measured it (versions, options)
 │   ├── model.csv         its operations: file, name, signature, calls per forward pass
 │   ├── collectives.csv   its collectives: topology, group size, calls, how sizes scale
-│   └── <operation>-<signature>.csv   latency of one operation per batch shape
+│   ├── <operation>-<signature>.csv   latency of one operation per batch shape
+│   └── runs/<run_uid>/   each run's trace.log.gz, profile.log.gz and trace.json.gz
 └── communication/<topology>/<engine>/
     ├── runs.json         the runs that measured them
+    ├── runs/<run_uid>/   their logs and traces
     └── <collective>.csv  latency per group size and message size
 ```
 
@@ -280,7 +289,8 @@ operation it shares with another model is copied into it unchanged); `upload` pr
 lists what it adds. It opens as a draft, which cannot be merged: check it on its page (Files
 changed) and click **Publish**. A coding agent that does this for you leaves it as a draft, for
 you to check and publish ([AGENTS.md](AGENTS.md#contributing-to-doolydb)). Check each
-`deployment.json` before uploading: it records the run's command line. Add
+`deployment.json` before uploading: it records the run's command line. The run's logs and trace
+go too (`runs/<run_uid>/*.gz`, `zcat` to read them). Add
 `--gpus N --tp N --profile-comm` to include collectives.
 
 - `download-db` leaves Hugging Face's download bookkeeping in `.cache/huggingface/` inside the

@@ -13,11 +13,15 @@ Each profiling run is recorded in ``profile_runs``, with a ``run_uid`` that stay
 every database the run's rows are exported to or imported into, and the versions it ran with
 (``stack_json``); the rows it wrote carry its ``run_id``. ``profiled_models`` rows also carry
 the device, the engine and the attention backend's version (``backend_version``, e.g.
-``FLASHINFER-0.7.2.post1``).
+``FLASHINFER-0.7.2.post1``). ``run_files`` keeps files of a run by its ``run_uid``: ``dooly run``
+stores its trace.log, profile.log and trace there, gzipped (``RUN_FILES``, with this machine's
+home directory, user and host written generically, ``portable_text``), and ``dooly export``
+writes them under ``runs/<run_uid>/`` next to the run's measurements, for debugging later.
 
 Only the standard library is imported, so ``dooly export`` / ``dooly import`` and the tests
 can use this module without PyTorch or vLLM.
 """
+import gzip
 import json
 import os
 import platform
@@ -31,6 +35,10 @@ from importlib import metadata
 RECORDED_DISTRIBUTIONS = ("vllm", "torch", "transformers", "triton", "flashinfer-python",
                           "nvidia-nccl-cu13", "nvidia-nccl-cu12", "nvidia-cuda-runtime",
                           "nvidia-cuda-runtime-cu12", "numpy")
+
+# What ``dooly run`` keeps of each run in ``run_files`` (each gzipped, as ``<name>.gz``): the two
+# stages' logs and the trace the profiler measured from.
+RUN_FILES = ("trace.log", "profile.log", "trace.json")
 
 # The library that implements an attention backend, for backend labels: the first entry whose
 # key is part of the backend name. FLASH_ATTN backends are labelled with the FlashAttention
@@ -115,6 +123,50 @@ def portable_argv(argv, home=None):
         return list(argv)
     pattern = re.compile(rf"(?<![^\s=:,]){re.escape(home)}(?=/|$|[\s:,])")
     return [pattern.sub("~", arg) for arg in argv]
+
+
+def _login():
+    """This account's user name, or None (e.g. a container run with --user and a UID it does not know)."""
+    for key in ("USER", "LOGNAME"):
+        if os.environ.get(key):
+            return os.environ[key]
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError):
+        return None
+
+
+def portable_text(text, home=None, user=None, host=None):
+    """``text`` (a run's log or trace, kept with the run and shared through DoolyDB) with what names
+    this machine and account written generically: the home directory (default: this user's) as
+    ``~`` wherever a path starts with it, as ``portable_argv`` does; the user name as ``<user>``
+    where it is part of a path (``/tmp/torchinductor_<user>``); the host name, and its first label,
+    as ``<host>`` where it stands as a word. Names shorter than 3 characters are left alone."""
+    home = (os.path.expanduser("~") if home is None else home).rstrip("/")
+    if len(home) >= 2:
+        text = re.sub(rf"(?<![^\s=:,'\"(\[]){re.escape(home)}(?=/|$|[\s:,'\")\]])", "~", text, flags=re.M)
+    user = _login() if user is None else user
+    if user and len(user) >= 3:
+        text = re.sub(rf"(?<=[/_-]){re.escape(user)}(?=/|$|[\s:,'\")\]])", "<user>", text, flags=re.M)
+    host = platform.node() if host is None else host
+    for name in dict.fromkeys([host, host.split(".")[0]] if host else []):
+        if len(name) >= 3:
+            text = re.sub(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", "<host>", text)
+    return text
+
+
+def gzip_bytes(data):
+    """``data`` gzipped the same way every time (no time stamp in the header)."""
+    return gzip.compress(data, compresslevel=9, mtime=0)
+
+
+def add_run_file(conn, run_uid, name, data):
+    """Keep ``data`` (bytes, stored as they are) as the file ``name`` of run ``run_uid``; a file of
+    that name the run already has is kept. True when it was added."""
+    cur = conn.execute("INSERT OR IGNORE INTO run_files (run_uid, name, data) VALUES (?, ?, ?)",
+                       (run_uid, name, sqlite3.Binary(data)))
+    return cur.rowcount == 1
 
 
 def run_stack(backend, flash_attn_version=None, argv=None):
@@ -325,6 +377,14 @@ def init_schema(conn):
             backend TEXT,
             stack_json TEXT,
             started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS run_files (
+            run_uid TEXT NOT NULL,
+            name TEXT NOT NULL,
+            data BLOB NOT NULL,
+            PRIMARY KEY (run_uid, name)
         )
     """)
     conn.commit()

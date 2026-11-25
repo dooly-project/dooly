@@ -7,6 +7,8 @@
 - the profiler's reuse lookup sees only rows of its own device and engine
 - an older database (no device, engine or run columns) is brought up to date, keeps its rows,
   and its unlabelled rows are neither reused nor exported
+- the files a run kept (run_files: its logs and trace) are exported under runs/<run_uid>/ of each
+  folder it measured for, read back byte for byte, and checked by verify (placement, gzip)
 
 Runs directly: ``python doolyprof/tests/profiles_test.py``. CPU only, standard library only.
 """
@@ -235,6 +237,54 @@ def test_older_database_is_upgraded_not_reused_not_exported():
         except ImportError:
             return
         assert ModuleComparator()._load_existing_signatures(f"{d}/old.db", "gpu-x", "vllm-0.33.0") == set()
+
+
+def test_run_files_go_with_the_runs_that_measured():
+    import gzip
+    with tempfile.TemporaryDirectory() as d:
+        db = f"{d}/a.db"
+        _fill(db, "gpu-x")
+        con = sqlite3.connect(db)
+        uid = con.execute("SELECT run_uid FROM profile_runs").fetchone()[0]
+        log = profile_db.gzip_bytes(b"[Tracer] traced\n")
+        assert log == profile_db.gzip_bytes(b"[Tracer] traced\n")             # the same bytes every time
+        for name in ("trace.log.gz", "trace.json.gz"):
+            assert profile_db.add_run_file(con, uid, name, log)
+        assert not profile_db.add_run_file(con, uid, "trace.log.gz", b"other")  # the first one is kept
+        con.commit()
+        con.close()
+        a = f"{d}/a"
+        done = profiles.export_db(db, a)
+        assert done["run_files"] == 4, done                                    # deployment and communication
+        dep = os.path.join(a, "compute", "gpu-x", "vllm-0.33.0", "FLASH_ATTN-fa2", "org", "model-a",
+                           "tp2-bfloat16-kvauto")
+        assert sorted(os.listdir(os.path.join(dep, "runs", uid))) == ["trace.json.gz", "trace.log.gz"]
+        with open(os.path.join(dep, "runs", uid, "trace.log.gz"), "rb") as f:
+            assert gzip.decompress(f.read()) == b"[Tracer] traced\n"
+        assert os.path.isdir(os.path.join(a, "communication", "gpu-x-pcie", "vllm-0.33.0", "runs", uid))
+        problems, counts = profiles.verify_tree(a)
+        # two files, written in both folders (each is self-contained): the second copies are already there
+        assert not problems and (counts["run_files_added"], counts["run_files_present"]) == (2, 2), (problems, counts)
+        profiles.import_tree(a, f"{d}/b.db")                                   # round trip
+        profiles.export_db(f"{d}/b.db", f"{d}/b")
+        _same_tree(a, f"{d}/b")
+        again = profiles.import_tree(a, f"{d}/b.db")                           # a union: nothing new
+        assert again["run_files_added"] == 0 and again["run_files_present"] == 4, again
+        with open(os.path.join(dep, "runs", uid, "trace.log.gz"), "wb") as f:  # damaged
+            f.write(b"not gzip")
+        problems, _ = profiles.verify_tree(a)
+        assert any("trace.log.gz: not a readable gzip file" in p for p in problems), problems
+        profiles.export_db(db, a)
+        os.makedirs(os.path.join(dep, "runs", "other-run"))                    # a run deployment.json does not list
+        with open(os.path.join(dep, "runs", "other-run", "x.gz"), "wb") as f:
+            f.write(log)
+        problems, _ = profiles.verify_tree(a)
+        assert any("other-run/x.gz: not written by dooly export" in p for p in problems), problems
+        profiles.export_db(db, a)                                              # exporting again tidies up
+        assert not profiles.verify_tree(a)[0] and not os.path.exists(os.path.join(dep, "runs", "other-run"))
+        _fill(f"{d}/c.db", "gpu-x")                                            # a run without files: no runs/
+        profiles.export_db(f"{d}/c.db", f"{d}/c")
+        assert not os.path.exists(os.path.join(f"{d}/c", os.path.relpath(dep, a), "runs"))
 
 
 if __name__ == "__main__":

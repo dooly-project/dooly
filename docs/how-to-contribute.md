@@ -100,7 +100,10 @@ database that DoolyProf and DoolySim work with is built from it on your machine 
 
 6. **Look over what you will upload**: the new folder should be your model's, and each new
    `deployment.json` records the run's command line. Paths under your home directory are
-   written as `~/…`; other paths (e.g. under `/mnt`) are kept as they were.
+   written as `~/…`; other paths (e.g. under `/mnt`) are kept as they were. The folder also holds
+   your run's logs and trace (`runs/<run_uid>/trace.log.gz`, `profile.log.gz`, `trace.json.gz`),
+   so that the run can be debugged later; there your user and host names are written as `<user>`
+   and `<host>` too. Read them with `zcat`.
 
 7. **Upload it as a pull request**:
 

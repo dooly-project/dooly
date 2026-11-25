@@ -90,7 +90,10 @@ versions. `DOOLY_DEVICE` and `DOOLY_ENGINE` override the two labels.
 
 `export` writes a database as a tree of CSV files, one per operation, to share or keep under
 version control; `import` merges such a tree into a database, after which runs on the same GPU
-and engine reuse its results:
+and engine reuse its results. `dooly run` also keeps its `trace.log`, `profile.log` and trace in
+the database with the run (gzipped; home directory, user and host names written generically),
+and `export` writes them next to the run's measurements as `runs/<run_uid>/*.gz`, so a run can be
+debugged later from the tree alone:
 
 ```bash
 python -m doolyprof.cli export --db ./dooly_data.db --out ./profiles
@@ -99,8 +102,8 @@ python -m doolyprof.cli verify ./profiles     # the tree is exactly what export 
 ```
 
 `dooly run --db DB` profiles into DB instead of `OUT/profile.db`, reusing what it already has.
-It runs on a GPU nobody else is on (under 4 GiB in use, no other user's process, not taken by
-another `dooly run`), and with `--profile-comm` on one per rank of the largest group, as well
+It runs on a GPU nobody else is on (under 4 GiB in use, no kernels running, no other user's
+process, not taken by another `dooly run`), and with `--profile-comm` on one per rank of the largest group, as well
 linked as the free ones allow (`--gpus N` for another count); it stops when too few are free.
 `CUDA_VISIBLE_DEVICES` picks the GPUs instead. Without Docker, FlashInfer (used by vLLM) compiles
 some kernels the first time they are used, with the nvcc of `CUDA_HOME`: point it at a toolkit of
