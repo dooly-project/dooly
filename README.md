@@ -35,6 +35,11 @@ cd dooly
 pip install -r requirements.txt
 ```
 
+Profiling also needs a CUDA toolkit (nvcc) of the CUDA version PyTorch is built for, with
+`CUDA_HOME` pointing at it (e.g. `/usr/local/cuda-13.0`): FlashInfer, which vLLM uses, compiles
+some kernels the first time they are used. The Docker image
+([doolyprof/README.md](doolyprof/README.md#run-with-docker)) has everything.
+
 ## Getting started
 
 - **Profile a model** with DoolyProf: [doolyprof/README.md](doolyprof/README.md). The quickest
