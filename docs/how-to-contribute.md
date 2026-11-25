@@ -112,24 +112,30 @@ database that DoolyProf and DoolySim work with is built from it on your machine 
 
 ## With Docker
 
-The same steps, with `hf` on your machine and the rest in the container (`./dooly-out/` on your
-machine is `/out/` in the container). These commands need an image from 2026-11-24 or later:
-`docker/dooly-docker.sh check-update` says whether yours is older, and
+The same steps through `docker/dooly-docker.sh` (`./dooly-out/` on your machine is `/out/` in the
+container), which needs no `hf` on your machine but always your token: a file that holds it in
+`HF_TOKEN_FILE` (how to make one: [docker/README.md](../docker/README.md#what-you-need)), or the
+token itself in `HF_TOKEN`. It uses that token, never a login saved on the machine. Use an image
+from 2026-11-24 or later: `docker/dooly-docker.sh check-update` says whether yours is older, and
 `docker pull jhkjames1110/doolyprof` updates it.
 
 ```bash
-hf download dooly-project/DoolyDB --repo-type dataset --local-dir dooly-out/DoolyDB
+export HF_TOKEN_FILE=~/.hf-token.txt
+docker/dooly-docker.sh download-db /out/DoolyDB
 docker/dooly-docker.sh import /out/DoolyDB --db /out/dooly.db
 docker/dooly-docker.sh download ORG/MODEL
 docker/dooly-docker.sh run --model ORG/MODEL --out /out/model --db /out/dooly.db --max-batch-size 32 --max-seq-len 8192
 docker/dooly-docker.sh export --db /out/dooly.db --out /out/DoolyDB
 docker/dooly-docker.sh verify /out/DoolyDB
-hf upload dooly-project/DoolyDB dooly-out/DoolyDB . --repo-type dataset --create-pr --commit-message "ORG/MODEL on <gpu>"
+docker/dooly-docker.sh upload /out/DoolyDB "ORG/MODEL on <gpu>"
 ```
 
 The image is offline, so `download` fetches the model's config and tokenizer first (no
-weights). Add `--gpus N --tp N --profile-comm` to `run` to include collectives. Then publish the
-pull request as in step 8.
+weights). Add `--gpus N --tp N --profile-comm` to `run` to include collectives. `upload` runs
+`verify` again, opens the pull request (never a commit to main) and prints its URL and what it
+adds compared with DoolyDB. Then publish it as in step 8. A coding agent doing this follows
+[docker/AGENTS.md](../docker/AGENTS.md#contributing-to-doolydb), which also has it check the
+pull request itself.
 
 ## If verify fails
 
