@@ -28,6 +28,18 @@ Model weights are never downloaded: DoolyProf only needs a model's config and to
 | **Disk** | About 18 GB for the image (an 8 GB download). |
 | **This repository** | For `docker/dooly-docker.sh`, the script that runs everything. |
 | **python3** (optional) | Lets the script pick the best-connected GPUs. Without it, it takes the first free ones. |
+| **Hugging Face token** | Every command needs one (create it at https://huggingface.co/settings/tokens; to contribute to DoolyDB it must be allowed to open pull requests). |
+
+Save the token in a file only you can read (typed at a hidden prompt, so it stays out of your
+shell history), and tell the script where it is, once per shell:
+
+```bash
+(umask 077; read -rsp "Hugging Face token: " T; echo; printf %s "$T" > ~/.hf-token.txt)
+export HF_TOKEN_FILE=~/.hf-token.txt
+```
+
+`HF_TOKEN=<token>` works too. The commands that reach Hugging Face (`download`, `download-db`,
+`upload`) use that token and never a login saved on the machine (`hf auth login`).
 
 If your account cannot run `docker` without `sudo`, run this once in your shell and everything
 below works unchanged:
@@ -110,7 +122,7 @@ attention backend:
 | `hetero` | `openai/gpt-oss-20b` | Layers that alternate sliding-window and full attention. | `TRITON_ATTN` |
 
 You need an 80 GB GPU (for Qwen3-30B-A3B), plus a second GPU for Qwen3.8-27B's communication.
-None of the three models is gated, so no Hugging Face login is needed:
+None of the three models is gated; like every command, the script needs your token (`HF_TOKEN_FILE`):
 
 ```bash
 docker/example.sh                      # all three: ~15 minutes the first time, ~10 after
@@ -216,6 +228,8 @@ docker/dooly-docker.sh [--gpus N | --devices LIST] COMMAND [options]
 | `export --db /out/NAME/profile.db --out /out/profiles` | Writes the database's results as CSV files, one per operation, in a folder tree by GPU, engine, backend, model and deployment (below). Uses no GPU. |
 | `import /out/profiles --db /out/NAME/profile.db` | Merges such a tree into a database, so later runs on the same GPU and engine reuse its results. Uses no GPU. |
 | `verify /out/profiles` | Checks that a tree is exactly what `export` writes, e.g. before contributing it to [DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB). Uses no GPU. |
+| `download-db /out/DoolyDB [--revision REV]` | Downloads [DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB), or one of its revisions (a pull request's is `refs/pr/N`), into a folder. Uses no GPU. |
+| `upload /out/DoolyDB "MESSAGE"` | Checks the folder with `verify`, then uploads it to DoolyDB as a pull request (never to main) and prints its URL and what it adds, changes and removes. Uses no GPU. |
 | `trace ...` / `profile ...` | Runs only one stage, with the arguments of `doolyprof/run/run-tracer.py` / `run-profiler.py`. |
 
 Options of `run`:
@@ -244,25 +258,26 @@ Step by step, with what to do when `verify` fails: [docs/how-to-contribute.md](.
 
 [DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB) is the shared tree of DoolyProf results. Start from it, so your run only
 measures what is not there yet for your GPU and engine, then send what you added as a pull
-request. `hf` downloads and uploads it on your machine (`pip install huggingface_hub`, then
-`hf auth login`); the rest runs in the container, with `./dooly-out/` as `/out/`:
+request. Everything runs through the script, with your token (`HF_TOKEN_FILE`) and
+`./dooly-out/` as `/out/`:
 
 ```bash
-hf download dooly-project/DoolyDB --repo-type dataset --local-dir dooly-out/DoolyDB
+docker/dooly-docker.sh download-db /out/DoolyDB
 docker/dooly-docker.sh import /out/DoolyDB --db /out/dooly.db
 docker/dooly-docker.sh download ORG/MODEL
 docker/dooly-docker.sh run --model ORG/MODEL --out /out/model --db /out/dooly.db --max-batch-size 32 --max-seq-len 8192
 docker/dooly-docker.sh export --db /out/dooly.db --out /out/DoolyDB
 docker/dooly-docker.sh verify /out/DoolyDB
-hf upload dooly-project/DoolyDB dooly-out/DoolyDB . --repo-type dataset --create-pr --commit-message "ORG/MODEL on <gpu>"
+docker/dooly-docker.sh upload /out/DoolyDB "ORG/MODEL on <gpu>"
 ```
 
 `run --db` reuses every result `dooly.db` already has for your GPU and engine, so a model whose
 operations are already in DoolyDB only measures what is new. The pull request adds your model's
-folder (an operation it shares with another model is copied into it unchanged). It opens as a
-draft, which cannot be merged: find it on the dataset's Community tab and click **Publish**.
-Check each `deployment.json` before uploading: it records the run's command line. Add
-`--gpus N --tp N --profile-comm` to include collectives.
+folder (an operation it shares with another model is copied into it unchanged); `upload` prints
+its URL and lists what it adds. It opens as a draft, which cannot be merged: check it on its page
+(Files changed) and click **Publish**. Check each `deployment.json` before uploading: it records
+the run's command line. Add `--gpus N --tp N --profile-comm` to include collectives.
+`DOOLY_DB_REPO` points `download-db` and `upload` at another dataset (e.g. a copy to try this on).
 
 ---
 
@@ -307,13 +322,13 @@ The summary line then also says how many collective measurements were stored, e.
 
 ---
 
-## Models that need a Hugging Face login
+## Models that need a license accepted
 
 Some models (Llama, Gemma, ...) require accepting a license on huggingface.co. Accept it on the
-model's page, create a token at https://huggingface.co/settings/tokens, then:
+model's page with the account your token belongs to, then download as usual:
 
 ```bash
-HF_TOKEN=hf_xxx docker/dooly-docker.sh download meta-llama/Llama-3.1-8B
+docker/dooly-docker.sh download meta-llama/Llama-3.1-8B      # with HF_TOKEN_FILE set
 ```
 
 Only `download` uses the internet; tracing and profiling run offline from your cache.
@@ -329,7 +344,9 @@ Only `download` uses the internet; tracing and profiling run offline from your c
 | `HF_CACHE` | `~/.cache/huggingface` | Host Hugging Face cache (models are downloaded here). |
 | `DOOLY_CACHE` | `~/.cache/dooly-docker` | Host folder for compiled kernels. |
 | `DOOLY_IMAGE` | `jhkjames1110/doolyprof:latest` | The image to run. |
-| `HF_TOKEN` | | Hugging Face token, for `download` of gated models. |
+| `HF_TOKEN_FILE` | | A file that holds your Hugging Face token (this or `HF_TOKEN` is required). |
+| `HF_TOKEN` | | The token itself, instead of `HF_TOKEN_FILE`. |
+| `DOOLY_DB_REPO` | `dooly-project/DoolyDB` | The dataset `download-db` and `upload` use. |
 | `DOOLY_ANY_LINK` | | `1`: take free GPUs even when better-connected ones exist but are busy. |
 | `DOOLY_TOPOLOGY` | derived | Label for communication measurements. |
 | `DOOLY_UPDATE_CHECK` | `1` | `0`: skip comparing your image with Docker Hub's before each command. |

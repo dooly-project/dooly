@@ -20,6 +20,7 @@ You need Linux, an NVIDIA GPU with driver 580 or newer, and Docker with the
 git clone https://github.com/dooly-project/dooly.git
 cd dooly
 docker pull jhkjames1110/doolyprof
+export HF_TOKEN_FILE=~/.hf-token.txt     # a file holding your Hugging Face token (docker/README.md)
 docker/dooly-docker.sh download Qwen/Qwen3-0.6B                          # config and tokenizer, no weights
 docker/dooly-docker.sh run --model Qwen/Qwen3-0.6B --out /out/qwen3-0.6b  # results: ./dooly-out/qwen3-0.6b/profile.db
 ```
@@ -154,8 +155,9 @@ refs/pr/<N> --local-dir pr-<N>`, then `python -m doolyprof.cli verify pr-<N>`; n
 Check each `deployment.json` before uploading: it records the run's command line, with paths
 under your home directory written as `~/…`, but other paths as they were. Profile at a scale DoolySim can
 use (e.g. `--max-batch-size 32 --max-seq-len 8192`), and add `--tp N --profile-comm` on N
-linked GPUs to include collectives. With Docker, the same commands run through
-`docker/dooly-docker.sh` (`import`, `run --db`, `export`, `verify`), with paths under `/out/`.
+linked GPUs to include collectives. With Docker, everything runs through
+`docker/dooly-docker.sh` (`download-db`, `import`, `run --db`, `export`, `verify`, `upload`), with
+paths under `/out/` and your Hugging Face token in `HF_TOKEN_FILE`.
 
 ## Layout
 

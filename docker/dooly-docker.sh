@@ -11,7 +11,14 @@
 #   docker/dooly-docker.sh export --db /out/qwen3/profile.db --out /out/profiles   (no GPU; CSV tree)
 #   docker/dooly-docker.sh import /out/profiles --db /out/qwen3/profile.db         (no GPU)
 #   docker/dooly-docker.sh verify /out/profiles                                     (no GPU)
+#   docker/dooly-docker.sh download-db /out/DoolyDB [--revision refs/pr/N]   (DoolyDB, or a pull request)
+#   docker/dooly-docker.sh upload /out/DoolyDB "ORG/MODEL on GPU"            (a pull request on DoolyDB)
 #   docker/dooly-docker.sh check-update                     (is Docker Hub's image newer than yours?)
+#
+# Every command needs a Hugging Face token: HF_TOKEN_FILE, the path of a file that holds it
+# (preferred), or HF_TOKEN, the token itself. Only download, download-db and upload hand it to a
+# container (the file mounted read-only, or the token in an env file only you can read), and they
+# use no other: never a login saved on this machine (`hf auth login`).
 #
 # Inside the container the chosen GPUs are 0..N-1 in the order chosen (CUDA_VISIBLE_DEVICES; the
 # first k GPUs form a k-rank group). Paths under /out are $DOOLY_OUT on the host.
@@ -33,7 +40,8 @@
 #   HF_CACHE     host Hugging Face cache, at /hf  DOOLY_CACHE  host folder for FlashInfer / Triton / vLLM
 #                ($HOME/.cache/huggingface)                    caches, the container's HOME ($HOME/.cache/dooly-docker)
 #   DOCKER       docker command (docker); "sudo docker" where your account is not in the docker group
-#   HF_TOKEN     passed to download, for gated models (or a token saved by `hf auth login` in HF_CACHE)
+#   HF_TOKEN_FILE  file holding your Hugging Face token   HF_TOKEN  the token itself (one is required)
+#   DOOLY_DB_REPO  the dataset download-db and upload use (dooly-project/DoolyDB)
 #   DOOLY_UPDATE_CHECK  0: do not compare the image with Docker Hub's before each command (it only
 #                warns when Docker Hub has a newer one; the copy on this machine is what runs)
 #   DOOLY_*      every other DOOLY_ variable is passed into the container (e.g. DOOLY_TOPOLOGY, the
@@ -49,6 +57,7 @@ HF=${HF_CACHE:-$HOME/.cache/huggingface}
 CACHE=${DOOLY_CACHE:-$HOME/.cache/dooly-docker}
 LOCK=/tmp/dooly_gpu   # $LOCK<i>.lock: GPU i is taken by a run of this script
 TOPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../doolyprof/profiler/utils/topology.py"
+DB_REPO=${DOOLY_DB_REPO:-dooly-project/DoolyDB}
 N="" DEVICES=""
 while [ $# -gt 0 ]; do
   case $1 in
@@ -57,6 +66,31 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
+
+# The Hugging Face token, required by every command (see the top of this file).
+if [ -n "${HF_TOKEN_FILE:-}" ]; then
+  if [ ! -f "$HF_TOKEN_FILE" ] || [ ! -r "$HF_TOKEN_FILE" ] || [ ! -s "$HF_TOKEN_FILE" ]; then
+    echo "[dooly-docker] HF_TOKEN_FILE=$HF_TOKEN_FILE is not a readable, non-empty file" >&2
+    exit 2
+  fi
+  HF_TOKEN_FILE="$(cd "$(dirname -- "$HF_TOKEN_FILE")" && pwd -P)/$(basename -- "$HF_TOKEN_FILE")"
+elif [ -z "${HF_TOKEN:-}" ]; then
+  echo "[dooly-docker] a Hugging Face token is required: HF_TOKEN_FILE=/path/to/token.txt (a file that holds" >&2
+  echo "  it; preferred) or HF_TOKEN=<token>. The commands that reach Hugging Face use it, and no saved login." >&2
+  exit 2
+fi
+token=()   # docker run options handing the token to a container (token_options)
+token_options() {  # the file read-only (HF_TOKEN_PATH), or the token in an env file only this user can read:
+  # `-e HF_TOKEN` alone passes nothing through `sudo docker`, and `-e HF_TOKEN=...` would show it in the
+  # process list. Either one is read instead of a login saved in HF_CACHE.
+  if [ -n "${HF_TOKEN_FILE:-}" ]; then
+    token=(-v "$HF_TOKEN_FILE":/run/dooly/hf_token:ro -e HF_TOKEN_PATH=/run/dooly/hf_token)
+  else
+    tokfile=$(mktemp) && chmod 600 "$tokfile" && printf 'HF_TOKEN=%s\n' "$HF_TOKEN" > "$tokfile"
+    trap 'rm -f "$tokfile"' EXIT
+    token=(--env-file "$tokfile")
+  fi
+}
 
 image_update_check() {  # 0: same as Docker Hub, 1: Docker Hub has a newer one (warned), 2: not checked
   [ "${DOOLY_UPDATE_CHECK:-1}" = 0 ] && return 2
@@ -104,14 +138,7 @@ if [ "${1:-}" = "download" ]; then  # model config and tokenizer files into $HF;
   shift
   [ $# -gt 0 ] || { echo "usage: dooly-docker.sh download MODEL [MODEL ...]" >&2; exit 2; }
   mkdir -p "$HF" "$CACHE"
-  # The token goes in an env file only this user can read: `-e HF_TOKEN` alone passes nothing
-  # through `sudo docker`, and `-e HF_TOKEN=...` would show it in the process list.
-  token=()
-  if [ -n "${HF_TOKEN:-}" ]; then
-    tokfile=$(mktemp) && chmod 600 "$tokfile" && printf 'HF_TOKEN=%s\n' "$HF_TOKEN" > "$tokfile"
-    trap 'rm -f "$tokfile"' EXIT
-    token=(--env-file "$tokfile")
-  fi
+  token_options
   rc=0
   for model in "$@"; do
     echo "[dooly-docker] downloading $model into $HF (config and tokenizer files; no weights)" >&2
@@ -122,6 +149,75 @@ if [ "${1:-}" = "download" ]; then  # model config and tokenizer files into $HF;
   done
   [ $rc = 0 ] && echo "[dooly-docker] done" >&2
   exit $rc
+fi
+
+under_out() {  # $1 must be a path under /out, the container's view of $DOOLY_OUT
+  case $1 in /out/?*) return 0 ;; esac
+  echo "[dooly-docker] $2: '$1' must be a folder under /out/ (\$DOOLY_OUT, here $OUT)" >&2
+  exit 2
+}
+
+if [ "${1:-}" = "download-db" ]; then  # DoolyDB (or a revision of it, e.g. refs/pr/N) into a folder; no GPU
+  shift
+  [ $# -ge 1 ] || { echo "usage: dooly-docker.sh download-db /out/DIR [--revision REV]" >&2; exit 2; }
+  dir=$1; shift
+  under_out "$dir" download-db
+  mkdir -p "$OUT"
+  token_options
+  echo "[dooly-docker] downloading $DB_REPO${*:+ ($*)} into $dir" >&2
+  $DOCKER run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_HOME=/tmp/hf -e HF_HUB_OFFLINE=0 \
+    "${token[@]}" -v "$OUT":/out --entrypoint hf "$IMAGE" download "$DB_REPO" --repo-type dataset \
+    --local-dir "$dir" "$@" >&2
+  exit $?
+fi
+
+if [ "${1:-}" = "upload" ]; then  # a folder as a pull request on DoolyDB, after dooly verify; no GPU
+  shift
+  [ $# -eq 2 ] || { echo "usage: dooly-docker.sh upload /out/DIR \"ORG/MODEL on GPU\"" >&2; exit 2; }
+  dir=$1 message=$2
+  under_out "$dir" upload
+  if ! $DOCKER run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$OUT":/out:ro "$IMAGE" verify "$dir"; then
+    echo "[dooly-docker] not uploaded: dooly verify found problems (docs/how-to-contribute.md, If verify fails)" >&2
+    exit 1
+  fi
+  token_options
+  $DOCKER run --rm -i --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_HOME=/tmp/hf -e HF_HUB_OFFLINE=0 \
+    "${token[@]}" -v "$OUT":/out:ro --entrypoint python "$IMAGE" - "$DB_REPO" "$dir" "$message" <<'EOF'
+# Always a pull request, never a commit to main; then what it changes compared with main.
+import sys
+from huggingface_hub import HfApi
+from huggingface_hub.hf_api import RepoFile
+repo, folder, message = sys.argv[1:]
+api = HfApi()
+try:
+    who = api.whoami()["name"]
+except Exception as e:  # noqa: BLE001
+    sys.exit(f"[dooly-docker] the Hugging Face token was not accepted: {e}")
+print(f"[dooly-docker] uploading {folder} to {repo} as {who}, as a pull request", file=sys.stderr, flush=True)
+info = api.upload_folder(repo_id=repo, repo_type="dataset", folder_path=folder, commit_message=message,
+                         create_pr=True)
+if not info.pr_url:
+    sys.exit(f"[dooly-docker] nothing uploaded: {folder} has no file that {repo} does not already have")
+
+def files(rev):
+    return {f.path: f.blob_id for f in api.list_repo_tree(repo, repo_type="dataset", revision=rev, recursive=True)
+            if isinstance(f, RepoFile)}
+main, pr = files("main"), files(info.pr_revision)
+added = sorted(set(pr) - set(main))
+changed = sorted(p for p in set(pr) & set(main) if pr[p] != main[p])
+removed = sorted(set(main) - set(pr))
+folders = sorted({p.rsplit("/", 1)[0] for p in added})
+print(f"[dooly-docker] pull request #{info.pr_num}: {info.pr_url}")
+print(f"[dooly-docker] compared with main it adds {len(added)} file(s), changes {len(changed)}, removes {len(removed)}")
+for f in folders:
+    print(f"    + {f}/")
+for p in changed:
+    print(f"    ~ {p}")
+for p in removed:
+    print(f"    - {p}")
+print("[dooly-docker] it is a draft: check it, then publish it on its page", flush=True)
+EOF
+  exit $?
 fi
 
 if [ "${1:-}" = "export" ] || [ "${1:-}" = "import" ] || [ "${1:-}" = "verify" ]; then  # database <-> CSV tree; no GPU
@@ -236,7 +332,7 @@ order=$(for g in ${devices//,/ }; do echo "$sorted" | tr , '\n' | grep -nx "$g" 
 envs=(-e CUDA_DEVICE_ORDER=PCI_BUS_ID -e CUDA_VISIBLE_DEVICES="$order")
 for name in $(compgen -e); do
   case $name in
-    DOOLY_IMAGE|DOOLY_OUT|DOOLY_CACHE|DOOLY_ANY_LINK|DOOLY_UPDATE_CHECK) ;;
+    DOOLY_IMAGE|DOOLY_OUT|DOOLY_CACHE|DOOLY_ANY_LINK|DOOLY_UPDATE_CHECK|DOOLY_DB_REPO) ;;
     DOOLY_*) envs+=(-e "$name=${!name}") ;;  # with its value: `-e NAME` alone passes nothing through sudo
   esac
 done

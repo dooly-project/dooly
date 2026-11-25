@@ -12,9 +12,10 @@
 #                                     mixture of experts), TRITON_ATTN: vLLM runs gpt-oss's
 #                                     attention sinks with Triton on A100 and Blackwell alike
 #
-# Each model's config and tokenizer are downloaded first unless already in HF_CACHE (no weights).
-# None of the three is gated, so no Hugging Face login is needed. Computation is profiled on one
-# GPU (Qwen3-30B-A3B needs an 80 GB one).
+# Each model's config and tokenizer are downloaded first unless already in HF_CACHE (no weights),
+# with the Hugging Face token dooly-docker.sh requires: HF_TOKEN_FILE=/path/to/token.txt (a file
+# that holds it; preferred) or HF_TOKEN=<token>. Computation is profiled on one GPU (Qwen3-30B-A3B
+# needs an 80 GB one).
 #
 # Results go to $DOOLY_OUT/example/NAME/ (default ./dooly-out/example/), each run's output to
 # $DOOLY_OUT/example/NAME.log. Each example starts from an empty folder and replaces its previous
@@ -25,9 +26,14 @@
 # Attention, 12 calls each.
 #
 # The settings of dooly-docker.sh apply (DOCKER, DOOLY_OUT, HF_CACHE, DOOLY_CACHE, DOOLY_IMAGE,
-# HF_TOKEN); options after "--" go to every run and win over the ones above, e.g.
+# HF_TOKEN_FILE, HF_TOKEN); options after "--" go to every run and win over the ones above, e.g.
 #   docker/example.sh moe -- --attention-backend FLASH_ATTN --max-batch-size 4
 set -u
+if [ -z "${HF_TOKEN_FILE:-}" ] && [ -z "${HF_TOKEN:-}" ]; then
+  echo "example.sh: a Hugging Face token is required: HF_TOKEN_FILE=/path/to/token.txt (a file that holds it;" >&2
+  echo "  preferred) or HF_TOKEN=<token>. See docker/README.md." >&2
+  exit 2
+fi
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RUN="$HERE/dooly-docker.sh"
 export DOOLY_OUT=${DOOLY_OUT:-$PWD/dooly-out}
@@ -65,7 +71,7 @@ for n in "${names[@]}"; do
   m=${MODEL[$n]}
   [ -d "$HF/hub/models--${m//\//--}" ] && continue
   if ! "$RUN" download "$m"; then
-    STATUS[$n]="download failed (a gated model needs its license accepted on huggingface.co/$m and HF_TOKEN)"
+    STATUS[$n]="download failed (is the token valid? a gated model also needs its license accepted on huggingface.co/$m)"
   fi
 done
 for n in "${names[@]}"; do

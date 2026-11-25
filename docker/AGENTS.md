@@ -13,11 +13,16 @@ This file is for coding agents that run DoolyProf for a user. People should read
   Weights are never needed; `download` fetches only config and tokenizer files.
 - Compute is always traced and profiled on one GPU, also for `--tp N` / `--dp N` (one rank
   of the split is emulated). Real multi-GPU runs are needed only for `--profile-comm`.
+- Every command of `dooly-docker.sh` and `example.sh` needs a Hugging Face token:
+  `export HF_TOKEN_FILE=/path/to/token.txt`, the path of a file that holds it (ask the user for
+  the path), or `HF_TOKEN`. Only `download`, `download-db` and `upload` hand it to a container,
+  and they never use a login saved on the machine.
 
 ## Preflight (run in order; stop and report on the first failure)
 
 | Check | Command | Expected |
 |---|---|---|
+| Token | `test -r "$HF_TOKEN_FILE" && test -s "$HF_TOKEN_FILE" && echo ok` | `ok`. Otherwise ask the user for the path of their token file. Never read, print or copy it. |
 | Driver | `nvidia-smi --query-gpu=index,name,driver_version,memory.used --format=csv` | GPUs listed, driver >= 580 |
 | Docker access | `docker info >/dev/null && echo ok` | `ok`. If permission denied: `export DOCKER="sudo docker"` and use `$DOCKER` below (do not run `sudo` for anything else). |
 | Image | `${DOCKER:-docker} pull jhkjames1110/doolyprof` | `Status: ...` with digest; 8 GB the first time |
@@ -37,22 +42,17 @@ docker/dooly-docker.sh export --db /out/NAME/profile.db --out /out/profiles   # 
 docker/dooly-docker.sh import /out/profiles --db /out/NAME/profile.db         # no GPU; merge a tree
 docker/dooly-docker.sh verify /out/profiles                                   # no GPU; tree == export?
 docker/dooly-docker.sh run --model MODEL --out /out/NAME --db /out/dooly.db   # profile into, reuse from, a db
+docker/dooly-docker.sh download-db /out/DoolyDB [--revision refs/pr/N]        # no GPU; DoolyDB, or a PR's revision
+docker/dooly-docker.sh upload /out/DoolyDB "ORG/MODEL on GPU"                 # no GPU; verify, then a draft PR
 docker/example.sh [dense] [moe] [hetero] [-- RUN-OPTIONS]        # example workloads, see below
 ```
 
-Contributing to [DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB) (the shared result tree on Hugging Face): `hf download
-dooly-project/DoolyDB --repo-type dataset --local-dir dooly-out/DoolyDB` on the host, then
-`import /out/DoolyDB --db /out/dooly.db`, `run ... --db /out/dooly.db` (reuses what DoolyDB has
-for this GPU and engine), `export --db /out/dooly.db --out /out/DoolyDB`, `verify /out/DoolyDB`,
-and on the host `hf upload dooly-project/DoolyDB dooly-out/DoolyDB . --repo-type dataset
---create-pr`. The pull request opens as a draft; the user publishes it on its page (the
-dataset's Community tab). Uploading needs the user's `hf auth login`; never ask for or type a token.
-The full walkthrough (and what to do when `verify` fails) is docs/how-to-contribute.md.
+Contributing to DoolyDB: see [its section](#contributing-to-doolydb) below.
 
 `docker/example.sh` runs `Qwen/Qwen3.8-27B` at `--tp 2` (`FLASH_ATTN`; on 2 GPUs with
 `--profile-comm` when the machine has two), `Qwen/Qwen3-30B-A3B` (`FLASHINFER`, needs an 80 GB GPU)
 and `openai/gpt-oss-20b` (`TRITON_ATTN`), downloading configs it does not find in `HF_CACHE`.
-None of the three is gated; no `HF_TOKEN` is needed.
+None of the three is gated, but like every command it needs the token (`HF_TOKEN_FILE`).
 It exits 0 only if every model's summary row says `ok`; results are in `$DOOLY_OUT/example/NAME/`,
 each run's output in `$DOOLY_OUT/example/NAME.log`.
 
@@ -62,8 +62,75 @@ each run's output in `$DOOLY_OUT/example/NAME.log`.
 - Other `run` options: `--dp N`, `--enable-expert-parallel`, `--attention-backend`
   (`FLASH_ATTN` default, `FLASHINFER`, `TRITON_ATTN`, MLA backends for MLA models),
   `--max-batch-size` (2), `--max-seq-len` (128), `--dtype` (`bfloat16`), `--gpu-memory-cap F`.
-- Gated models: `HF_TOKEN=... docker/dooly-docker.sh download MODEL`. Never print or log the token;
-  if none is available, ask the user to set `HF_TOKEN` or run `hf auth login` themselves.
+- Gated models: the token's account must have accepted the model's license on its page.
+
+## Contributing to DoolyDB
+
+[DoolyDB](https://huggingface.co/datasets/dooly-project/DoolyDB) is the shared result tree on
+Hugging Face. You do the whole contribution, upload included, and you check it yourself:
+`dooly verify` only proves the folder is what `dooly export` writes, not that it holds what you
+meant to add. The walkthrough for people is docs/how-to-contribute.md.
+
+```bash
+export HF_TOKEN_FILE=/path/to/token.txt                     # from the user
+docker/dooly-docker.sh download-db /out/DoolyDB-base        # untouched copy, to compare against
+docker/dooly-docker.sh download-db /out/DoolyDB             # the copy your results go into
+docker/dooly-docker.sh import /out/DoolyDB --db /out/dooly.db
+docker/dooly-docker.sh download MODEL
+docker/dooly-docker.sh run --model MODEL --out /out/NAME --db /out/dooly.db --max-batch-size 32 --max-seq-len 8192
+docker/dooly-docker.sh export --db /out/dooly.db --out /out/DoolyDB
+docker/dooly-docker.sh verify /out/DoolyDB
+# your own checks (below), then:
+docker/dooly-docker.sh upload /out/DoolyDB "MODEL on GPU"
+# your checks of the pull request (below)
+```
+
+`upload` runs `dooly verify` again and stops if it fails, uploads as the token's account (it
+prints which), always as a pull request (never a commit to main), and prints the pull request's
+number and URL and what it adds, changes and removes compared with main.
+
+Check before uploading (stop and report on any failure; do not upload a folder you could not check):
+
+1. **Only your folder is new.** `diff -rq --exclude=.cache dooly-out/DoolyDB-base dooly-out/DoolyDB`
+   prints only `Only in dooly-out/DoolyDB/compute/...: <your deployment>` (with `--profile-comm`,
+   also the collective files of your topology under `communication/`). A `Files ... differ` line
+   for an existing deployment means stop.
+2. **The folder names what you ran**: `compute/<gpu>/<engine>/<backend>/<org>/<model>/<deployment>/`,
+   with `<gpu>` this GPU (`nvidia-smi` name), `<engine>` the image's vLLM version, `<backend>` your
+   `--attention-backend`, and `<deployment>` your `tp<N>-<dtype>-kv<cache dtype>`.
+3. **deployment.json** has the right `model`, `device`, `engine`, `backend` and `dtype`, and the
+   command line in `runs[].stack.argv` holds no path you would not share (paths under `/out/` are
+   fine).
+4. **model.csv lists every operation file and nothing is missing**: each `file` it names exists,
+   and every other CSV in the folder is `model.csv` or `collectives.csv`. Per-layer operations have a `count`
+   equal to the model's `num_hidden_layers` (its `config.json` in `HF_CACHE`) or a multiple of it;
+   the embedding and the sampler run once.
+5. **The numbers are sane**: every operation file has rows; all latencies are positive and finite,
+   and min <= median <= max on each row; a linear operation's median latency does not fall as
+   `num_tokens` grows (beyond noise). The folder's rows add up to R from the run's summary when the
+   database had none of these operations before.
+
+Check after uploading:
+
+6. `upload` printed `pull request #N`, the account you expected, `changes 0, removes 0` (unless
+   step 1 showed collective files) and only your folder after `+`.
+7. **The pull request holds exactly your folder**:
+   `docker/dooly-docker.sh download-db /out/pr-N --revision refs/pr/N`, then
+   `diff -rq --exclude=.cache dooly-out/DoolyDB dooly-out/pr-N` prints nothing, and
+   `docker/dooly-docker.sh verify /out/pr-N` is valid.
+8. **It is an open draft by that account** (public dataset, no token needed):
+   `${DOCKER:-docker} run --rm -e HF_HUB_OFFLINE=0 --entrypoint python jhkjames1110/doolyprof -c
+   "from huggingface_hub import HfApi; d = HfApi().get_discussion_details('dooly-project/DoolyDB', N, repo_type='dataset'); print(d.status, d.author, d.title)"`
+   prints `draft <account> <your message>`.
+
+Then report the pull request's URL and the result of each check. It stays a draft: the user
+publishes it on its page (the dataset's Community tab) unless they told you to. If a check fails
+after uploading, do not edit the pull request; tell the user (fix the folder and upload a new one
+if they agree).
+
+Token rules: use only the token file the user gave you (or their `HF_TOKEN`). Never read, print,
+copy or log it, never put a token on a command line or in a file you write, never ask for one in
+chat, and never use a login saved on the machine or a token you find elsewhere.
 
 ## Timing (for timeouts and background jobs)
 
@@ -72,6 +139,7 @@ Measured on one RTX PRO 6000 Blackwell; an A100 is similar.
 | Step | Typical |
 |---|---|
 | `download` | 1-10 s |
+| `download-db`, `upload` | seconds to a minute (grows with DoolyDB) |
 | `test` | ~1 min |
 | `run`, small model (Qwen3-0.6B) | ~3 min first time, ~1.5 min after |
 | `run`, 8B model | 3-5 min |
@@ -134,7 +202,9 @@ EOF
 |---|---|---|
 | `MODEL is not in ... (the image works offline)` (script, exit 2) | Not downloaded | `docker/dooly-docker.sh download MODEL`, then rerun |
 | `LocalEntryNotFoundError` / `outgoing traffic has been disabled` (`trace.log`) | Model missing from `$HF_CACHE`, or `HF_CACHE` points elsewhere than at download time | Download again with the same `HF_CACHE` |
-| `401` / `gated repo` (download), or `download failed (...)` (example.sh) | Gated model | Need `HF_TOKEN` from the user |
+| `a Hugging Face token is required` / `HF_TOKEN_FILE=... is not a readable, non-empty file` (script, exit 2) | No token given, or a wrong path | Ask the user for the path of their token file |
+| `401` / `gated repo` (download), `download failed (...)` (example.sh), `the Hugging Face token was not accepted` (upload) | Token invalid or expired, or a gated model whose license the account has not accepted | Tell the user; do not look for another token |
+| `not uploaded: dooly verify found problems` (upload) | The folder is not what `dooly export` writes | docs/how-to-contribute.md, *If verify fails* |
 | `waiting for N free GPU(s)` / `waiting for GPU(s) ...` (script, repeats every 60 s) | GPUs in use by others or locked by another run (`/tmp/dooly_gpu<i>.lock`) | Wait, or tell the user. **Never** kill other processes or remove lock dirs you did not create. |
 | `waiting for N free GPUs linked by ...` | Only worse-connected GPUs are free | Wait, or `DOOLY_ANY_LINK=1` if the user accepts measurements on those links |
 | `trace failed (exit N)` (script) + vLLM error about the attention backend or head size (`trace.log`) | vLLM does not support that backend on this GPU/model | Retry with another `--attention-backend`; report which ones vLLM rejected |
