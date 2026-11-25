@@ -23,7 +23,10 @@
 # Inside the container the chosen GPUs are 0..N-1 in the order chosen (CUDA_VISIBLE_DEVICES; the
 # first k GPUs form a k-rank group). Paths under /out are $DOOLY_OUT on the host.
 # A container cannot see other users' processes, so the free-GPU check runs here: a GPU is free
-# when it has under 4 GB in use, no process of another user, and no lock dir /tmp/dooly_gpu<i>.lock.
+# when it has under 4 GB in use, runs no kernels (utilization under 5% in each of three samples a
+# second apart), has no process of another user, and no lock dir /tmp/dooly_gpu<i>.lock. On an
+# account several people share, their processes look like yours: memory, utilization and the
+# locks are what tell their GPUs apart.
 # The script creates that lock for each GPU it takes and removes it when the run ends, so two runs
 # never share a GPU, not even while one of them is starting and uses no memory yet.
 #
@@ -79,6 +82,8 @@ elif [ -z "${HF_TOKEN:-}" ]; then
   echo "  it; preferred) or HF_TOKEN=<token>. The commands that reach Hugging Face use it, and no saved login." >&2
   exit 2
 fi
+# The image's huggingface_hub is pinned: no hints to update it or to install its `hf` skill for agents.
+HF_QUIET="-e HF_HUB_DISABLE_UPDATE_CHECK=1"
 token=()   # docker run options handing the token to a container (token_options)
 token_options() {  # the file read-only (HF_TOKEN_PATH), or the token in an env file only this user can read:
   # `-e HF_TOKEN` alone passes nothing through `sudo docker`, and `-e HF_TOKEN=...` would show it in the
@@ -123,7 +128,8 @@ built() {  # built CREATED COMMIT: "built 2026-11-24 14:38 UTC from commit cf974
 
 UPDATE_NOTE=""
 image_update_check() {  # 0: same as Docker Hub's, 1: Docker Hub's is newer (warned), 2: not checked,
-                        # 3: this machine's is not older than Docker Hub's (UPDATE_NOTE says so)
+                        # 3: this machine's is not older than Docker Hub's, or another build of the
+                        #    same commit (UPDATE_NOTE says which)
   [ "${DOOLY_UPDATE_CHECK:-1}" = 0 ] && return 2
   command -v curl > /dev/null || return 2
   local ref=${IMAGE#docker.io/} repo tag last created rev digests token remote hub hub_created hub_rev
@@ -153,6 +159,10 @@ image_update_check() {  # 0: same as Docker Hub's, 1: Docker Hub's is newer (war
   # A different image: newer only if Docker Hub's was built later (both times are UTC, ISO 8601)
   hub=$(hub_image "$repo" "$remote" "$token")
   read -r hub_created hub_rev <<< "$hub"
+  if [ -n "$rev" ] && [ "$rev" = "${hub_rev:-}" ]; then  # e.g. built here from the commit Docker Hub's is
+    UPDATE_NOTE="this machine's $IMAGE ($(built "$created" "$rev")) and Docker Hub's ($(built "$hub_created" "$hub_rev")) are builds of the same commit"
+    return 3
+  fi
   if [[ ${hub_created:-} == [0-9]* ]]; then
     if [[ ! ${hub_created:0:19} > ${created:0:19} ]]; then
       UPDATE_NOTE="this machine's $IMAGE ($(built "$created" "$rev")) is not older than Docker Hub's ($(built "$hub_created" "${hub_rev:-}"))"
@@ -185,7 +195,7 @@ if [ "${1:-}" = "download" ]; then  # model config and tokenizer files into $HF;
   rc=0
   for model in "$@"; do
     echo "[dooly-docker] downloading $model into $HF (config and tokenizer files; no weights)" >&2
-    $DOCKER run --rm --user "$(id -u):$(id -g)" -e HOME=/cache -e HF_HOME=/hf -e HF_HUB_OFFLINE=0 \
+    $DOCKER run --rm --user "$(id -u):$(id -g)" -e HOME=/cache -e HF_HOME=/hf -e HF_HUB_OFFLINE=0 $HF_QUIET \
       ${token[@]+"${token[@]}"} -v "$HF":/hf -v "$CACHE":/cache --entrypoint hf "$IMAGE" download "$model" \
       --exclude "*.safetensors" --exclude "*.bin" --exclude "*.pt" --exclude "*.pth" --exclude "*.ckpt" \
       --exclude "*.gguf" --exclude "*.h5" --exclude "*.msgpack" --exclude "*.onnx" >&2 || rc=1
@@ -208,7 +218,7 @@ if [ "${1:-}" = "download-db" ]; then  # DoolyDB (or a revision of it, e.g. refs
   mkdir -p "$OUT"
   token_options
   echo "[dooly-docker] downloading $DB_REPO${*:+ ($*)} into $dir" >&2
-  $DOCKER run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_HOME=/tmp/hf -e HF_HUB_OFFLINE=0 \
+  $DOCKER run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_HOME=/tmp/hf -e HF_HUB_OFFLINE=0 $HF_QUIET \
     "${token[@]}" -v "$OUT":/out --entrypoint hf "$IMAGE" download "$DB_REPO" --repo-type dataset \
     --local-dir "$dir" "$@" >&2
   exit $?
@@ -224,7 +234,7 @@ if [ "${1:-}" = "upload" ]; then  # a folder as a pull request on DoolyDB, after
     exit 1
   fi
   token_options
-  $DOCKER run --rm -i --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_HOME=/tmp/hf -e HF_HUB_OFFLINE=0 \
+  $DOCKER run --rm -i --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_HOME=/tmp/hf -e HF_HUB_OFFLINE=0 $HF_QUIET \
     "${token[@]}" -v "$OUT":/out:ro --entrypoint python "$IMAGE" - "$DB_REPO" "$dir" "$message" <<'EOF'
 # Always a pull request, never a commit to main; then what it changes compared with main.
 import sys
@@ -304,14 +314,22 @@ N=${N:-1}
 mkdir -p "$OUT" "$CACHE"
 
 free_gpus() {  # comma-separated indices of the GPUs nobody is on
-  local free=() g uuid mem others
+  local free=() g uuid mem others active s
   local count=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
+  # GPUs running kernels: 5% or more in any of three samples a second apart (one sample can fall
+  # between a job's kernels). This also catches jobs whose processes the user check below cannot
+  # tell from ours (an account several people share).
+  active=$(for s in 1 2 3; do
+             [ $s = 1 ] || sleep 1
+             nvidia-smi --query-gpu=index,utilization.gpu --format=csv,noheader,nounits
+           done | awk -F', *' '$2 + 0 >= 5 { print $1 }' | sort -un | paste -sd, -)
   for ((g = 0; g < count; g++)); do
     uuid=$(nvidia-smi -i $g --query-gpu=uuid --format=csv,noheader)
     mem=$(nvidia-smi -i $g --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
     others=$(nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader | grep "$uuid" |
              while IFS=, read u p; do [ "$(ps -o user= -p $p | tr -d ' ')" != "$USER" ] && echo $p; done)
-    [ "$mem" -lt 4000 ] && [ -z "$others" ] && [ ! -e $LOCK$g.lock ] && free+=($g)
+    [ "$mem" -lt 4000 ] && [ -z "$others" ] && [[ ",$active," != *",$g,"* ]] && [ ! -e $LOCK$g.lock ] &&
+      free+=($g)
   done
   (IFS=,; echo "${free[*]}")
 }
