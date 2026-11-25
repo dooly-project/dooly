@@ -25,7 +25,7 @@ Model weights are never downloaded: DoolyProf only needs a model's config and to
 | **GPU** | An NVIDIA GPU. Tested on A100 80GB and RTX PRO 6000 Blackwell. One GPU is enough; communication profiling needs one GPU per rank. |
 | **Driver** | NVIDIA driver 580 or newer (CUDA 13.0). Check with `nvidia-smi`. |
 | **Docker** | Docker with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). |
-| **Disk** | About 18 GB for the image (an 8 GB download). |
+| **Disk** | About 18 GB for the image (an 8 GB download); about 26 GB where Docker also keeps the download (its containerd image store). |
 | **This repository** | For `docker/dooly-docker.sh`, the script that runs everything. |
 | **python3** (optional) | Lets the script pick the best-connected GPUs. Without it, it takes the first free ones. |
 | **Hugging Face token** | Every command needs one (create it at https://huggingface.co/settings/tokens; to contribute to DoolyDB it must be allowed to open pull requests). |
@@ -171,9 +171,9 @@ running an example again replaces them.
 |---|---|
 | `trace/<model>_<tp>_dooly_trace.json` | The trace: every operation the model runs and how its shapes depend on the batch. |
 | `trace.log` | The tracer's log. Look here if the trace fails. |
-| `profile.db` | **The results**, a SQLite database (tables below). |
-| `profile.log` | The profiler's log. Look here if profiling fails. |
-| `profile_timings.csv` | How long the profiler spent on each operation (for the profiler itself, not results). |
+| `profile.db` | **The results**, a SQLite database (tables below). With `--db /out/FILE.db` they go into that file instead, and the run folder has no `profile.db`. |
+| `profile.log` | The profiler's log. Look here if profiling fails. It may say `Wrote N results` with N above the summary's row count: a batch shape measured twice in one run is stored once. |
+| `profile_timings.csv` | How long the profiler spent on each operation (for the profiler itself, not results). It is written next to the database: here, or next to the `--db` file. |
 
 Main tables in `profile.db`:
 
@@ -272,12 +272,20 @@ docker/dooly-docker.sh upload /out/DoolyDB "ORG/MODEL on <gpu>"
 ```
 
 `run --db` reuses every result `dooly.db` already has for your GPU and engine, so a model whose
-operations are already in DoolyDB only measures what is new. The pull request adds your model's
-folder (an operation it shares with another model is copied into it unchanged); `upload` prints
-its URL and lists what it adds. It opens as a draft, which cannot be merged: check it on its page
-(Files changed) and click **Publish**. Check each `deployment.json` before uploading: it records
-the run's command line. Add `--gpus N --tp N --profile-comm` to include collectives.
-`DOOLY_DB_REPO` points `download-db` and `upload` at another dataset (e.g. a copy to try this on).
+operations are already in DoolyDB only measures what is new; while DoolyDB has nothing for your
+GPU and engine yet, it measures everything. The pull request adds your model's folder (an
+operation it shares with another model is copied into it unchanged); `upload` prints its URL and
+lists what it adds. It opens as a draft, which cannot be merged: check it on its page (Files
+changed) and click **Publish**. A coding agent that does this for you leaves it as a draft, for
+you to check and publish ([AGENTS.md](AGENTS.md#contributing-to-doolydb)). Check each
+`deployment.json` before uploading: it records the run's command line. Add
+`--gpus N --tp N --profile-comm` to include collectives.
+
+- `download-db` leaves Hugging Face's download bookkeeping in `.cache/huggingface/` inside the
+  folder; `verify` and `upload` ignore it.
+- On an account other people use too, set `HF_CACHE` and `DOOLY_CACHE` (see [Settings](#settings))
+  to folders of your own first.
+- `DOOLY_DB_REPO` points `download-db` and `upload` at another dataset (e.g. a copy to try this on).
 
 ---
 
@@ -341,8 +349,8 @@ Only `download` uses the internet; tracing and profiling run offline from your c
 |---|---|---|
 | `DOCKER` | `docker` | The docker command, e.g. `sudo docker`. |
 | `DOOLY_OUT` | `./dooly-out` | Host folder that appears as `/out` in the container. |
-| `HF_CACHE` | `~/.cache/huggingface` | Host Hugging Face cache (models are downloaded here). |
-| `DOOLY_CACHE` | `~/.cache/dooly-docker` | Host folder for compiled kernels. |
+| `HF_CACHE` | `~/.cache/huggingface` | Host Hugging Face cache (models are downloaded here). On an account others use too, set a folder of your own, and keep it the same from `download` to `run`. |
+| `DOOLY_CACHE` | `~/.cache/dooly-docker` | Host folder for compiled kernels. On an account others use too, set a folder of your own. |
 | `DOOLY_IMAGE` | `jhkjames1110/doolyprof:latest` | The image to run. |
 | `HF_TOKEN_FILE` | | A file that holds your Hugging Face token (this or `HF_TOKEN` is required). |
 | `HF_TOKEN` | | The token itself, instead of `HF_TOKEN_FILE`. |
@@ -366,7 +374,8 @@ Only `download` uses the internet; tracing and profiling run offline from your c
 | KV cache too small for the trace batch | Add `--gpu-memory-cap 0.95`. |
 | `argument --profiler-args: expected one argument` | Use the `=` form: `--profiler-args=--overwrite`. |
 | `0 result rows` when running again with the same `--out` | Operations already in that folder's `profile.db` are not measured again (DoolyProf reuses what it has). Use a new `--out`, or add `--profiler-args=--overwrite` to measure again. |
-| `Docker Hub has a newer jhkjames1110/doolyprof:latest than this machine` | Your copy of the image is older than the repository's main branch. Run the `docker pull` command it prints. |
+| `Docker Hub has a newer jhkjames1110/doolyprof:latest (built ...) than this machine (built ...)` | Your copy of the image was built before Docker Hub's. Run the `docker pull` command it prints. |
+| `Chat template warmup failed` with a traceback, `FlashInfer's precompiled kernels are missing`, or `Unknown vLLM environment variable detected: VLLM_FAKE_*` in `trace.log` / `profile.log` | Harmless: vLLM runs without a tokenizer, compiles the FlashInfer kernels it needs (kept in `DOOLY_CACHE`), and does not know DoolyProf's own `VLLM_FAKE_*` settings (how it emulates the ranks of `--tp`). |
 
 ---
 
@@ -374,9 +383,10 @@ Only `download` uses the internet; tracing and profiling run offline from your c
 
 `jhkjames1110/doolyprof:latest` is the code on the repository's main branch. Docker downloads it
 only when your machine has no copy, so before each command the script compares your copy with
-Docker Hub's and, if Docker Hub's is newer, prints a warning with the command to update (it still
-runs your copy; `DOOLY_UPDATE_CHECK=0` turns the check off). `docker/dooly-docker.sh check-update`
-runs the check by itself. To update:
+Docker Hub's and, if Docker Hub's was built later, prints a warning with both build dates and
+commits and the command to update (it still runs your copy; `DOOLY_UPDATE_CHECK=0` turns the
+check off). `docker/dooly-docker.sh check-update` runs the check by itself, and also says when
+your copy is the newer one (e.g. built here from a newer commit). To update:
 
 ```bash
 docker pull jhkjames1110/doolyprof
@@ -391,6 +401,6 @@ docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revisi
 To build the image from this repository instead:
 
 ```bash
-docker build -f docker/Dockerfile -t doolyprof:local .
+docker build -f docker/Dockerfile --build-arg DOOLY_REVISION=$(git rev-parse HEAD) -t doolyprof:local .
 DOOLY_IMAGE=doolyprof:local docker/dooly-docker.sh test
 ```

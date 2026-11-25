@@ -42,6 +42,9 @@ database that DoolyProf and DoolySim work with is built from it on your machine 
    hf download dooly-project/DoolyDB --repo-type dataset --local-dir DoolyDB
    ```
 
+   `hf` keeps its download bookkeeping in `DoolyDB/.cache/huggingface/`; `verify` and `hf upload`
+   ignore it.
+
 2. **Import it into a local database**:
 
    ```bash
@@ -58,8 +61,9 @@ database that DoolyProf and DoolySim work with is built from it on your machine 
    ```
 
    The run skips every operation `dooly.db` already has for your GPU and engine version and
-   measures the rest. An operation is identified by its shapes and kernels, so a model shares
-   most operations with its variants (Qwen2.5-7B-Instruct after Qwen2.5-7B measures 1 of its 13)
+   measures the rest; while DoolyDB has nothing for them yet, it measures everything. An
+   operation is identified by its shapes and kernels, so a model shares most operations with its
+   variants (on a GPU where Qwen2.5-7B was measured, Qwen2.5-7B-Instruct measures 1 of its 13)
    and few with other architectures. Profile at a scale DoolySim can use (e.g.
    `--max-batch-size 32 --max-seq-len 8192`), and add `--tp N --profile-comm` on N linked GPUs
    to include collectives.
@@ -70,7 +74,8 @@ database that DoolyProf and DoolySim work with is built from it on your machine 
    unless you pass `--attention-backend` (e.g. `FLASHINFER`, `TRITON_ATTN`); each backend gets
    its own folder in DoolyDB. The run ends with
    `[dooly] profile exit 0 in Ns: R result rows, 0 ops without a working parent`, where R is the
-   number of rows it added to `dooly.db`.
+   number of rows it added to `dooly.db` (the profiler's own `Wrote N results` can be higher: a
+   batch shape measured twice in one run is stored once).
 
 4. **Export into the downloaded folder**:
 
@@ -108,7 +113,8 @@ database that DoolyProf and DoolySim work with is built from it on your machine 
 
 8. **Publish the pull request**: it opens as a draft, which cannot be merged. On the dataset's
    page, open the **Community** tab and your pull request, check **Files changed** (your
-   folders, nothing else), and click **Publish**.
+   folders, nothing else), and click **Publish**. If a coding agent contributed for you, it
+   leaves the pull request as a draft and reports its URL: this step is yours.
 
 ## With Docker
 
@@ -117,7 +123,9 @@ container), which needs no `hf` on your machine but always your token: a file th
 `HF_TOKEN_FILE` (how to make one: [docker/README.md](../docker/README.md#what-you-need)), or the
 token itself in `HF_TOKEN`. It uses that token, never a login saved on the machine. Use an image
 from 2026-11-24 or later: `docker/dooly-docker.sh check-update` says whether yours is older, and
-`docker pull jhkjames1110/doolyprof` updates it.
+`docker pull jhkjames1110/doolyprof` updates it. On an account other people use too, point
+`HF_CACHE` and `DOOLY_CACHE` at folders of your own first (the defaults are in that account's
+home).
 
 ```bash
 export HF_TOKEN_FILE=~/.hf-token.txt

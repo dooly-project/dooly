@@ -92,10 +92,41 @@ token_options() {  # the file read-only (HF_TOKEN_PATH), or the token in an env 
   fi
 }
 
-image_update_check() {  # 0: same as Docker Hub, 1: Docker Hub has a newer one (warned), 2: not checked
+MANIFESTS="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+
+hub_image() {  # hub_image REPO DIGEST TOKEN: "<created> <commit>" of that image on Docker Hub, from its
+  # manifest and config (a few KB; not a pull). Prints nothing without python3 or when they cannot be read.
+  command -v python3 > /dev/null || return 0
+  python3 - "$@" "$MANIFESTS" <<'EOF' 2> /dev/null
+import json, platform, subprocess, sys
+repo, ref, token, manifests = sys.argv[1:]
+def get(path, accept=manifests):  # curl -L does not send the token on to the blob store it redirects to
+    out = subprocess.run(["curl", "-fsSL", "--max-time", "6", "-H", "Authorization: Bearer " + token,
+                          "-H", "Accept: " + accept, f"https://registry-1.docker.io/v2/{repo}/{path}"],
+                         capture_output=True, check=True).stdout
+    return json.loads(out)
+m = get("manifests/" + ref)
+if "manifests" in m:  # one image per platform: this machine's
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), platform.machine())
+    m = get("manifests/" + next(e["digest"] for e in m["manifests"]
+                                if e.get("platform", {}).get("os") == "linux"
+                                and e["platform"].get("architecture") == arch))
+config = get("blobs/" + m["config"]["digest"], accept="*/*")
+labels = (config.get("config") or {}).get("Labels") or {}
+print(config.get("created") or "-", labels.get("org.opencontainers.image.revision") or "")
+EOF
+}
+
+built() {  # built CREATED COMMIT: "built 2026-11-24 14:38 UTC from commit cf974cf"
+  echo "built ${1:0:10} ${1:11:5} UTC${2:+ from commit ${2:0:7}}"
+}
+
+UPDATE_NOTE=""
+image_update_check() {  # 0: same as Docker Hub's, 1: Docker Hub's is newer (warned), 2: not checked,
+                        # 3: this machine's is not older than Docker Hub's (UPDATE_NOTE says so)
   [ "${DOOLY_UPDATE_CHECK:-1}" = 0 ] && return 2
   command -v curl > /dev/null || return 2
-  local ref=${IMAGE#docker.io/} repo tag last digests token remote rev
+  local ref=${IMAGE#docker.io/} repo tag last created rev digests token remote hub hub_created hub_rev
   [[ $ref == *@* ]] && return 2                                   # pinned by digest
   last=${ref##*/}
   if [[ $last == *:* ]]; then tag=${last##*:}; repo=${ref%:*}; else tag=latest; repo=$ref; fi
@@ -104,22 +135,33 @@ image_update_check() {  # 0: same as Docker Hub, 1: Docker Hub has a newer one (
   else
     repo=library/$repo
   fi
-  # this machine's copy, as the digests Docker recorded when it was pulled or pushed (none if built here)
-  digests=$($DOCKER image inspect --format '{{join .RepoDigests "\n"}}' "$IMAGE" 2> /dev/null) || return 2
+  # this machine's copy: when it was built, from which commit, and the digests Docker recorded
+  # when it was pulled or pushed (none, or only a local one, if it was built here)
+  created=$($DOCKER image inspect --format '{{.Created}}' "$IMAGE" 2> /dev/null) || return 2
+  rev=$($DOCKER image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE" 2> /dev/null)
+  digests=$($DOCKER image inspect --format '{{join .RepoDigests "\n"}}' "$IMAGE" 2> /dev/null)
   digests=$(sed -n "s|^\(docker.io/\)\{0,1\}${repo#library/}@||p" <<< "$digests")
-  [ -n "$digests" ] || return 2
   # Docker Hub's: a HEAD request for the manifest (does not count as a pull)
   token=$(curl -fsS --max-time 4 "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$repo:pull" \
             2> /dev/null | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p')
   [ -n "$token" ] || return 2
-  remote=$(curl -fsSI --max-time 4 -H "Authorization: Bearer $token" \
-             -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+  remote=$(curl -fsSI --max-time 4 -H "Authorization: Bearer $token" -H "Accept: $MANIFESTS" \
              "https://registry-1.docker.io/v2/$repo/manifests/$tag" 2> /dev/null |
            tr -d '\r' | grep -i '^docker-content-digest:' | sed 's/^[^:]*: *//')
   [ -n "$remote" ] || return 2
   grep -qxF "$remote" <<< "$digests" && return 0
-  rev=$($DOCKER image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE" 2> /dev/null)
-  echo "[dooly-docker] Docker Hub has a newer $IMAGE than this machine${rev:+ (yours was built from commit ${rev:0:7})}. To update:" >&2
+  # A different image: newer only if Docker Hub's was built later (both times are UTC, ISO 8601)
+  hub=$(hub_image "$repo" "$remote" "$token")
+  read -r hub_created hub_rev <<< "$hub"
+  if [[ ${hub_created:-} == [0-9]* ]]; then
+    if [[ ! ${hub_created:0:19} > ${created:0:19} ]]; then
+      UPDATE_NOTE="this machine's $IMAGE ($(built "$created" "$rev")) is not older than Docker Hub's ($(built "$hub_created" "${hub_rev:-}"))"
+      return 3
+    fi
+    echo "[dooly-docker] Docker Hub has a newer $IMAGE ($(built "$hub_created" "${hub_rev:-}")) than this machine ($(built "$created" "$rev")). To update:" >&2
+  else
+    echo "[dooly-docker] Docker Hub's $IMAGE is not the one on this machine ($(built "$created" "$rev")) and may be newer. To update:" >&2
+  fi
   echo "  $DOCKER pull $IMAGE        (this run uses the copy here; DOOLY_UPDATE_CHECK=0 skips the check)" >&2
   return 1
 }
@@ -128,7 +170,8 @@ if [ "${1:-}" = "check-update" ]; then
   DOOLY_UPDATE_CHECK=1 image_update_check
   case $? in
     0) echo "[dooly-docker] $IMAGE is up to date" >&2 ;;
-    2) echo "[dooly-docker] could not compare $IMAGE with Docker Hub (not on this machine yet, built here, another registry, or no network)" >&2 ;;
+    2) echo "[dooly-docker] could not compare $IMAGE with Docker Hub (not on this machine yet, another registry, or no network)" >&2 ;;
+    3) echo "[dooly-docker] $UPDATE_NOTE: nothing to update" >&2 ;;
   esac
   exit 0
 fi

@@ -5,7 +5,8 @@
   free GPUs stop the run and say which are busy and why
 - memory already in use when an engine starts is blamed on other processes only when NVML shows
   other processes: this run's own earlier stages are named as such
-- the command line a run records has the home directory as ~
+- the command line a run records has the home directory as ~; the DoolyProf commit it records
+  comes from git, or from doolyprof/REVISION where the code is not a checkout (the Docker image)
 - the summary counts the rows this run wrote, not the database's
 
 Runs directly: ``python doolyprof/tests/cli_run_test.py``. CPU only, standard library only.
@@ -175,6 +176,22 @@ def test_command_line_has_the_home_directory_as_tilde():
         "~/dooly/doolyprof/run/run-profiler.py", "--db-path", "~/dooly.db", "--out=~/runs/x",
         "--traces", "~/a.json,~/b.json", "/home/user2/x", "~", "/data/home/u/y", "--tp", "1"]
     assert profile_db.portable_argv(["/x"], home="/") == ["/x"]
+
+
+def test_revision_without_git_comes_from_the_revision_file():
+    saved = os.environ.pop("DOOLY_REVISION", None)
+    try:
+        with tempfile.TemporaryDirectory() as d:     # a copy of the package, not a git checkout
+            assert profile_db._revision(d) is None
+            with open(os.path.join(d, "REVISION"), "w") as f:
+                f.write("0123abc\n")
+            assert profile_db._revision(d) == "0123abc"
+            os.environ["DOOLY_REVISION"] = "fedcba9"
+            assert profile_db._revision(d) == "fedcba9"
+    finally:
+        os.environ.pop("DOOLY_REVISION", None)
+        if saved is not None:
+            os.environ["DOOLY_REVISION"] = saved
 
 
 def test_summary_counts_the_rows_of_this_run():

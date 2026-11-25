@@ -17,6 +17,10 @@ This file is for coding agents that run DoolyProf for a user. People should read
   `export HF_TOKEN_FILE=/path/to/token.txt`, the path of a file that holds it (ask the user for
   the path), or `HF_TOKEN`. Only `download`, `download-db` and `upload` hand it to a container,
   and they never use a login saved on the machine.
+- On an account other people use too (e.g. a shared `ubuntu`), first point `HF_CACHE` and
+  `DOOLY_CACHE` at folders of your own (e.g. in your workspace): the defaults,
+  `~/.cache/huggingface` and `~/.cache/dooly-docker`, are that account's. Keep the same `HF_CACHE`
+  from `download` to `run`.
 
 ## Preflight (run in order; stop and report on the first failure)
 
@@ -25,7 +29,7 @@ This file is for coding agents that run DoolyProf for a user. People should read
 | Token | `test -r "$HF_TOKEN_FILE" && test -s "$HF_TOKEN_FILE" && echo ok` | `ok`. Otherwise ask the user for the path of their token file. Never read, print or copy it. |
 | Driver | `nvidia-smi --query-gpu=index,name,driver_version,memory.used --format=csv` | GPUs listed, driver >= 580 |
 | Docker access | `docker info >/dev/null && echo ok` | `ok`. If permission denied: `export DOCKER="sudo docker"` and use `$DOCKER` below (do not run `sudo` for anything else). |
-| Image | `${DOCKER:-docker} pull jhkjames1110/doolyprof` | `Status: ...` with digest; 8 GB the first time |
+| Image | `${DOCKER:-docker} pull jhkjames1110/doolyprof` | `Status: ...` with digest; 8 GB the first time. Skip it if the user says the image here is the one to use; `docker/dooly-docker.sh check-update` then says whether it or Docker Hub's was built later. |
 | GPUs in containers | `${DOCKER:-docker} run --rm --gpus all --entrypoint nvidia-smi jhkjames1110/doolyprof -L` | One `GPU i: ...` line per GPU. `could not select device driver` = NVIDIA Container Toolkit missing: report to the user, do not install system packages yourself. |
 | Self-test | `docker/dooly-docker.sh test` | Last line `[dooly] N/N suites passed` (every suite passed), exit 0, ~1 min |
 
@@ -37,7 +41,7 @@ docker/dooly-docker.sh run --model MODEL --out /out/NAME          # 1 GPU
 docker/dooly-docker.sh --gpus N run --model MODEL --tp N --out /out/NAME --profile-comm
 docker/dooly-docker.sh --devices 2,3 run ...                      # exact host GPUs, in this order
 docker/dooly-docker.sh test
-docker/dooly-docker.sh check-update                               # is Docker Hub's image newer?
+docker/dooly-docker.sh check-update                               # is Docker Hub's image built later?
 docker/dooly-docker.sh export --db /out/NAME/profile.db --out /out/profiles   # no GPU; CSV tree
 docker/dooly-docker.sh import /out/profiles --db /out/NAME/profile.db         # no GPU; merge a tree
 docker/dooly-docker.sh verify /out/profiles                                   # no GPU; tree == export?
@@ -89,12 +93,20 @@ docker/dooly-docker.sh upload /out/DoolyDB "MODEL on GPU"
 prints which), always as a pull request (never a commit to main), and prints the pull request's
 number and URL and what it adds, changes and removes compared with main.
 
+`download-db` leaves Hugging Face's download bookkeeping in `.cache/huggingface/` inside the
+folder; `verify` and `upload` ignore it (hence `--exclude=.cache` below). While DoolyDB has nothing
+for this GPU and engine version, `import` adds 0 rows and the run measures every operation; later
+runs reuse what is there (a model's variants share most operations).
+
 Check before uploading (stop and report on any failure; do not upload a folder you could not check):
 
 1. **Only your folder is new.** `diff -rq --exclude=.cache dooly-out/DoolyDB-base dooly-out/DoolyDB`
-   prints only `Only in dooly-out/DoolyDB/compute/...: <your deployment>` (with `--profile-comm`,
-   also the collective files of your topology under `communication/`). A `Files ... differ` line
-   for an existing deployment means stop.
+   prints only `Only in dooly-out/DoolyDB/...: X` lines, where X is your deployment's folder or the
+   highest folder above it that DoolyDB did not have yet (in an empty DoolyDB, `Only in
+   dooly-out/DoolyDB: compute`); with `--profile-comm` also the collective files of your topology
+   under `communication/`. When X is above your deployment, `find dooly-out/DoolyDB/compute -name
+   deployment.json` must list only yours besides those of the base. A `Files ... differ` line for
+   an existing deployment means stop.
 2. **The folder names what you ran**: `compute/<gpu>/<engine>/<backend>/<org>/<model>/<deployment>/`,
    with `<gpu>` this GPU (`nvidia-smi` name), `<engine>` the image's vLLM version, `<backend>` your
    `--attention-backend`, and `<deployment>` your `tp<N>-<dtype>-kv<cache dtype>`.
@@ -181,8 +193,10 @@ EOF
 
 ## Outputs
 
-`dooly-out/NAME/`: `trace/*.json` (trace), `trace.log`, `profile.db` (results), `profile.log`,
-`profile_timings.csv` (profiler bookkeeping).
+`dooly-out/NAME/`: `trace/*.json` (trace), `trace.log`, `profile.log`, and `profile.db`
+(results) with `profile_timings.csv` (profiler bookkeeping, how long each operation took to
+measure). With `--db /out/FILE.db` the results go into that file and `profile_timings.csv` next to
+it, and the run folder has no `profile.db`.
 
 `profile.db` tables:
 
@@ -215,6 +229,8 @@ EOF
 | `profile exit 0 ... 0 result rows` on a rerun | Same `--out`: everything already in its `profile.db` | New `--out`, or `--profiler-args=--overwrite` |
 | `[WARN] Calls recorded on K-rank groups are not profiled` (`profile.log`) | Fewer GPUs than group size | Rerun with `--gpus K` if the user wants those measured |
 | `[WARN] the K GPUs of this group are not all linked by NVLink` (`profile.log`) | Run got GPUs from different NVLink islands | Results are stored under the `-pcie` label; rerun without `--devices`/`DOOLY_ANY_LINK` for NVLink numbers |
+| `Chat template warmup failed` with a traceback, `FlashInfer's precompiled kernels are missing`, `Unknown vLLM environment variable detected: VLLM_FAKE_*` (`trace.log`, `profile.log`) | Harmless: vLLM runs without a tokenizer, compiles the FlashInfer kernels it needs into `$DOOLY_CACHE`, and does not know DoolyProf's own `VLLM_FAKE_*` settings (rank emulation) | Nothing; judge the run by the success criteria |
+| `Wrote N results` (`profile.log`) above R of the summary | A batch shape measured twice in one run is stored once | Nothing; R is what the database got |
 
 ## Rules
 
@@ -227,9 +243,11 @@ EOF
   profiled again and the summary reports only the new rows (possibly `0 result rows`). Use a new
   `--out` per run, or `--profiler-args=--overwrite` to measure again. `example.sh` clears each
   example's folder itself.
-- Before each command the script warns if Docker Hub has a newer image than the machine
-  (`Docker Hub has a newer ...`). It still runs the local copy; tell the user, and pull only if
-  they agree (`DOOLY_UPDATE_CHECK=0` silences it).
+- Before each command the script warns if Docker Hub's image was built later than the machine's
+  (`Docker Hub has a newer ... (built DATE from commit C) than this machine (built ...)`). It still
+  runs the local copy; tell the user, and pull only if they agree (`DOOLY_UPDATE_CHECK=0` silences
+  it). `check-update` says `... is not older than Docker Hub's ...: nothing to update` when the
+  copy here was built later (e.g. from a newer commit of main).
 - Results from different GPUs or link types are kept apart by their topology label; do not
   merge databases from different machines unless the user asks.
 
@@ -237,18 +255,23 @@ EOF
 
 The image is the full build (`docker/Dockerfile`) of a commit of main: its Python packages
 (`docker/requirements.txt`) and the `doolyprof/` and `doolysim/` packages, with the commit in the
-label `org.opencontainers.image.revision`. Rebuild and push it when main changes (needs `docker
-login` as the image owner; an agent must not enter credentials), from a clean copy of the commit:
+label `org.opencontainers.image.revision` and in `/opt/dooly/doolyprof/REVISION` (which every
+profiling run records as `doolyprof_revision`), both from `--build-arg DOOLY_REVISION`. Rebuild and
+push it when main changes (needs `docker login` as the image owner; an agent must not enter
+credentials), from a clean copy of the commit:
 
 ```bash
 SHA=$(git rev-parse main); SRC=$(mktemp -d)
 git archive "$SHA" docker doolyprof doolysim | tar -x -C "$SRC"
-docker build -f "$SRC/docker/Dockerfile" --label org.opencontainers.image.revision=$SHA \
+docker build -f "$SRC/docker/Dockerfile" --build-arg DOOLY_REVISION=$SHA \
   -t jhkjames1110/doolyprof:latest "$SRC"
 DOOLY_IMAGE=jhkjames1110/doolyprof:latest docker/dooly-docker.sh test     # every suite must pass
 docker push jhkjames1110/doolyprof:latest
 ```
 
-When only `doolyprof/` or `doolysim/` changed, a thin image on top of the published one builds in
-seconds: `FROM jhkjames1110/doolyprof:latest`, `RUN rm -rf /opt/dooly/doolyprof
-/opt/dooly/doolysim`, `COPY` both from the archive, and the same label.
+When only `doolyprof/` or `doolysim/` changed, the machine that built the previous image reuses
+its cached layers up to `COPY doolyprof`, so the build takes seconds and the push uploads only the
+code layers. Elsewhere, a thin image on top of the published one does the same:
+`FROM jhkjames1110/doolyprof:latest`, `RUN rm -rf /opt/dooly/doolyprof /opt/dooly/doolysim`,
+`COPY` both from the archive, then the `ARG`, `RUN` and `LABEL` lines that follow them in
+`docker/Dockerfile`, built with the same `--build-arg`.
