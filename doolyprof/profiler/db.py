@@ -21,6 +21,7 @@ can use this module without PyTorch or vLLM.
 import json
 import os
 import platform
+import re
 import sqlite3
 import subprocess
 import uuid
@@ -93,9 +94,22 @@ def _revision():
         return None
 
 
+def portable_argv(argv, home=None):
+    """``argv`` with the home directory (default: this user's) written as ``~`` wherever a path
+    starts with it (an argument, a ``--opt=`` value, an item of a list): the command line is
+    exported with the run (deployment.json, shared through DoolyDB), and the rest of a path still
+    says what was read and written."""
+    home = (os.path.expanduser("~") if home is None else home).rstrip("/")
+    if len(home) < 2:  # no home directory, or "/"
+        return list(argv)
+    pattern = re.compile(rf"(?<![^\s=:,]){re.escape(home)}(?=/|$|[\s:,])")
+    return [pattern.sub("~", arg) for arg in argv]
+
+
 def run_stack(backend, flash_attn_version=None, argv=None):
     """What a profiling run records about itself: its labels (device, engine, backend), the GPU
-    model, driver and package versions, the DoolyProf commit and the command line."""
+    model, driver and package versions, the DoolyProf commit and the command line (home directory
+    as ``~``, ``portable_argv``)."""
     from .utils.topology import device_label, gpu_name
     return {
         "run_uid": uuid.uuid4().hex,
@@ -107,7 +121,7 @@ def run_stack(backend, flash_attn_version=None, argv=None):
         "python": platform.python_version(),
         "versions": {d: v for d in RECORDED_DISTRIBUTIONS if (v := _version(d))},
         "doolyprof_revision": _revision(),
-        "argv": list(argv) if argv else None,
+        "argv": portable_argv(argv) if argv else None,
     }
 
 
