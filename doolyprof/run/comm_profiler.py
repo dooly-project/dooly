@@ -129,6 +129,20 @@ def _time_collective(op_fn, warmup_iters: int, measure_iters: int,
     return float(np.median(latencies))
 
 
+def _release_sweep_buffers():
+    """Give the GPU back the memory the last sweep size cached (outside any timed region).
+
+    A sweep builds new tensors for every size, in increasing order, so PyTorch's caching
+    allocator can never reuse a freed block and keeps them all: on an 80 GB GPU it filled
+    the memory the engine left free within one sweep. Libraries the engine calls lazily
+    allocate outside PyTorch (e.g. vLLM creating FlashInfer's all-reduce workspace on the
+    first eligible all_reduce) and can then fail on one rank only, which desynchronizes the
+    ranks: the rank whose setup failed goes on, the other waits in the setup's handshake
+    forever. Serving holds no such dead buffers, so releasing them also keeps the replay
+    on the communication path vLLM would really use."""
+    torch.cuda.empty_cache()
+
+
 # Point-to-point needs a matching side on the peer rank: the engine's send is
 # matched by its recv. Every other recorded call is a collective and is
 # replayed by all ranks with the recorded arguments.
@@ -297,6 +311,8 @@ def _profile_recorded(entry, sizes, comm, tp_rank, tp_world_size, dtype, device,
         except Exception as e:  # noqa: BLE001
             ok = 0
             print(f"[WARN] {tag}: CUDA-graph capture failed ({type(e).__name__}: {str(e)[:120]})")
+        del probe
+        _release_sweep_buffers()
         flag = torch.tensor([ok], dtype=torch.int32)
         torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN,
                                      group=group.cpu_group if group is not None else None)
@@ -308,6 +324,8 @@ def _profile_recorded(entry, sizes, comm, tp_rank, tp_world_size, dtype, device,
     for workload in workloads:
         call, size_bytes = _build_call(entry, workload, comm, tp_rank, dtype, device)
         latency = _time_collective(call, warmup_iters, measure_iters, timing, capture_ctx)
+        del call
+        _release_sweep_buffers()
         results.append({
             'operation': op,
             'topology': topology,
@@ -400,6 +418,8 @@ def _run_profiling_on_worker_standalone(
                     latency = _time_collective(
                         _p2p, warmup_iters, measure_iters, comm_timing, tp_group.graph_capture,
                     )
+                    del tensor, _p2p
+                    _release_sweep_buffers()
 
                     results.append({
                         'operation': 'send_recv',
