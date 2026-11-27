@@ -161,6 +161,29 @@ full-attention layers. gpt-oss's attention comes in two kinds, sliding-window an
 each. Each model's results are in `dooly-out/example/<name>/`, laid out as described next;
 running an example again replaces them.
 
+### On a Google Cloud GPU
+
+Without a GPU machine of your own, `docker/gcp.sh` runs the examples on a Google Cloud VM from
+your local machine (it needs only `gcloud`, logged in to a project, and git). It creates the VM
+(`MACHINE`, by default `a3-highgpu-2g`: two H100 80GB linked by NVLink) from Google's Deep
+Learning VM image with driver 580 in the first zone with capacity, installs Docker and the NVIDIA
+Container Toolkit, runs `dooly-docker.sh test` and `example.sh`, copies the results to
+`dooly-out/gcp/<vm>/` and deletes the VM:
+
+```bash
+HF_TOKEN_FILE=~/.hf-token.txt docker/gcp.sh                                 # 2x H100
+MACHINE=a2-ultragpu-2g HF_TOKEN_FILE=~/.hf-token.txt docker/gcp.sh          # 2x A100 80GB
+MACHINE=g4-standard-96 HF_TOKEN_FILE=~/.hf-token.txt docker/gcp.sh all -- moe hetero   # 2x RTX PRO 6000
+```
+
+VMs are Spot by default (A3 High with fewer than 8 GPUs is Spot or Flex-start only), so the
+project needs Spot quota for the GPU, and a preempted VM loses its run. Every VM deletes itself
+after `MAX_RUN` (3h) whatever happens. Steps also run one at a time (`up`, `setup`, `run`,
+`exec -- COMMAND`, `fetch`, `ssh`, `down`), e.g. with `KEEP=1` to keep the VM, and
+`LOCAL_IMAGE=1` runs a thin image of your checkout's HEAD instead of the published one (to try a
+fix, as in [AGENTS.md](AGENTS.md#tested-gpus-and-what-to-do-on-others)). `docker/gcp.sh --help`
+lists the settings.
+
 ---
 
 ## What you get

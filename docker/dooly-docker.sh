@@ -311,7 +311,7 @@ if [ -n "$DEVICES" ]; then
   N=$given
 fi
 N=${N:-1}
-mkdir -p "$OUT" "$CACHE"
+mkdir -p "$OUT" "$CACHE" "$HF"   # before docker run -v, which would make them root-owned
 
 free_gpus() {  # comma-separated indices of the GPUs nobody is on
   local free=() g uuid mem others active s
